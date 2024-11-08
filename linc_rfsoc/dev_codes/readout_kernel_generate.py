@@ -35,7 +35,7 @@ class ReadoutTestRuntime_dsp(Runtime):
         
         # Create a record group for saving captured data
         for i in range(len(self.phases)):
-            self.data.add_group(f"traces_phi{i}", uniform=False)
+            self.data.add_group(f"traces_phi{i}", uniform=True)
                         
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
@@ -52,10 +52,14 @@ class ReadoutTestRuntime_dsp(Runtime):
         acadia.attach()
 
         # Configure channel analog parameters
+        acadia.align_tile_latencies()
         stimulus_channel.set(nco_update_event_source="sysref", **self.stimulus["datapath"])
         capture_channel.set(nco_update_event_source="sysref", **self.capture["datapath"])
-        # stimulus_channel.nco_immediate_update_event()
-        # capture_channel.nco_immediate_update_event()
+        acadia.reset_nco_phase(stimulus_channel)
+        acadia.reset_nco_phase(capture_channel)
+        acadia.update_nco_phase(stimulus_channel, 2)
+        acadia.update_nco_phase(capture_channel, 0)
+        acadia.update_ncos_synchronized()
 
         # Assemble and load the program
         acadia.assemble()
@@ -68,8 +72,6 @@ class ReadoutTestRuntime_dsp(Runtime):
                 self.stimulus["signal"]["scale"] = amp0 * np.exp(1j*phi)
 
                 stimulus_waveform.set(**self.stimulus["signal"])
-                acadia.update_ncos_synchronized()
-
                 
                 # capture data and put in the corresponding group
                 acadia.run()
@@ -198,8 +200,8 @@ if __name__ == "__main__":
         },
 
         "waveform": {
-            "length": 700*1.25e-9,
-            "decimation": 1,
+            "length": 800*1.25e-9,
+            "decimation": 4,
             "region": "plddr"
         }
     }
@@ -211,8 +213,8 @@ if __name__ == "__main__":
 
 
     rt = ReadoutTestRuntime_dsp(stimulus, capture, phases, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_kernel_generate", files=[rt.FILE])    
-    rt.display()
+    rt.deploy("10.66.3.198", "readout_kernel_generate", files=[rt.FILE]) 
+    rt.display() 
 
     # some ad hoc processing
     rt._event_loop.join()
@@ -223,8 +225,10 @@ if __name__ == "__main__":
     all_data = all_data.view(complex).squeeze()
 
 
-    rk = ReatoutKernelGenerator(all_data, (-0.64 + 1.61j, 0.5), (0.64  -1.61j, 0.5))
-    rk.save_kernel(r"../dev_codes//")
+    rk = ReatoutKernelGenerator(all_data, (0 + 6j, 2), (0 -6j, 2))
+    print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
+
+    rk.plot_kernel()
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
     
 

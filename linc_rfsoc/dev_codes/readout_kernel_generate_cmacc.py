@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 from acadia.runtime import Runtime
-from acadia.system import Waveform
 
 
 @dataclass
-class ReadoutTestRuntime_cmacc(Runtime):
+class ReadoutTestRuntime_test(Runtime):
     """
     A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
     it on an ADC.
@@ -35,7 +34,8 @@ class ReadoutTestRuntime_cmacc(Runtime):
         capture_waveform = acadia.create_waveform(capture_channel, **self.capture["waveform"]) 
         
         # Create a record group for saving captured data
-        self.data.add_group(f"traces", uniform=True)
+        for i in range(len(self.phases)):
+            self.data.add_group(f"traces_phi{i}", uniform=True)
         
         kernel_wf = self.capture["kernel_wf"]
         if type(kernel_wf) == float: # constant value kernel
@@ -46,7 +46,7 @@ class ReadoutTestRuntime_cmacc(Runtime):
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = acadia.configure_cmacc(capture_channel, kernel=kernel_cmacc, reset_fifo=True)
+            capture_stream, kernel = acadia.configure_cmacc(capture_channel, kernel=kernel_cmacc, reset_fifo=True, write_mode="input", last_only=False)
 
             acadia.cmacc_load(capture_stream, 0)
 
@@ -91,7 +91,7 @@ class ReadoutTestRuntime_cmacc(Runtime):
                 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"traces"].write(capture_waveform.array)
+                self.data[f"traces_phi{phi_idx}"].write(capture_waveform.array)
             
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -99,24 +99,33 @@ class ReadoutTestRuntime_cmacc(Runtime):
         
         self.final_serve()
 
-
-
-
-
-
     def initialize(self):
         # Set the matplotlib backend to one which we can actually update
-        self.figsize = (4, 3) if self.figsize is None else self.figsize
+        self.phase_num = len(self.phases)
+        self.figsize = (4, 2*self.phase_num+1) if self.figsize is None else self.figsize
 
         if self.plot:
-            from acadia.processing import DynamicReadoutHistogram
+            from acadia.processing import DynamicLine
             import matplotlib.pyplot as plt
 
-            self.fig, self.ax = plt.subplots(1, 1, figsize=self.figsize)
+            self.fig, self.axs = plt.subplots(self.phase_num, 1, figsize=self.figsize)
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
-            self.hist = DynamicReadoutHistogram(self.ax)
+            if self.phase_num == 1:
+                self.axs = [self.axs]
+
+            self.lines_re = []
+            self.lines_im = []
+            for j, phi in enumerate(self.phases):
+                self.lines_re.append(DynamicLine(self.axs[j], ".-"))
+                self.lines_im.append(DynamicLine(self.axs[j], ".-"))
+                self.axs[j].set_xlabel("Time [s]")
+                self.axs[j].set_ylabel("Amp [arb. V]")
+                self.axs[j].set_title(f"Phase: {np.round(phi/np.pi, 5)}$\pi$")
+                self.axs[j].grid()
+
+            self.time_axis = None
 
         from tqdm.notebook import tqdm
         self.progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
@@ -127,27 +136,33 @@ class ReadoutTestRuntime_cmacc(Runtime):
         import matplotlib.pyplot as plt
 
         # First make sure that we actually have new data to process
-        if f"traces" not in self.data or len(self.data[f"traces"]) == 0:
+        if f"traces_phi{self.phase_num-1}" not in self.data or len(self.data[f"traces_phi{self.phase_num-1}"]) == 0:
             return
 
         # Update the progress bar based on the number of iterations that have been completed
-        completed_iterations = len(self.data[f"traces"])
+        completed_iterations = len(self.data[f"traces_phi{self.phase_num-1}"])
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations        
 
+        # We'll make an x-axis for the plot, but we only need to make it once
+        if self.time_axis is None:
+            # Last index is for quadrature
+            samples_per_trace = np.array(self.data["traces_phi0"].records()).shape[-2]
+            capture_time = self.capture["waveform"]["length"]
+            self.time_axis = np.linspace(0, capture_time, samples_per_trace, endpoint=False)
 
- 
-
-        data = self.data["traces"].records().squeeze()
-
+        self.trace_summed = np.zeros((self.phase_num, len(self.time_axis), 2), dtype=np.int64)
+        for i in range(self.phase_num):
+            self.trace_summed[i] = np.sum(self.data[f"traces_phi{i}"].records(), axis=0)
+        
         if self.plot:
-            # self.hist.update(data)
-            self.ax.hist2d(data[:, 0], data[:, 1], bins=51)
-            self.ax.relim()
-            self.ax.autoscale(tight=True)
-            self.fig.tight_layout()
-            self.fig.canvas.draw_idle()
-            self.ax.set_aspect(1)
+            for i in range(self.phase_num):
+                self.lines_re[i].update(self.time_axis, self.trace_summed[i, :,0])
+                self.lines_im[i].update(self.time_axis, self.trace_summed[i, :,1])
+                self.axs[i].relim()
+                self.axs[i].autoscale(tight=True)
+                self.fig.tight_layout()
+                self.fig.canvas.draw_idle()
 
         # Save the data
         self.data.save(self.local_directory)
@@ -197,7 +212,7 @@ if __name__ == "__main__":
 
         "waveform": {
             "length": 800*1.25e-9,
-            "decimation": 0,
+            "decimation": 4,
             "region": "plddr"
         },
 
@@ -214,23 +229,20 @@ if __name__ == "__main__":
     phases = np.array([0, np.pi])
 
 
-    rt = ReadoutTestRuntime_cmacc(stimulus, capture, phases, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_kernel_test_use", files=[rt.FILE])    
+    rt = ReadoutTestRuntime_test(stimulus, capture, phases, plot=plot, iterations=iterations)
+    rt.deploy("10.66.3.198", "readout_kernel_generate_cmacc", files=[rt.FILE])    
     rt.display()
 
     # some ad hoc processing
     rt._event_loop.join()
     rt.fig
 
-    data = rt.data["traces"].records().squeeze()
-    fig, ax = plt.subplots(1, 1)
-    ax.plot(data[:, 0], data[:, 1], "o")
-    ax.set_aspect(1)
+    all_data = np.concatenate([np.array(rt.data[f"traces_phi0"].records()).astype(float),
+                               np.array(rt.data[f"traces_phi1"].records()).astype(float)])
+    all_data = all_data.view(complex).squeeze()
 
-    #
-    # rk = ReatoutKernelGenerator(all_data, (-0.2 + 1.72j, 0.5), (0.3  -1.73j, 0.5))
+    rk = ReatoutKernelGenerator(all_data, (-0.64 + 1.61j, 0.5), (0.64  -1.61j, 0.5))
     # rk.save_kernel(r"../dev_codes//")
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
-    #
 
     

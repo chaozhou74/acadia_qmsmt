@@ -75,9 +75,10 @@ class ReatoutKernelGenerator:
             axs[0].set_aspect('equal')
 
             axs[1].set_title("IQ traces after selection")
+            trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
             for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
-                axs[1].plot(trace.real, ".-", color=f"C{i}", label=f"{['g','e'][i]} trace, re")
-                axs[1].plot(trace.imag, ".--", color=f"C{i}", label=f"{['g','e'][i]} trace, im")
+                axs[1].plot(trace.real, ".-", color=trace_colors[2*i], label=f"{['g','e'][i]} trace, re")
+                axs[1].plot(trace.imag, ".-", color=trace_colors[2*i+1], label=f"{['g','e'][i]} trace, im")
                 axs[1].set_xlabel("pts")
                 axs[1].legend()
 
@@ -87,6 +88,13 @@ class ReatoutKernelGenerator:
             plt.show()
 
         return self.kernel
+
+    def plot_kernel(self):
+        plt.figure()
+        plt.title("calculated kernel")
+        plt.plot(self.kernel.real, label="re")
+        plt.plot(self.kernel.imag, label="im")
+        plt.legend()
 
     def save_kernel(self, save_dir, save_name=None):
         save_name = datetime.now().strftime("readoutkernel_%y%m%d_%H%M%S") if save_name is None else save_name
