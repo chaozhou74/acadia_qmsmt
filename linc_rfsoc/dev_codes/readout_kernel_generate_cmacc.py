@@ -13,6 +13,7 @@ class ReadoutTestRuntime_test(Runtime):
     capture: dict
     phases: tuple 
     iterations: int
+    capture_delay: float
     plot: bool = True
     figsize: tuple[int] = None
     
@@ -28,11 +29,20 @@ class ReadoutTestRuntime_test(Runtime):
         acadia = Acadia()
         stimulus_channel = acadia.channel(self.stimulus["channel"])
         capture_channel = acadia.channel(self.capture["channel"])
+        capture_delay = self.capture_delay
 
         # Create the waveforms that we'll need 
         stimulus_waveform = acadia.create_waveform(stimulus_channel, **self.stimulus["waveform"])
         capture_waveform = acadia.create_waveform(capture_channel, **self.capture["waveform"]) 
         
+        # Create blank waveform for delay between capture and stimulus
+        if capture_delay < 0: # capture will be advanced by -capture_delay compare to stimulus
+            blank_wf = acadia.create_waveform(stimulus_channel, length=-capture_delay, blank=True)
+        elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
+            blank_wf = acadia.create_waveform(capture_channel, length=capture_delay, blank=True,
+                                              decimation=self.capture["waveform"]["decimation"], 
+                                              region=self.capture["waveform"]["region"])
+
         # Create a record group for saving captured data
         for i in range(len(self.phases)):
             self.data.add_group(f"traces_phi{i}", uniform=True)
@@ -46,11 +56,16 @@ class ReadoutTestRuntime_test(Runtime):
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = acadia.configure_cmacc(capture_channel, kernel=kernel_cmacc, reset_fifo=True, write_mode="input", last_only=False)
+            capture_stream, kernel = acadia.configure_cmacc(capture_channel, kernel=kernel_cmacc, 
+                                                            reset_fifo=True, write_mode="upper", last_only=False)
+            # capture_stream, kernel = acadia.configure_cmacc(capture_channel, kernel=kernel_cmacc, 
+                                                            # reset_fifo=True, write_mode="input", last_only=False)
 
             acadia.cmacc_load(capture_stream, 0)
 
             with a.channel_synchronizer():
+                if capture_delay != 0:     
+                    a.schedule_waveform(blank_wf)   
                 a.schedule_waveform(stimulus_waveform)
                 a.stream(capture_stream, capture_waveform)
 
@@ -178,7 +193,7 @@ class ReadoutTestRuntime_test(Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.analysis.generate_readout_kernel import ReatoutKernelGenerator, load_kernel
+    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
     
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
@@ -193,13 +208,13 @@ if __name__ == "__main__":
         },
 
         "waveform": {
-            "length": 200e-9, 
-            "fixed_length": 200e-9 
+            "length": 0., 
+            "fixed_length": 1200e-9 
         },
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.7
+            "scale": 0.05
         }
     }
 
@@ -217,19 +232,22 @@ if __name__ == "__main__":
         },
 
         # "kernel_wf": np.repeat(load_kernel("test_kernel.npy"), 4)
-        # "kernel_wf": load_kernel("test_kernel.npy")*0.1
-        # "kernel_wf": np.concatenate([np.array([0.1+0j]*200), np.array([0.0+0j]*200)])
-        # "kernel_wf":np.array([0.1+0j]*200)
-        "kernel_wf": 0.1
+        # "kernel_wf": load_kernel("test_kernel.npy")[::1]
+        # "kernel_wf": np.repeat([0.1, 0], 25)
+        "kernel_wf": np.repeat([ 0, 0.1, 0.2, 0.3], 4)
+        # "kernel_wf":np.array([0.1j]*200)
+        # "kernel_wf": 0.1
     }
 
     plot = True
-    iterations = 1000
+    iterations = 2000
     # phases = (0, np.pi/2, np.pi)
     phases = np.array([0, np.pi])
 
 
-    rt = ReadoutTestRuntime_test(stimulus, capture, phases, plot=plot, iterations=iterations)
+    rt = ReadoutTestRuntime_test(stimulus, capture, phases, 
+                                 plot=plot, iterations=iterations, capture_delay=280e-9)
+    
     rt.deploy("10.66.3.198", "readout_kernel_generate_cmacc", files=[rt.FILE])    
     rt.display()
 
@@ -240,9 +258,27 @@ if __name__ == "__main__":
     all_data = np.concatenate([np.array(rt.data[f"traces_phi0"].records()).astype(float),
                                np.array(rt.data[f"traces_phi1"].records()).astype(float)])
     all_data = all_data.view(complex).squeeze()
+    phi0_trace = np.mean(all_data[:iterations], axis=0)
 
-    rk = ReatoutKernelGenerator(all_data, (-0.64 + 1.61j, 0.5), (0.64  -1.61j, 0.5))
+    plt.figure()
+    plt.plot(phi0_trace.real)
+    plt.plot(phi0_trace.imag)
+    plt.grid()
+
+    plt.figure()
+    plt.plot((phi0_trace[1:] - phi0_trace[:-1]).real)
+    plt.plot((phi0_trace[1:] - phi0_trace[:-1]).imag)
+
+    # final_result_idx = -10
+    # fig, ax = plt.subplots(1, 1)
+    # ax.hist2d(all_data[:, final_result_idx].real, all_data[:, final_result_idx].imag, bins=51)
+    # ax.set_aspect(1)
+
     # rk.save_kernel(r"../dev_codes//")
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
+
+    plt.figure()
+    plt.plot(np.real(rt.capture["kernel_wf"]))
+    plt.plot(np.imag(rt.capture["kernel_wf"]))
 
     

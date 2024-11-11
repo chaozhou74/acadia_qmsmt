@@ -35,7 +35,7 @@ def load_kernel(kernel_path):
     kernel = np.load(kernel_path)
     return kernel
 
-class ReatoutKernelGenerator:
+class ReadoutKernelGenerator:
     def __init__(self, traces:Union[List, np.ndarray], g_circle:Tuple[complex, float], e_circle:Tuple[complex, float],
                  plot=True):
         """
@@ -116,6 +116,6 @@ if __name__ == "__main__":
     all_data = all_data.view(complex).squeeze()
 
 
-    rk = ReatoutKernelGenerator(all_data, (-1.6 + 0j, 0.5), (1.6 + 0j, 0.5))
+    rk = ReadoutKernelGenerator(all_data, (-1.6 + 0j, 0.5), (1.6 + 0j, 0.5))
     # rk.save_kernel(r"../dev_codes//")
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")

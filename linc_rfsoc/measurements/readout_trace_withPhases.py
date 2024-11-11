@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 from acadia.runtime import Runtime
-from acadia.system import Waveform
 
 
 @dataclass
-class ReadoutTestRuntime_cmacc(Runtime):
+class ReadoutTestRuntime_dsp(Runtime):
     """
     A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
     it on an ADC.
@@ -35,33 +34,22 @@ class ReadoutTestRuntime_cmacc(Runtime):
         capture_waveform = acadia.create_waveform(capture_channel, **self.capture["waveform"]) 
         
         # Create a record group for saving captured data
-        self.data.add_group(f"traces", uniform=True)
-        
-        kernel_wf = self.capture["kernel_wf"]
-        if type(kernel_wf) == float: # constant value kernel
-            kernel_wf = np.float64(kernel_wf)
-            kernel_cmacc = None
-        elif type(kernel_wf) == np.ndarray:
-            kernel_cmacc = kernel_wf
-
+        for i in range(len(self.phases)):
+            self.data.add_group(f"traces_phi{i}", uniform=True)
+                        
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = acadia.configure_cmacc(capture_channel, kernel=kernel_cmacc, reset_fifo=True)
-
-            acadia.cmacc_load(capture_stream, 0)
+            capture_stream = acadia.configure_dsp(capture_channel, self.capture["waveform"]["decimation"])
 
             with a.channel_synchronizer():
                 a.schedule_waveform(stimulus_waveform)
                 a.stream(capture_stream, capture_waveform)
 
-            return kernel
-
         # Compile the sequence
-        kernel = acadia.compile(sequence)
+        acadia.compile(sequence)
                 
         # Attach to the hardware
         acadia.attach()
-
 
         # Configure channel analog parameters
         acadia.align_tile_latencies()
@@ -69,13 +57,9 @@ class ReadoutTestRuntime_cmacc(Runtime):
         capture_channel.set(nco_update_event_source="sysref", **self.capture["datapath"])
         acadia.reset_nco_phase(stimulus_channel)
         acadia.reset_nco_phase(capture_channel)
-        acadia.update_nco_phase(stimulus_channel, 2)
+        acadia.update_nco_phase(stimulus_channel, 0)
         acadia.update_nco_phase(capture_channel, 0)
         acadia.update_ncos_synchronized()
-
-        logger.info(f"kernel waveform {kernel}, {kernel.array.shape}")
-        # Set the amplitude of the boxcar integration kernel
-        kernel.set(kernel_wf)
 
         # Assemble and load the program
         acadia.assemble()
@@ -91,7 +75,7 @@ class ReadoutTestRuntime_cmacc(Runtime):
                 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"traces"].write(capture_waveform.array)
+                self.data[f"traces_phi{phi_idx}"].write(capture_waveform.array)
             
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -101,17 +85,31 @@ class ReadoutTestRuntime_cmacc(Runtime):
 
     def initialize(self):
         # Set the matplotlib backend to one which we can actually update
-        self.figsize = (4, 3) if self.figsize is None else self.figsize
+        self.phase_num = len(self.phases)
+        self.figsize = (4, 2*self.phase_num+1) if self.figsize is None else self.figsize
 
         if self.plot:
-            from acadia.processing import DynamicReadoutHistogram
+            from acadia.processing import DynamicLine
             import matplotlib.pyplot as plt
 
-            self.fig, self.ax = plt.subplots(1, 1, figsize=self.figsize)
+            self.fig, self.axs = plt.subplots(self.phase_num, 1, figsize=self.figsize)
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
-            self.hist = DynamicReadoutHistogram(self.ax)
+            if self.phase_num == 1:
+                self.axs = [self.axs]
+
+            self.lines_re = []
+            self.lines_im = []
+            for j, phi in enumerate(self.phases):
+                self.lines_re.append(DynamicLine(self.axs[j], ".-"))
+                self.lines_im.append(DynamicLine(self.axs[j], ".-"))
+                self.axs[j].set_xlabel("Time [s]")
+                self.axs[j].set_ylabel("Amp [arb. V]")
+                self.axs[j].set_title(f"Phase: {np.round(phi/np.pi, 5)}$\pi$")
+                self.axs[j].grid()
+
+            self.time_axis = None
 
         from tqdm.notebook import tqdm
         self.progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
@@ -122,30 +120,41 @@ class ReadoutTestRuntime_cmacc(Runtime):
         import matplotlib.pyplot as plt
 
         # First make sure that we actually have new data to process
-        if f"traces" not in self.data or len(self.data[f"traces"]) == 0:
+        if f"traces_phi{self.phase_num-1}" not in self.data or len(self.data[f"traces_phi{self.phase_num-1}"]) == 0:
             return
 
         # Update the progress bar based on the number of iterations that have been completed
-        completed_iterations = len(self.data[f"traces"])
+        completed_iterations = len(self.data[f"traces_phi{self.phase_num-1}"])
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations        
 
+        # We'll make an x-axis for the plot, but we only need to make it once
+        if self.time_axis is None:
+            # Last index is for quadrature
+            samples_per_trace = np.array(self.data["traces_phi0"].records()).shape[-2]
+            capture_time = self.capture["waveform"]["length"]
+            self.time_axis = np.linspace(0, capture_time, samples_per_trace, endpoint=False)
 
- 
-
-        data = self.data["traces"].records().squeeze()
-
+        # Sum the traces from each iteration
+        # Each trace has the shape (samples, 2) where the number of samples is determined
+        # at runtime from the specified waveform length in seconds. 
+        # Because the record group is uniform, when we get the records from the
+        # group, they are stacked into a single array of shape (iterations, samples, 2)
+        self.trace_summed = np.zeros((self.phase_num, len(self.time_axis), 2), dtype=np.int64)
+        for i in range(self.phase_num):
+            self.trace_summed[i] = np.sum(self.data[f"traces_phi{i}"].records(), axis=0)
+        
         if self.plot:
-            # self.hist.update(data)
-            self.ax.hist2d(data[:, 0], data[:, 1], bins=51)
-            self.ax.relim()
-            self.ax.autoscale(tight=True)
-            self.fig.tight_layout()
-            self.fig.canvas.draw_idle()
-            self.ax.set_aspect(1)
+            for i in range(self.phase_num):
+                self.lines_re[i].update(self.time_axis, self.trace_summed[i, :,0])
+                self.lines_im[i].update(self.time_axis, self.trace_summed[i, :,1])
+                self.axs[i].relim()
+                self.axs[i].autoscale(tight=True)
+                self.fig.tight_layout()
+                self.fig.canvas.draw_idle()
 
         # Save the data
-        self.data.save(self.local_directory)
+        self.data.save(self.local_directory)    
 
     def finalize(self):
         super().finalize()
@@ -169,17 +178,17 @@ if __name__ == "__main__":
         "datapath": {
             "vop": 30000,
             "mix_reconstruction": True,
-            "nco_frequency": 9.03e9
+            "nco_frequency": 9.03002e9
         },
 
         "waveform": {
-            "length": 200e-9, 
-            "fixed_length": 200e-9 
+            "length": 40e-9, 
+            "fixed_length": 1.6e-6
         },
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.05
+            "scale": 0.8
         }
     }
 
@@ -187,45 +196,44 @@ if __name__ == "__main__":
         "channel": "ADC0",
 
         "datapath": {
-            "nco_frequency": -9.03e9
+            "nco_frequency": -9.03002e9
         },
 
         "waveform": {
-            "length": 800*1.25e-9,
-            "decimation": 0,
+            "length": 2000*1.25e-9,
+            "decimation": 8,
             "region": "plddr"
-        },
-
-        # "kernel_wf": np.repeat(load_kernel("test_kernel.npy"), 4)
-        "kernel_wf": load_kernel("test_kernel.npy")
-        # "kernel_wf": np.concatenate([np.array([0.1+0j]*200), np.array([0.0+0j]*200)])
-        # "kernel_wf":np.array([0.1+0j]*200)
-        # "kernel_wf": 0.1
+        }
     }
 
     plot = True
-    iterations = 1000
+    iterations = 10000
     # phases = (0, np.pi/2, np.pi)
-    phases = np.array([0, np.pi])
+    phases = np.array([0, np.pi]) + np.pi/4
 
 
-    rt = ReadoutTestRuntime_cmacc(stimulus, capture, phases, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_kernel_test_use", files=[rt.FILE])    
-    rt.display()
+    rt = ReadoutTestRuntime_dsp(stimulus, capture, phases, plot=plot, iterations=iterations)
+    rt.deploy("10.66.3.198", "readout_trace", files=[rt.FILE]) 
+    rt.display() 
 
     # some ad hoc processing
     rt._event_loop.join()
     rt.fig
 
-    data = rt.data["traces"].records().squeeze()
+
+    all_traces = np.concatenate([np.array(rt.data[f"traces_phi{i}"].records()).astype(float) for i in range(len(phases))])
+    all_traces = all_traces.view(complex).squeeze()
+    all_pts = np.mean(all_traces, axis=1)
     fig, ax = plt.subplots(1, 1)
-    ax.plot(data[:, 0], data[:, 1], "o")
+    ax.hist2d(all_pts.real, all_pts.imag, cmap="hot", bins=51)
     ax.set_aspect(1)
 
-    #
-    # rk = ReatoutKernelGenerator(all_data, (-0.2 + 1.72j, 0.5), (0.3  -1.73j, 0.5))
-    # rk.save_kernel(r"../dev_codes//")
+
+    # rk = ReadoutKernelGenerator(all_data, (-13 + 5j, 2), (13 - 5j, 2))
+    # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
+
+    # rk.plot_kernel()
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
-    #
+    
 
     
