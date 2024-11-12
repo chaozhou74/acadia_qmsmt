@@ -69,8 +69,8 @@ class QubitSpecRuntime(Runtime):
             with a.channel_synchronizer():
                 a.schedule_waveform(qubit_stimulus_waveform)
                 a.barrier()
-                a.schedule_waveform(blank_wf)
-                a.barrier()
+                # a.schedule_waveform(blank_wf)
+                # a.barrier()
                 a.schedule_waveform(readout_stimulus_waveform)
                 a.stream(capture_stream, readout_capture_waveform)
 
@@ -191,37 +191,37 @@ if __name__ == "__main__":
     get_ipython().run_line_magic("matplotlib", "widget")
 
     qubit_stimulus: dict = {
-        "channel": "DAC0",
+        "channel": "DAC1",
 
         "datapath": {
             "vop": 30000,
-            "mix_reconstruction": True,
-            "nco_frequency": 8.23e9
+            "mix_reconstruction": False,
+            "nco_frequency": 40e6
         },
 
         "waveform": {
-            "length": 200e-9, 
-            "fixed_length": 1e-6
+            "length": 600e-9*1,  # this only works when length = 200e-9
+            "fixed_length": 0.0
         },
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.03
+            "scale": 0.8
         }
     }
 
     readout_stimulus: dict = {
-        "channel": "DAC2",
+        "channel": "DAC4",
 
         "datapath": {
             "vop": 30000,
-            "mix_reconstruction": True,
-            "nco_frequency": 9.03002e9
+            "mix_reconstruction": False,
+            "nco_frequency": 40e6
             # "nco_frequency": 8.23e9
         },
 
         "waveform": {
-            "length": 200e-9, 
+            "length": 200e-9*1, 
             "fixed_length": 2e-6
         },
         
@@ -249,11 +249,11 @@ if __name__ == "__main__":
 
     plot = True
     iterations = 500
-    qubit_freqs = np.linspace(-2e6, 2e6, 101) + 8.23e9
+    qubit_freqs = np.array([50e6])
 
 
     rt = QubitSpecRuntime(qubit_freqs, qubit_stimulus, readout_stimulus, readout_capture, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "qubit_spec", files=[rt.FILE])    
+    rt.deploy("10.66.3.198", "qubit_spec_test", files=[rt.FILE])    
     rt.display()
 
     # some ad hoc processing

@@ -37,15 +37,16 @@ class QubitPwrRabiRuntime(Runtime):
 
         # Create the waveforms that we'll need 
         qubit_stimulus_waveform = acadia.create_waveform(qubit_channel, **self.qubit_stimulus["waveform"])
-        readout_stimulus_waveform = acadia.create_waveform(readout_stimulus_channel, **self.qubit_stimulus["waveform"])
+        readout_stimulus_waveform = acadia.create_waveform(readout_stimulus_channel, **self.readout_stimulus["waveform"])
         readout_capture_waveform = acadia.create_waveform(readout_capture_channel, **self.readout_capture["waveform"]) 
-
-        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-6, blank=True) 
+        
+        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-9, blank=True) 
         #todo: add wait length to input
 
         # assemble channel objects
         channels_ = [qubit_channel, readout_stimulus_channel, readout_capture_channel]
         channel_configs = [self.qubit_stimulus, self.readout_stimulus, self.readout_capture]
+        channel_wfs = [qubit_stimulus_waveform, readout_stimulus_waveform, readout_capture_waveform]
         
         # Create a record group for saving captured data
         self.data.add_group(f"traces", uniform=True)
@@ -68,10 +69,12 @@ class QubitPwrRabiRuntime(Runtime):
             with a.channel_synchronizer():
                 a.schedule_waveform(qubit_stimulus_waveform)
                 a.barrier()
-                a.schedule_waveform(readout_stimulus_waveform)
-                a.stream(capture_stream, readout_capture_waveform)
                 a.schedule_waveform(blank_wf)
                 a.barrier()
+                a.schedule_waveform(readout_stimulus_waveform)
+                a.stream(capture_stream, readout_capture_waveform)
+                # a.schedule_waveform(blank_wf)
+                # a.barrier()
 
             return kernel
 
@@ -85,7 +88,9 @@ class QubitPwrRabiRuntime(Runtime):
         # Configure channel analog parameters
         # todo: this should be written as a generic function that automatically resets all channels used
         acadia.align_tile_latencies()
-        for ch, config in zip(channels_, channel_configs):
+        for ch, config, wf in zip(channels_, channel_configs, channel_wfs):
+            if "signal" in config: # is DAC channel
+                wf.set(**config["signal"])
             ch.set(nco_update_event_source="sysref", **config["datapath"])
             acadia.reset_nco_phase(ch)
             acadia.update_nco_phase(ch, 0)
@@ -203,7 +208,7 @@ if __name__ == "__main__":
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.6
+            "scale": 0.3
         }
     }
 
@@ -218,8 +223,8 @@ if __name__ == "__main__":
         },
 
         "waveform": {
-            "length": 40e-9, 
-            "fixed_length": 1.6e-6
+            "length":200e-9, 
+            "fixed_length": 2e-6
         },
         
         "signal": {
@@ -245,7 +250,7 @@ if __name__ == "__main__":
     }
 
     plot = True
-    iterations = 5000
+    iterations = 500
     qubit_amp_scales = np.linspace(-1.5, 1.5, 61)
 
 

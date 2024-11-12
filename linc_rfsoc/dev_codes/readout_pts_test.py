@@ -25,6 +25,7 @@ class ReadoutTestRuntime_cmacc(Runtime):
         import logging
         
         logger = logging.getLogger("acadia")
+
         # Create an acadia object and grab a couple of its channels
         acadia = Acadia()
         stimulus_channel = acadia.channel(self.stimulus["channel"])
@@ -69,7 +70,7 @@ class ReadoutTestRuntime_cmacc(Runtime):
         capture_channel.set(nco_update_event_source="sysref", **self.capture["datapath"])
         acadia.reset_nco_phase(stimulus_channel)
         acadia.reset_nco_phase(capture_channel)
-        acadia.update_nco_phase(stimulus_channel, 2)
+        acadia.update_nco_phase(stimulus_channel, 0)
         acadia.update_nco_phase(capture_channel, 0)
         acadia.update_ncos_synchronized()
 
@@ -164,22 +165,22 @@ if __name__ == "__main__":
     get_ipython().run_line_magic("matplotlib", "widget")
 
     stimulus: dict = {
-        "channel": "DAC2",
+        "channel": "DAC1",
 
         "datapath": {
             "vop": 30000,
-            "mix_reconstruction": True,
-            "nco_frequency": 9.03e9
+            "mix_reconstruction": False,
+            "nco_frequency": 40e6
         },
 
         "waveform": {
-            "length": 200e-9, 
-            "fixed_length": 200e-9 
+            "length": 290e-9 , 
+            "fixed_length": 200e-9*0 # question: this always works for any length I use
         },
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.05
+            "scale": 0.5
         }
     }
 
@@ -187,30 +188,26 @@ if __name__ == "__main__":
         "channel": "ADC0",
 
         "datapath": {
-            "nco_frequency": -9.03e9
+            "nco_frequency": -9.03002e9
         },
 
         "waveform": {
-            "length": 800*1.25e-9,
+            "length": 2000*1.25e-9,
             "decimation": 0,
             "region": "plddr"
         },
 
-        # "kernel_wf": np.repeat(load_kernel("test_kernel.npy"), 4)
-        # "kernel_wf": load_kernel("test_kernel.npy")
-        # "kernel_wf": np.concatenate([np.array([0.1+0j]*200), np.array([0.0+0j]*200)])
-        # "kernel_wf":np.array([0.1+0j]*200)
         "kernel_wf": 0.1
     }
 
     plot = True
-    iterations = 1000
+    iterations = 500
     # phases = (0, np.pi/2, np.pi)
     phases = np.array([0, np.pi])
 
 
     rt = ReadoutTestRuntime_cmacc(stimulus, capture, phases, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_kernel_test_use", files=[rt.FILE])    
+    rt.deploy("10.66.3.198", "readout_pts_test", files=[rt.FILE])    
     rt.display()
 
     # some ad hoc processing
@@ -222,10 +219,6 @@ if __name__ == "__main__":
     ax.plot(data[:, 0], data[:, 1], "o")
     ax.set_aspect(1)
 
-    #
-    # rk = ReatoutKernelGenerator(all_data, (-0.2 + 1.72j, 0.5), (0.3  -1.73j, 0.5))
-    # rk.save_kernel(r"../dev_codes//")
-    # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
-    #
+
 
     
