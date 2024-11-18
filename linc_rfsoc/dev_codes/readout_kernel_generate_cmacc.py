@@ -193,7 +193,6 @@ class ReadoutTestRuntime_test(Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
     
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
@@ -214,7 +213,7 @@ if __name__ == "__main__":
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.05
+            "scale": 0.5
         }
     }
 
@@ -231,18 +230,19 @@ if __name__ == "__main__":
             "region": "plddr"
         },
 
-        # "kernel_wf": np.repeat(load_kernel("test_kernel.npy"), 4)
-        # "kernel_wf": load_kernel("test_kernel.npy")[::1]
-        # "kernel_wf": np.repeat([0.1, 0], 25)
-        "kernel_wf": np.repeat([ 0, 0.1, 0.2, 0.3], 4)
+
+        # "kernel_wf": np.repeat([0.1, 0], 100) # full length of the capture waveform
+        "kernel_wf": np.repeat([0, 0.1, 0.1, 0], 50) # full length of the capture waveform
+        # "kernel_wf": np.repeat([0, 0.1, 0.1, 0], 50)[::4] # quoter length of the capture waveform
+        # "kernel_wf": np.repeat([ 0, 0.1, 0.2, 0.3], 4)
         # "kernel_wf":np.array([0.1j]*200)
         # "kernel_wf": 0.1
     }
 
     plot = True
-    iterations = 2000
+    iterations = 10000
     # phases = (0, np.pi/2, np.pi)
-    phases = np.array([0, np.pi])
+    phases = np.array([0])
 
 
     rt = ReadoutTestRuntime_test(stimulus, capture, phases, 
@@ -253,31 +253,24 @@ if __name__ == "__main__":
 
     # some ad hoc processing
     rt._event_loop.join()
-    rt.fig
 
-    all_data = np.concatenate([np.array(rt.data[f"traces_phi0"].records()).astype(float),
-                               np.array(rt.data[f"traces_phi1"].records()).astype(float)])
-    all_data = all_data.view(complex).squeeze()
-    phi0_trace = np.mean(all_data[:iterations], axis=0)
+    phi0_data = np.array(rt.data[f"traces_phi0"].records()).astype(float).view(complex).squeeze()
+    phi0_trace = np.mean(phi0_data, axis=0)
 
     plt.figure()
+    plt.title("received data")
     plt.plot(phi0_trace.real)
     plt.plot(phi0_trace.imag)
     plt.grid()
 
     plt.figure()
+    plt.title("data derivative (inferred kernel)")
     plt.plot((phi0_trace[1:] - phi0_trace[:-1]).real)
     plt.plot((phi0_trace[1:] - phi0_trace[:-1]).imag)
 
-    # final_result_idx = -10
-    # fig, ax = plt.subplots(1, 1)
-    # ax.hist2d(all_data[:, final_result_idx].real, all_data[:, final_result_idx].imag, bins=51)
-    # ax.set_aspect(1)
-
-    # rk.save_kernel(r"../dev_codes//")
-    # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
 
     plt.figure()
+    plt.title("uploaded kernel")
     plt.plot(np.real(rt.capture["kernel_wf"]))
     plt.plot(np.imag(rt.capture["kernel_wf"]))
 

@@ -87,7 +87,7 @@ class QubitPwrRabiRuntime(Runtime):
 
         # Configure channel analog parameters
         # todo: this should be written as a generic function that automatically resets all channels used
-        acadia.align_tile_latencies()
+        acadia.align_tile_latencies() # todo: might not be necessary
         for ch, config, wf in zip(channels_, channel_configs, channel_wfs):
             if "signal" in config: # is DAC channel
                 wf.set(**config["signal"])
