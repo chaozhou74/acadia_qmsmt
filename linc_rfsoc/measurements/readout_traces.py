@@ -194,7 +194,7 @@ if __name__ == "__main__":
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
 
-    config_dict = load_config() # todo: make the yaml file take complex values
+    config_dict = load_config() 
 
     plot = True
     iterations = 5000
@@ -216,8 +216,8 @@ if __name__ == "__main__":
     ax.set_aspect(1)
 
     
-    # from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
-    # rk = ReadoutKernelGenerator(all_traces, (70 + 73j, 20), (16 + 105j, 20))
+    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
+    rk = ReadoutKernelGenerator(all_traces, (-120 + 0j, 20), (-90 + 65j, 20))
 
     # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
 

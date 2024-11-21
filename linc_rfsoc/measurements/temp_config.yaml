@@ -24,7 +24,7 @@ ro_stimulus:
       fixed_length: 1.6e-6
   signal:
     data: ["scipy", "hann"]
-    scale: -0.4
+    scale: 0.1+0.5j
 
 ro_capture:
   channel: "ADC0"

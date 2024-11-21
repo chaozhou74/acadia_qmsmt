@@ -1,4 +1,3 @@
-import yaml
 from linc_rfsoc.helpers.yaml_editor import update_yaml, load_yaml
 
 CONFIG_FILE_PATH = "temp_config.yaml"

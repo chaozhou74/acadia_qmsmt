@@ -8,6 +8,9 @@ FILE = __file__
 
 #todo: this should be moved to a separate submodule... But need to figure out a easy way to send this to the board
 
+# todo: needs to also configure have separate signals.
+
+
 class AutoConfigMixin:
     """
     takes the overall config dict and automatically applies some configurations
@@ -51,7 +54,7 @@ class AutoConfigMixin:
         :return:
         """
         if align_tile:
-            acadia.align_tile_latencies() # todo: might be removed?
+            acadia.align_tile_latencies() 
         for ch_name, config in configs.items():
             channel_obj = self.channel_objs[ch_name]
             # Configure  analog parameters for each channel
