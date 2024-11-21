@@ -1,37 +1,38 @@
 q_stimulus:
   channel: "DAC0"
   nco_config:
-    vop: 30000
+    vop: 20000
     mix_reconstruction: true
     nco_frequency: 8.23e9
   waveforms:
     pi_pulse:
-      length: 40e-9
-      fixed_length: 1.6e-6
+      length: 40.0e-9
+      fixed_length: 200.0e-9
   signal:
     data: ["scipy", "hann"]
-    scale: 0.03
+    scale: 0.24
 
 ro_stimulus:
   channel: "DAC2"
   nco_config:
-    vop: 30000
+    vop: 25000
     mix_reconstruction: true
-    nco_frequency: 9.03002e9
+    nco_frequency: 9.030e9
   waveforms:
     ro_drive:
-      length: 40e-9
+      length: 40.e-9
       fixed_length: 1.6e-6
   signal:
     data: ["scipy", "hann"]
-    scale: 0.8
+    scale: -0.4
 
 ro_capture:
   channel: "ADC0"
   nco_config:
-    nco_frequency: -9.03002e9
+    nco_frequency: -9.030e9
   waveforms:
     ro_demod:
-      length: 2.5e-6
+      length: 2.4e-6
       decimation: 8
       region: "plddr"
+  capture_delay: 300e-9

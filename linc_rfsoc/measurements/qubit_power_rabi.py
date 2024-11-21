@@ -208,7 +208,7 @@ if __name__ == "__main__":
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.3
+            "scale": 0.24
         }
     }
 
@@ -216,7 +216,7 @@ if __name__ == "__main__":
         "channel": "DAC2",
 
         "datapath": {
-            "vop": 30000,
+            "vop":25000,
             "mix_reconstruction": True,
             "nco_frequency": 9.03002e9
             # "nco_frequency": 8.23e9
@@ -229,7 +229,7 @@ if __name__ == "__main__":
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.8
+            "scale": 0.6
         }
     }
 
@@ -251,7 +251,7 @@ if __name__ == "__main__":
 
     plot = True
     iterations = 500
-    qubit_amp_scales = np.linspace(-1.5, 1.5, 61)
+    qubit_amp_scales = np.linspace(-1.5, 1.5, 61) # not the scale in "signal", is multiply factor on that
 
 
     rt = QubitPwrRabiRuntime(qubit_amp_scales, qubit_stimulus, readout_stimulus, readout_capture, plot=plot, iterations=iterations)

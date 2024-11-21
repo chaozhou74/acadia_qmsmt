@@ -1,4 +1,6 @@
+from copy import deepcopy
 
+from acadia import Acadia
 
 
 FILE = __file__
@@ -11,16 +13,17 @@ class AutoConfigMixin:
     takes the overall config dict and automatically applies some configurations
     """
 
-    def auto_config_channels(self, acadia, **configs):
+    def auto_config_channels(self, acadia: Acadia, **configs):
         """
         Automatically configure channels with given configurations dicts and add them to a collection.
         """
+        self.channel_configs = configs
         self.channel_objs = {}
         for ch_name, config in configs.items():
             self.channel_objs[ch_name] = acadia.channel(config["channel"])
 
 
-    def auto_config_waveform_mems(self, acadia, **configs):
+    def auto_config_waveform_mems(self, acadia: Acadia, **configs):
         """
 
         :param acadia:
@@ -37,7 +40,8 @@ class AutoConfigMixin:
                 wf_obj = acadia.create_waveform(channel_obj, **wf_cgf)
                 self.channel_waveforms[ch_name][wf_name] = wf_obj
 
-    def auto_config_ncos(self, acadia, nco_update_event_source="sysref", reset_phases=True, **configs):
+    def auto_config_ncos(self, acadia: Acadia, nco_update_event_source="sysref", 
+                         reset_phases=True, align_tile=True, **configs):
         """
 
         :param acadia:
@@ -46,7 +50,8 @@ class AutoConfigMixin:
         :param configs:
         :return:
         """
-        acadia.align_tile_latencies() # todo: might be removed?
+        if align_tile:
+            acadia.align_tile_latencies() # todo: might be removed?
         for ch_name, config in configs.items():
             channel_obj = self.channel_objs[ch_name]
             # Configure  analog parameters for each channel
@@ -62,5 +67,37 @@ class AutoConfigMixin:
 
 
 
-    # todo: should have auto config for 'channel', 'datapath', ('waveform', and 'signal')
-    #  consider renaming those also.....
+    def blank_waveform_generator(self, acadia: Acadia, channel:str, reference_waveform:dict=None):
+        """function for making blank waveforms for dac or adc channels
+
+        :param acadia: 
+        :param channel: name of the DAC or ADC channel
+        :param reference_waveform: for ADC channel, a reference waveform needs to provided to decide the
+            `decimation` and `region`
+        """
+        channel_obj = self.channel_objs[channel]
+        waveform_args = {"blank": True}
+
+        # get decimation and wf region for blank wf in adc channels
+        if not channel_obj.is_dac:
+            if reference_waveform is None:
+                # check if all the waveform mem configuration in the channel has the same settings
+                for i, wf_cfg in enumerate(self.channel_configs[channel]["waveforms"].values()):
+                    d, r = wf_cfg.get("decimation", None), wf_cfg.get("region", None)
+                    if i == 0:
+                        decimation, region = d, r
+                    if decimation != d or region != r:
+                        raise ValueError(f"for blank waveform in an ADC channel, a reference waveform name must be provided")
+            else:
+                ref_wf_cfg = self.channel_configs[channel]["waveforms"][reference_waveform]
+                decimation = ref_wf_cfg.get("decimation", None)
+                region = ref_wf_cfg.get("region", None)
+            
+            waveform_args.update({"decimation": decimation, "region": region})
+        
+        def blank_wf_gen(length:float):
+            blank_wf = acadia.create_waveform(channel_obj, length=length, **waveform_args)
+            return blank_wf
+        
+        return blank_wf_gen
+        
