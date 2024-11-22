@@ -39,7 +39,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
 
         # Allocate the waveform memories that we'll need
         self.auto_config_waveform_mems(acadia, **channel_configs)
-        pi_pulse = self.channel_waveforms["q_stimulus"]["pi_pulse"]
+        q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
         ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
         ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
         
@@ -63,7 +63,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
             capture_stream = acadia.configure_dsp(self.channel_objs["ro_capture"], ro_demod._decimation) 
         
             with a.channel_synchronizer():
-                a.schedule_waveform(pi_pulse)
+                a.schedule_waveform(q_rotation)
                 a.schedule_waveform(q_blank_wf)
                 a.barrier()
                 if capture_delay != 0:     
@@ -85,19 +85,20 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         acadia.load()
 
         # set waveform for ro drive
-        ro_drive.set(**self.ro_stimulus["signal"])
+        ro_drive.set(**self.ro_stimulus["signals"]["readout"])
 
         # average iterations for preparing qubit in g and e
-        amp0 = self.q_stimulus["signal"]["scale"]
+        pi_signal = self.q_stimulus["signals"]["pi_pulse"]
+        pi_amp = pi_signal["scale"]
         for i in range(self.iterations):
             for state_ in ["g", "e"]:
                 # set the pulse amplitude
                 if state_ == "g":
-                    self.q_stimulus["signal"]["scale"] = 0
+                    pi_signal["scale"] = 0
                 else:
-                    self.q_stimulus["signal"]["scale"] = amp0
+                    pi_signal["scale"] = pi_amp
 
-                pi_pulse.set(**self.q_stimulus["signal"])
+                q_rotation.set(**pi_signal)
                 
                 # capture data and put in the corresponding group
                 acadia.run()
@@ -175,7 +176,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                 self.fig.canvas.draw_idle()
 
         # Save the data
-        self.data.save(self.local_directory)    
+        self.data.save(self.local_directory)
 
     def finalize(self):
         super().finalize()
@@ -216,8 +217,8 @@ if __name__ == "__main__":
     ax.set_aspect(1)
 
     
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
-    rk = ReadoutKernelGenerator(all_traces, (-120 + 0j, 20), (-90 + 65j, 20))
+    # from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
+    # rk = ReadoutKernelGenerator(all_traces, (-90 + 65j, 20), (-115 + 0j, 20))
 
     # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
 

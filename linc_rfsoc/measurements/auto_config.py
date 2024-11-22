@@ -6,9 +6,7 @@ from acadia import Acadia
 FILE = __file__
 
 
-#todo: this should be moved to a separate submodule... But need to figure out a easy way to send this to the board
-
-# todo: needs to also configure have separate signals.
+# todo: this should be moved to a separate submodule... But need to figure out a easy way to send this to the board
 
 
 class AutoConfigMixin:
@@ -95,7 +93,9 @@ class AutoConfigMixin:
                 ref_wf_cfg = self.channel_configs[channel]["waveforms"][reference_waveform]
                 decimation = ref_wf_cfg.get("decimation", None)
                 region = ref_wf_cfg.get("region", None)
-            
+
+            if decimation == 0:
+                decimation = 4 # for cmacc # todo: need to test
             waveform_args.update({"decimation": decimation, "region": region})
         
         def blank_wf_gen(length:float):

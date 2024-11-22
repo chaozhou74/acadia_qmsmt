@@ -1,100 +1,99 @@
 from dataclasses import dataclass
+from typing import Union
+import numpy as np
 from acadia.runtime import Runtime
-from acadia.system import Waveform
+
+from auto_config import AutoConfigMixin
+from auto_config import FILE as config_helper_file
 
 
 @dataclass
-class QubitSpecRuntime(Runtime):
+class QubitSpecRuntime(AutoConfigMixin, Runtime):
     """
     A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
     it on an ADC.
     """
 
-    qubit_frequencies: list 
-    qubit_stimulus: dict
-    readout_stimulus: dict
-    readout_capture: dict
+    q_stimulus: dict
+    ro_stimulus: dict
+    ro_capture: dict
+
+    qubit_frequencies: Union[list, np.ndarray]
 
     iterations: int
     plot: bool = True
     figsize: tuple[int] = None
-    
+
     FILE = __file__
-        
-    def main(self):     
+
+    def main(self):
         from acadia import Acadia, DataManager
         import numpy as np
         import logging
-        
+
         logger = logging.getLogger("acadia")
+
+        channel_configs = {"q_stimulus": self.q_stimulus,
+                           "ro_stimulus": self.ro_stimulus,
+                           "ro_capture": self.ro_capture
+                           }
 
         # Create an acadia object and grab a couple of its channels
         acadia = Acadia()
-        qubit_channel = acadia.channel(self.qubit_stimulus["channel"])
-        readout_stimulus_channel = acadia.channel(self.readout_stimulus["channel"])
-        readout_capture_channel = acadia.channel(self.readout_capture["channel"])
+        self.auto_config_channels(acadia, **channel_configs)
 
+        # Allocate the waveform memories that we'll need
+        self.auto_config_waveform_mems(acadia, **channel_configs)
+        q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
+        ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
+        ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
 
-        # Create the waveforms that we'll need 
-        qubit_stimulus_waveform = acadia.create_waveform(qubit_channel, **self.qubit_stimulus["waveform"])
-        readout_stimulus_waveform = acadia.create_waveform(readout_stimulus_channel, **self.readout_stimulus["waveform"])
-        readout_capture_waveform = acadia.create_waveform(readout_capture_channel, **self.readout_capture["waveform"]) 
-        
-        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-9, blank=True) 
-        #todo: add wait length to input
+        # Create a blank waveform between qubit drive and readout drive
+        q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
 
-        # assemble channel objects
-        channels_ = [qubit_channel, readout_stimulus_channel, readout_capture_channel]
-        channel_configs = [self.qubit_stimulus, self.readout_stimulus, self.readout_capture]
-        channel_wfs = [qubit_stimulus_waveform, readout_stimulus_waveform, readout_capture_waveform]
-        
-        # Create a record group for saving captured data
-        self.data.add_group(f"traces", uniform=True)
-        
-        # todo: this could be simplified
-        kernel_wf = self.readout_capture["kernel_wf"]
-        if type(kernel_wf) == float: # constant value kernel
+        # Create blank waveform for delay between capture and stimulus
+        capture_delay = self.ro_capture["capture_delay"]
+        if capture_delay < 0:  # capture will be advanced by -capture_delay compare to stimulus
+            blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
+        elif capture_delay > 0:  # capture will be delayed by capture_delay compare to stimulus
+            blank_wf = self.blank_waveform_generator(acadia, "ro_capture")(capture_delay)
+
+        kernel_wf = self.ro_capture.get("kernel_wf", 0.1)
+        if type(kernel_wf) == float:  # constant value kernel
             kernel_wf = np.float64(kernel_wf)
             kernel_cmacc = None
         elif type(kernel_wf) == np.ndarray:
             kernel_cmacc = kernel_wf
 
+        # Create the record groups for saving captured data
+        self.data.add_group(f"spec", uniform=True)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = acadia.configure_cmacc(readout_capture_channel, kernel=kernel_cmacc, reset_fifo=True)
+            capture_stream, kernel = acadia.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
+                                                            reset_fifo=True)
 
             acadia.cmacc_load(capture_stream, 0)
 
             with a.channel_synchronizer():
-                a.schedule_waveform(qubit_stimulus_waveform)
+                a.schedule_waveform(q_rotation)
+                a.schedule_waveform(q_blank_wf)
                 a.barrier()
-                a.schedule_waveform(blank_wf)
-                a.barrier()
-                a.schedule_waveform(readout_stimulus_waveform)
-                a.stream(capture_stream, readout_capture_waveform)
-
+                if capture_delay != 0:
+                    a.schedule_waveform(blank_wf)
+                a.schedule_waveform(ro_drive)
+                a.stream(capture_stream, ro_demod)
 
             return kernel
 
         # Compile the sequence
         kernel = acadia.compile(sequence)
-                
+
         # Attach to the hardware
         acadia.attach()
 
-
         # Configure channel analog parameters
-        # todo: this should be written as a generic function that automatically resets all channels used
-        acadia.align_tile_latencies()
-        for ch, config, wf in zip(channels_, channel_configs, channel_wfs):
-            if "signal" in config: # is DAC channel
-                wf.set(**config["signal"])
-            ch.set(nco_update_event_source="sysref", **config["datapath"])
-            acadia.reset_nco_phase(ch)
-            acadia.update_nco_phase(ch, 0)
-        acadia.update_ncos_synchronized()
-
+        self.auto_config_ncos(acadia, **channel_configs)
 
         # Set the amplitude of the boxcar integration kernel
         kernel.set(kernel_wf)
@@ -103,20 +102,23 @@ class QubitSpecRuntime(Runtime):
         acadia.assemble()
         acadia.load()
 
+        # set waveform for ro drive
+        ro_drive.set(**self.ro_stimulus["signals"]["readout"])
+
         for i in range(self.iterations):
             for freq_idx, freq in enumerate(self.qubit_frequencies):
                 # set the qubit nco freq
-                acadia.update_nco_frequency(qubit_channel, freq)
+                acadia.update_nco_frequency(self.channel_objs["q_stimulus"], freq)
                 acadia.update_ncos_synchronized()
 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"traces"].write(readout_capture_waveform.array)
-            
+                self.data[f"spec"].write(ro_demod.array)
+
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
                 return
-        
+
         self.final_serve()
 
     def initialize(self):
@@ -145,17 +147,16 @@ class QubitSpecRuntime(Runtime):
         n_freqs = len(self.qubit_frequencies)
 
         # First make sure that we actually have new data to process
-        if f"traces" not in self.data or len(self.data[f"traces"]) < n_freqs:
+        if "spec" not in self.data or len(self.data["spec"]) < n_freqs:
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["traces"]) // n_freqs
+        completed_iterations = len(self.data["spec"]) // n_freqs
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
-        self.previous_completed_iterations = completed_iterations        
+        self.previous_completed_iterations = completed_iterations
 
-
-        valid_traces = completed_iterations*n_freqs
-        data = self.data["traces"].records()[:valid_traces, ...].squeeze()
+        valid_traces = completed_iterations * n_freqs
+        data = self.data["spec"].records()[:valid_traces, ...].squeeze()
 
         # Get the collection of data and reshape it so that the axes index as: 
         # (iteration, frequency, sample quadrature)
@@ -164,8 +165,8 @@ class QubitSpecRuntime(Runtime):
 
         if self.plot:
             # self.hist.update(data)
-            self.line_re.update(self.qubit_frequencies, data_sum[:,0])
-            self.line_im.update(self.qubit_frequencies, data_sum[:,1])
+            self.line_re.update(self.qubit_frequencies, data_sum[:, 0])
+            self.line_im.update(self.qubit_frequencies, data_sum[:, 1])
             self.ax.relim()
             self.ax.autoscale(tight=True)
             self.fig.tight_layout()
@@ -178,82 +179,27 @@ class QubitSpecRuntime(Runtime):
         super().finalize()
         self.progress_bar.close()
         if self.plot:
-            self.savefig(self.fig)  
+            self.savefig(self.fig)
 
 
-    
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
+    from linc_rfsoc.measurements import load_config
     from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
-    
+
     from IPython.core.getipython import get_ipython
+
     get_ipython().run_line_magic("matplotlib", "widget")
 
-    qubit_stimulus: dict = {
-        "channel": "DAC0",
-
-        "datapath": {
-            "vop": 30000,
-            "mix_reconstruction": True,
-            "nco_frequency": 8.23e9
-        },
-
-        "waveform": {
-            "length": 200e-9, 
-            "fixed_length": 1e-6
-        },
-        
-        "signal": {
-            "data": ("scipy", "hann"),
-            "scale": 0.03
-        }
-    }
-
-    readout_stimulus: dict = {
-        "channel": "DAC2",
-
-        "datapath": {
-            "vop": 30000,
-            "mix_reconstruction": True,
-            "nco_frequency": 9.03002e9
-            # "nco_frequency": 8.23e9
-        },
-
-        "waveform": {
-            "length": 200e-9, 
-            "fixed_length": 2e-6
-        },
-        
-        "signal": {
-            "data": ("scipy", "hann"),
-            "scale": 0.8
-        }
-    }
-
-    readout_capture: dict = {
-        "channel": "ADC0",
-
-        "datapath": {
-            "nco_frequency": -9.03002e9
-        },
-
-        "waveform": {
-            "length": 2000*1.25e-9,
-            "decimation": 0,
-            "region": "plddr"
-        },
-
-        "kernel_wf": 0.1
-    }
+    config_dict = load_config()
 
     plot = True
     iterations = 500
-    qubit_freqs = np.linspace(-2e6, 2e6, 101) + 8.23e9
+    qubit_freqs = np.linspace(-20e6, 20e6, 101) + 8.23e9
 
-
-    rt = QubitSpecRuntime(qubit_freqs, qubit_stimulus, readout_stimulus, readout_capture, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "qubit_spec", files=[rt.FILE])    
+    rt = QubitSpecRuntime(**config_dict, qubit_frequencies=qubit_freqs, plot=plot, iterations=iterations)
+    rt.deploy("10.66.3.198", "qubit_spec", files=[rt.FILE, config_helper_file])
     rt.display()
 
     # some ad hoc processing
@@ -266,5 +212,3 @@ if __name__ == "__main__":
     # fig, axs = plt.subplots(2, 1, figsize=(6,6))
     # axs[0].plot(qubit_freqs, data_avg.real, ".-")
     # axs[1].plot(qubit_freqs, data_avg.imag, ".-")
-
-    

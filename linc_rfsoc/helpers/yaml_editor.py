@@ -6,7 +6,7 @@ import ruamel.yaml as yaml
 from linc_rfsoc.helpers.yaml_rountine import PARAMETER_HANDLERS
 
 
-def apply_handlers(config: dict, handlers: dict) -> dict:
+def apply_type_handlers(config: dict, handlers: dict) -> dict:
     """
     Recursively applies type handlers to matched paths in the configuration dict.
 
@@ -42,7 +42,8 @@ def load_yaml(yaml_path: str):
     yml = yaml.YAML(typ='safe', pure=True)
     with open(yaml_path, 'r') as file:
         config = yml.load(file)
-    return apply_handlers(config, PARAMETER_HANDLERS)
+    return apply_type_handlers(config, PARAMETER_HANDLERS)
+
 
 def to_yaml_friendly(v):
     """convert possible numpy type to native python types"""
@@ -71,7 +72,7 @@ def to_yaml_friendly(v):
         return vv
 
 
-def update_yaml(yaml_path:str, new_param_dict: dict):
+def update_yaml(yaml_path: str, new_param_dict: dict):
     """
     update a yaml config file with updated parameters, and keep the original format. 
 
