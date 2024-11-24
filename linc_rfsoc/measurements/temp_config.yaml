@@ -26,7 +26,7 @@ ro_stimulus:
   signals:
     readout:
       data: ["scipy", "hann"]
-      scale: (0.5, -36deg)
+      scale: (0.5, -50deg)
 
 ro_capture:
   channel: "ADC0"
@@ -38,3 +38,5 @@ ro_capture:
       decimation: 0
       region: "plddr"
   capture_delay: 300e-9
+  kernel_wf: 0.1
+  kernel_offset: 0

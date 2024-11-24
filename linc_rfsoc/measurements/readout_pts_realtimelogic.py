@@ -42,7 +42,9 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.auto_config_waveform_mems(acadia, **channel_configs)
         q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
         ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
-        ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
+
+        ro_demod0 = acadia.create_waveform(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
+        ro_demod1 = acadia.create_waveform(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
 
         # Create a blank waveform between qubit drive and readout drive
         q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
@@ -60,34 +62,53 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
             kernel_cmacc = None
         elif type(kernel_wf) == np.ndarray:
             kernel_cmacc = kernel_wf
-
+        
         kernel_offset = self.ro_capture.get("kernel_offset", 0)
 
         # Create the record groups for saving captured data
-        self.data.add_group(f"pts_g", uniform=True)
-        self.data.add_group(f"pts_e", uniform=True)
+        self.data.add_group(f"pts_0", uniform=True)
+        self.data.add_group(f"pts_1", uniform=True)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
             capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
-                                                            reset_fifo=True)
+                                                            reset_fifo=True, accumulator_done=False)
 
             a.cmacc_load(capture_stream, kernel_offset)
 
-            with a.channel_synchronizer():
-                a.schedule_waveform(q_rotation)
-                a.schedule_waveform(q_blank_wf)
-                a.barrier()
+            # first msmt
+            with a.channel_synchronizer(): 
                 if capture_delay != 0:
                     a.schedule_waveform(blank_wf)
                 a.schedule_waveform(ro_drive)
-                a.stream(capture_stream, ro_demod)
+                a.stream(capture_stream, ro_demod0)
+
+            # check which quadrant does the 1st msmt result falls in
+            # and apply a conditional pi-pulse
+            with a.sequencer().test(a.cmacc_get_quadrant(capture_stream) == a.CMACC_QUADRANT_3):
+                with a.channel_synchronizer():
+                    a.schedule_waveform(q_rotation)
+                    a.schedule_waveform(q_blank_wf) 
+                    a.barrier()
+
+
+            # reconfigure the capture stream and do the 2nd msmt
+            capture_stream1, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
+                                                            reset_fifo=False, accumulator_done=False)
+            a.cmacc_load(capture_stream1, kernel_offset) 
+
+            with a.channel_synchronizer():
+                if capture_delay != 0:
+                    a.schedule_waveform(blank_wf)
+                a.schedule_waveform(ro_drive)
+                a.stream(capture_stream1, ro_demod1)
+
 
             return kernel
 
         # Compile the sequence
         kernel = acadia.compile(sequence)
-
+# 
         # Attach to the hardware
         acadia.attach()
 
@@ -101,12 +122,6 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         acadia.assemble()
         acadia.load()
         
-        # logger.info(acadia._firmware.config)
-        # for k, v in acadia._firmware["sequencer_bus"].items():
-        #     logger.info((k,v))
-        # logger.info("-------------------------")
-        # k = acadia._firmware.sequencer_bus_decoder["module2_registers"].__dir__()
-        # logger.info((k))
 
 
         # set waveform for ro drive
@@ -114,20 +129,12 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 
         # average iterations for preparing qubit in g and e
         pi_signal = self.q_stimulus["signals"]["pi_pulse"]
-        pi_amp = pi_signal["scale"]
         for i in range(self.iterations):
-            for state_ in ["g", "e"]:
-                # set the pulse amplitude
-                if state_ == "g":
-                    pi_signal["scale"] = 0
-                else:
-                    pi_signal["scale"] = pi_amp
-
-                q_rotation.set(**pi_signal)
-
-                # capture data and put in the corresponding group
-                acadia.run()
-                self.data[f"pts_{state_}"].write(ro_demod.array)
+            q_rotation.set(**pi_signal)
+            # capture data and put in the corresponding group
+            acadia.run()
+            self.data[f"pts_0"].write(ro_demod0.array)
+            self.data[f"pts_1"].write(ro_demod1.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -158,16 +165,16 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         import matplotlib.pyplot as plt
 
         # First make sure that we actually have new data to process
-        if "pts_e" not in self.data or len(self.data["pts_e"]) == 0:
+        if "pts_1" not in self.data or len(self.data["pts_1"]) < 2:
             return
 
         # Update the progress bar based on the number of iterations that have been completed
-        completed_iterations = len(self.data["pts_e"])
+        completed_iterations = len(self.data["pts_1"])
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations
 
         if self.plot:
-            data = [self.data[f"pts_{s_}"].records().squeeze() for s_ in ["g", "e"]]
+            data = [self.data[f"pts_{s_}"].records().squeeze() for s_ in ["0", "1"]]
             for i in range(2):
                 # self.hist.update(data)
                 self.axs[i].hist2d(data[i][:, 0], data[i][:, 1], bins=51, cmap="hot")
@@ -176,6 +183,8 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                 self.fig.tight_layout()
                 self.fig.canvas.draw_idle()
                 self.axs[i].set_aspect(1)
+                self.axs[i].set_aspect(1)
+                self.axs[i].tick_params(axis='both', which='major', labelsize=5)
 
         # Save the data
         self.data.save(self.local_directory)
@@ -186,6 +195,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         if self.plot:
             self.savefig(self.fig)
         
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -203,15 +213,15 @@ if __name__ == "__main__":
     iterations = 5000
 
     rt = ReadoutPtsRuntime(**config_dict, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_pts", files=[rt.FILE, config_helper_file])
+    rt.deploy("10.66.3.198", "readout_pts_realtimelogic", files=[rt.FILE, config_helper_file])
     rt.display()
 
     # some ad hoc processing
     rt._event_loop.join()
-    rt.fig
+    # rt.fig
 
     fig, ax = plt.subplots(1, 1)
-    for i, s_ in enumerate(["g", "e"]):
+    for i, s_ in enumerate(["0", "1"]):
         data = rt.data[f"pts_{s_}"].records().squeeze()
         ax.plot(data[:, 0], data[:, 1], ".", ms=0.5)
         ax.set_aspect(1)

@@ -28,6 +28,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         
         logger = logging.getLogger("acadia")
 
+        # todo: these blocks could be wrapped into the experiment based mixin class
         channel_configs = {"q_stimulus": self.q_stimulus,
                            "ro_stimulus": self.ro_stimulus,
                            "ro_capture": self.ro_capture

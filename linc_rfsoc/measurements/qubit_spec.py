@@ -65,6 +65,8 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         elif type(kernel_wf) == np.ndarray:
             kernel_cmacc = kernel_wf
 
+        kernel_offset = self.ro_capture.get("kernel_offset", 0)
+
         # Create the record groups for saving captured data
         self.data.add_group(f"spec", uniform=True)
 
@@ -73,7 +75,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
             capture_stream, kernel = acadia.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
                                                             reset_fifo=True)
 
-            acadia.cmacc_load(capture_stream, 0)
+            acadia.cmacc_load(capture_stream, kernel_offset)
 
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
