@@ -208,7 +208,7 @@ if __name__ == "__main__":
         
         "signal": {
             "data": ("scipy", "hann"),
-            "scale": 0.24
+            "scale": 0.282
         }
     }
 

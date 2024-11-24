@@ -1,9 +1,9 @@
 q_stimulus:
-  channel: "DAC0"
+  channel: "DAC1"
   nco_config:
-    vop: 20000
-    mix_reconstruction: true
-    nco_frequency: 8.23e9
+    vop: 30000
+    mix_reconstruction: False
+    nco_frequency: 40e6
   waveforms:
     q_rotation:
       length: 40.0e-9
@@ -17,15 +17,15 @@ q_stimulus:
       scale: 0.141
 
 ro_stimulus:
-  channel: "DAC2"
+  channel: "DAC4"
   nco_config:
     vop: 25000
-    mix_reconstruction: true
-    nco_frequency: 9.030e9
+    mix_reconstruction: False
+    nco_frequency: 60e6
   waveforms:
     ro_drive:
       length: 40.e-9
-      fixed_length: 1.6e-6
+      fixed_length: 0.6e-6
   signals:
     readout:
       data: ["scipy", "hann"]

@@ -59,6 +59,10 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         elif capture_delay > 0:  # capture will be delayed by capture_delay compare to stimulus
             blank_wf = self.blank_waveform_generator(acadia, "ro_capture")(capture_delay)
 
+        # idle waveform for relaxation time after each shot
+        # without this, it will be around 170 us python for-loop time 
+        blank_wf_ro_idle = self.blank_waveform_generator(acadia, "ro_stimulus")(200e-6)
+
         kernel_wf = self.ro_capture.get("kernel_wf", 0.1)
         if type(kernel_wf) == float:  # constant value kernel
             kernel_wf = np.float64(kernel_wf)
@@ -107,7 +111,8 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                     a.schedule_waveform(blank_wf)
                 a.schedule_waveform(ro_drive)
                 a.stream(capture_stream, ro_demod1)
-                
+
+                a.schedule_waveform(blank_wf_ro_idle)
 
 
             return kernel
@@ -133,18 +138,20 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         # set waveform for ro and qubit drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
         q_rotation_pi.set(**self.q_stimulus["signals"]["pi_pulse"])
-        q_rotation_pi2.set(**self.q_stimulus["signals"]["pi_2_pulse"])
+        q_rotation_pi2.set(**self.q_stimulus["signals"]["pi_2_pulse"]) # takes ~ 1.2 ms
 
         # average iterations for preparing qubit in g and e
         for i in range(self.iterations):
             # capture data and put in the corresponding group
             acadia.run()
-            self.data[f"pts_0"].write(ro_demod0.array)
-            self.data[f"pts_1"].write(ro_demod1.array)
-
-            if self.data.serve() == DataManager.serve_hangup():
+            self.data[f"pts_0"].write(ro_demod0.array) # takes ~40 us
+            self.data[f"pts_1"].write(ro_demod1.array) # takes ~40 us
+# 
+            if self.data.serve() == DataManager.serve_hangup(): # takes ~ 5us
                 self.data.disconnect()
                 return
+
+            # takes extra ~90 us before the next iteration.
 
         self.final_serve()
 
@@ -206,8 +213,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.measurements import load_config
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
+    from linc_rfsoc.dev_codes.scope_with_autoconfig import load_config
 
     from IPython.core.getipython import get_ipython
 
@@ -219,7 +225,7 @@ if __name__ == "__main__":
     iterations = 50000
 
     rt = ReadoutPtsRuntime(**config_dict, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_pts_realtimelogic", files=[rt.FILE, config_helper_file])
+    rt.deploy("10.66.3.198", "readout_pts_realtimelogic_scope", files=[rt.FILE, config_helper_file])
     rt.display()
 
     # some ad hoc processing
