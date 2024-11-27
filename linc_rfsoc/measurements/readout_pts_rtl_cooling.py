@@ -36,10 +36,10 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 
         # Create an acadia object and grab a couple of its channels
         acadia = Acadia()
-        self.auto_config_channels(acadia, **channel_configs)
+        self.obtain_channels(acadia, **channel_configs)
 
         # Allocate the waveform memories that we'll need
-        self.auto_config_waveform_mems(acadia, **channel_configs)
+        self.allocate_all_waveform_mems(acadia, **channel_configs)
         ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
 
         # need two copies for changing qubit pulse within one sequence
@@ -69,7 +69,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         elif type(kernel_wf) == np.ndarray:
             kernel_cmacc = kernel_wf
         
-        kernel_offset = self.ro_capture.get("kernel_offset", 0)
+        cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
         self.data.add_group(f"pts_0", uniform=True)
@@ -83,7 +83,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
             capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
                                                             reset_fifo=True, accumulator_done=False)
 
-            a.cmacc_load(capture_stream, kernel_offset)
+            a.cmacc_load(capture_stream, cmacc_offset)
 
             with a.channel_synchronizer(): 
                 a.schedule_waveform(q_rotation_pi2)
@@ -104,7 +104,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                 capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel,
                                                             reset_fifo=True, accumulator_done=False)
 
-                a.cmacc_load(capture_stream, kernel_offset)
+                a.cmacc_load(capture_stream, cmacc_offset)
 
                 with a.channel_synchronizer():
                     a.schedule_waveform(q_rotation_pi)
@@ -124,7 +124,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
             ## do a final msmt
             capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel,
                                                             reset_fifo=False, accumulator_done=False)
-            a.cmacc_load(capture_stream, kernel_offset) 
+            a.cmacc_load(capture_stream, cmacc_offset)
 
             with a.channel_synchronizer():
                 if capture_delay != 0:
@@ -260,7 +260,7 @@ if __name__ == "__main__":
 
     def g_pct(data_group:str):
         data = rt.data[data_group].records().squeeze()
-        n_g = len(np.where(data[:, 0]<config_dict["ro_capture"]["kernel_offset"])[0])
+        n_g = len(np.where(data[:, 0]<400)[0])
         n_tot = len(data)
         return n_g/n_tot
 

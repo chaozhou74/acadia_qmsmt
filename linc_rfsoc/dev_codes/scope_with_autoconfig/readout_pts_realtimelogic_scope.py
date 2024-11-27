@@ -70,7 +70,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         elif type(kernel_wf) == np.ndarray:
             kernel_cmacc = kernel_wf
         
-        kernel_offset = self.ro_capture.get("kernel_offset", 0)
+        cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
         self.data.add_group(f"pts_0", uniform=True)
@@ -81,7 +81,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
             capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
                                                             reset_fifo=True, accumulator_done=False)
 
-            a.cmacc_load(capture_stream, kernel_offset)
+            a.cmacc_load(capture_stream, cmacc_offset)
 
             # first msmt
             with a.channel_synchronizer(): 
@@ -104,7 +104,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
             # reconfigure the capture stream and do the 2nd msmt
             capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
                                                             reset_fifo=False, accumulator_done=False)
-            a.cmacc_load(capture_stream, kernel_offset) 
+            a.cmacc_load(capture_stream, cmacc_offset)
 
             with a.channel_synchronizer():
                 if capture_delay != 0:

@@ -35,14 +35,14 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                            }
 
         # Create an acadia object and grab a couple of its channels
-        acadia = Acadia()
-        self.auto_config_channels(acadia, **channel_configs)
+        self.acadia = acadia = Acadia()
+        channel_objs = self.obtain_channels(acadia, **channel_configs)
 
         # Allocate the waveform memories that we'll need
-        self.auto_config_waveform_mems(acadia, **channel_configs)
-        q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
-        ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
-        ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
+        q_rotation = self.allocate_waveform_mem(self.acadia, "q_stimulus", "q_rotation")
+        ro_drive = self.allocate_waveform_mem(self.acadia, "ro_stimulus", "ro_drive")
+        ro_demod = self.allocate_waveform_mem(self.acadia, "ro_capture", "ro_demod")
+
 
         # Create a blank waveform between qubit drive and readout drive
         q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
@@ -54,14 +54,9 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         elif capture_delay > 0:  # capture will be delayed by capture_delay compare to stimulus
             blank_wf = self.blank_waveform_generator(acadia, "ro_capture")(capture_delay)
 
-        kernel_wf = self.ro_capture.get("kernel_wf", 0.1)
-        if type(kernel_wf) == float:  # constant value kernel
-            kernel_wf = np.float64(kernel_wf)
-            kernel_cmacc = None
-        elif type(kernel_wf) == np.ndarray:
-            kernel_cmacc = kernel_wf
-
-        kernel_offset = self.ro_capture.get("kernel_offset", 0)
+        # get the kernel and IQ offsets fom the config dict
+        kernel_wf = self.ro_capture.get("kernel_wf", [0.1])
+        cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
         self.data.add_group(f"pts_g", uniform=True)
@@ -69,10 +64,10 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
+            capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf,
                                                             reset_fifo=True)
 
-            a.cmacc_load(capture_stream, kernel_offset)
+            a.cmacc_load(capture_stream, cmacc_offset)
 
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
@@ -100,13 +95,6 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         # Assemble and load the program
         acadia.assemble()
         acadia.load()
-        
-        # logger.info(acadia._firmware.config)
-        # for k, v in acadia._firmware["sequencer_bus"].items():
-        #     logger.info((k,v))
-        # logger.info("-------------------------")
-        # k = acadia._firmware.sequencer_bus_decoder["module2_registers"].__dir__()
-        # logger.info((k))
 
 
         # set waveform for ro drive

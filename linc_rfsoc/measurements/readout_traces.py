@@ -28,7 +28,6 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         
         logger = logging.getLogger("acadia")
 
-        # todo: these blocks could be wrapped into the experiment based mixin class
         channel_configs = {"q_stimulus": self.q_stimulus,
                            "ro_stimulus": self.ro_stimulus,
                            "ro_capture": self.ro_capture
@@ -36,24 +35,22 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
 
         # Create an acadia object and grab a couple of its channels
         acadia = Acadia()
-        self.auto_config_channels(acadia, **channel_configs)
+        self.obtain_channels(acadia, **channel_configs)
 
         # Allocate the waveform memories that we'll need
-        self.auto_config_waveform_mems(acadia, **channel_configs)
-        q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
-        ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
-        ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
+        q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
+        ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
+        ro_demod = self.allocate_waveform_mem(acadia, "ro_capture", "ro_demod")
         
         # Create a blank waveform between qubit drive and readout drive
         q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
 
         # Create blank waveform for delay between capture and stimulus
         capture_delay = self.ro_capture["capture_delay"]
-        if capture_delay < 0: # capture will be advanced by -capture_delay compare to stimulus
+        if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
             blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
         elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture")(capture_delay)
-        
+            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
         
         # Create the record groups for saving captured data
         self.data.add_group(f"traces_g", uniform=True)
@@ -97,12 +94,13 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                 if state_ == "g":
                     pi_signal["scale"] = 0
                 else:
-                    pi_signal["scale"] = pi_amp
+                    pi_signal["scale"] = pi_amp 
 
-                q_rotation.set(**pi_signal)
+                q_rotation.set(**pi_signal) # takes around 1ms
                 
                 # capture data and put in the corresponding group
                 acadia.run()
+
                 self.data[f"traces_{state_}"].write(ro_demod.array)
             
             if self.data.serve() == DataManager.serve_hangup():
@@ -129,7 +127,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                 self.lines_re.append(DynamicLine(self.axs[j], ".-"))
                 self.lines_im.append(DynamicLine(self.axs[j], ".-"))
                 self.axs[j].set_xlabel("Time [s]")
-                self.axs[j].set_ylabel("Amp [arb. V]")
+                self.axs[j].set_ylabel("Accumulated Amp [arb. V]")
                 self.axs[j].set_title(f"prepare {state_}")
                 self.axs[j].grid()
 
@@ -151,23 +149,20 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations        
 
-        # We'll make an x-axis for the plot, but we only need to make it once
-        if self.time_axis is None:
-            # Last index is for quadrature
-            samples_per_trace = np.array(self.data["traces_g"].records()).shape[-2]
-            capture_time = self.ro_capture["waveforms"]["ro_demod"]["length"] # todo: simplify this, too long.....
-            self.time_axis = np.linspace(0, capture_time, samples_per_trace, endpoint=False)
-
-        # Sum the traces from each iteration
-        # Each trace has the shape (samples, 2) where the number of samples is determined
-        # at runtime from the specified waveform length in seconds. 
-        # Because the record group is uniform, when we get the records from the
-        # group, they are stacked into a single array of shape (iterations, samples, 2)
-        self.trace_summed = np.zeros((2, len(self.time_axis), 2), dtype=np.int64)
-        for j, state_ in enumerate(["g", "e"]):
-            self.trace_summed[j] = np.sum(self.data[f"traces_{state_}"].records(), axis=0)
-        
         if self.plot:
+            # We'll make an x-axis for the plot, but we only need to make it once
+            if self.time_axis is None:
+                # Last index is for quadrature
+                samples_per_trace = np.array(self.data["traces_g"].records()).shape[-2]
+                capture_time = self.ro_capture["waveforms"]["ro_demod"]["length"] 
+                self.time_axis = np.linspace(0, capture_time, samples_per_trace, endpoint=False)
+
+            # Sum the traces from each iteration
+            # The records have shape (iterations, samples, 2)
+            self.trace_summed = np.zeros((2, len(self.time_axis), 2), dtype=np.int64)
+            for j, state_ in enumerate(["g", "e"]):
+                self.trace_summed[j] = np.sum(self.data[f"traces_{state_}"].records(), axis=0)
+        
             for i in range(2):
                 self.lines_re[i].update(self.time_axis, self.trace_summed[i, :,0])
                 self.lines_im[i].update(self.time_axis, self.trace_summed[i, :,1])
@@ -206,10 +201,11 @@ if __name__ == "__main__":
     rt.deploy("10.66.3.198", "readout_traces", files=[rt.FILE, config_helper_file])
     rt.display() 
 
-    # some ad hoc processing
+    # # some ad hoc processing
     rt._event_loop.join()
     rt.fig
 
+    # make a histogram by integrating the acquired traces
     all_traces = np.concatenate([np.array(rt.data[f"traces_{s}"].records()).astype(float) for s in ["g", "e"]])
     all_traces = all_traces.view(complex).squeeze()
     all_pts = np.mean(all_traces, axis=1)
@@ -218,8 +214,8 @@ if __name__ == "__main__":
     ax.set_aspect(1)
 
     
-    # from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
-    # rk = ReadoutKernelGenerator(all_traces, (-90 + 65j, 20), (-115 + 0j, 20))
+    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
+    rk = ReadoutKernelGenerator(all_traces, (13 +52j, 10), (-20 + 52j, 10))
 
     # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
 

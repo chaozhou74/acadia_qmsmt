@@ -42,4 +42,4 @@ ro_capture:
       region: "plddr"
   capture_delay: 300e-9
   kernel_wf: 0.1
-  kernel_offset: 0
+  cmacc_offset: 0

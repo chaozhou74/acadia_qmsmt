@@ -40,10 +40,10 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
         # Create an acadia object and grab a couple of its channels
         acadia = Acadia()
-        self.auto_config_channels(acadia, **channel_configs)
+        self.obtain_channels(acadia, **channel_configs)
 
         # Allocate the waveform memories that we'll need
-        self.auto_config_waveform_mems(acadia, **channel_configs)
+        self.allocate_all_waveform_mems(acadia, **channel_configs)
         q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
         ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
         ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
@@ -65,7 +65,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         elif type(kernel_wf) == np.ndarray:
             kernel_cmacc = kernel_wf
 
-        kernel_offset = self.ro_capture.get("kernel_offset", 0)
+        cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
         self.data.add_group(f"spec", uniform=True)
@@ -75,7 +75,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
             capture_stream, kernel = acadia.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
                                                             reset_fifo=True)
 
-            acadia.cmacc_load(capture_stream, kernel_offset)
+            acadia.cmacc_load(capture_stream, cmacc_offset)
 
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
