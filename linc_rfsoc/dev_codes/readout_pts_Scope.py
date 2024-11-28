@@ -159,7 +159,7 @@ class ReadoutTestRuntime_cmacc(Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
+    from linc_rfsoc.analysis.generate_readout_kernel import KernelGeneratorBase, load_kernel
     
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")

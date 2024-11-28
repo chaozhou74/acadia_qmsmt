@@ -167,7 +167,7 @@ class ReadoutTestRuntime_dsp(Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
+    from linc_rfsoc.analysis.generate_readout_kernel import KernelGeneratorBase, load_kernel
     
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
@@ -225,7 +225,7 @@ if __name__ == "__main__":
     all_data = all_data.view(complex).squeeze()
 
 
-    rk = ReadoutKernelGenerator(all_data, (-13 + 5j, 2), (13 - 5j, 2))
+    rk = KernelGeneratorBase(all_data, (-13 + 5j, 2), (13 - 5j, 2))
     # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
 
     rk.plot_kernel()

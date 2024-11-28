@@ -1,42 +1,159 @@
 from datetime import datetime
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Any
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
+from IPython.core.pylabtools import figsize
+from scipy.ndimage import label
+
+StateCircleType = Tuple[complex, float]  # (I_center + 1j * Q_center, circle_radius)
+ComplexDataPointsType = Union[List[complex], np.ndarray[complex]]
+ComplexDataTracesType = Union[List, np.ndarray]
 
 
-def mask_state_with_circle(iq_pts:Union[List[complex], np.ndarray[complex]], state_circle:Tuple[complex, float],
-                           plot: Union[bool, int] = True, state_name: str = "", plot_ax=None):
+def mask_state_with_circle(iq_pts: ComplexDataPointsType, state_circle: StateCircleType) -> List[bool]:
     """
+    Generate a mask for the input IQ data points that are within the `state_circle`
+
     :param iq_pts: input IQ data points, should be an array of complex numbers
-    :param state_circle: (I_center + 1j * Q_center, circle_radius)
-    :param plot: if true, plot selected data
-    :param state_name: name of the state, will be used in the plotting title.
+
     :return:
     """
     state_center, state_r = state_circle
-    mask = abs(iq_pts-state_center) < state_r
-
-    if plot:
-        if plot_ax is None:
-            fig, ax = plt.subplots(1, 1)
-        else:
-            ax = plot_ax
-        ax.set_title(f'{state_name} state selection')
-        ax.hist2d(iq_pts.real.flatten(), iq_pts.imag.flatten(), bins=101)
-        theta = np.linspace(0, 2 * np.pi, 201)
-        ax.plot(state_center.real + state_r * np.cos(theta), state_center.imag + state_r * np.sin(theta), color='r')
-        ax.set_aspect(1)
+    mask = abs(iq_pts - state_center) < state_r
 
     return mask
 
-def load_kernel(kernel_path):
-    kernel = np.load(kernel_path)
-    return kernel
 
-class ReadoutKernelGenerator:
-    def __init__(self, traces:Union[List, np.ndarray], g_circle:Tuple[complex, float], e_circle:Tuple[complex, float],
+def _hist2d_with_indices(iq_pts: ComplexDataPointsType, **kwargs):
+    """
+    Compute a 2D histogram of IQ data points, as well as the bin indices of where each data point falls in the grid.
+
+    :param iq_pts: List of complex IQ points
+    :param kwargs: kwargs for `np.histogram2d`
+    :return:
+    """
+    hist, xedges, yedges = np.histogram2d(iq_pts.real, iq_pts.imag, **kwargs)
+    bin_indices = np.digitize(iq_pts.real, xedges[:-1]) - 1, np.digitize(iq_pts.imag, yedges[:-1]) - 1
+
+    return hist, xedges, yedges, bin_indices
+
+
+def find_most_significant_blob(iq_pts: ComplexDataPointsType,
+                               bins: int = 50, sigma_factor: float = 3) -> StateCircleType:
+    """
+    Identify the most significant Gaussian blob in an 1D array of complex IQ points.
+    Different blobs are separated by looking at bin connectivity.
+
+    No fitting is performed here, so hopefully this is fast and robust...
+
+    :param iq_pts: 1D array of complex numbers representing IQ points.
+    :param bins: Number of bins for the 2D histogram.
+    :param sigma_factor: The factor for the radius (e.g., 2 for 2-sigma).
+    :return: A tuple (center, radius) for the most significant blob.
+    """
+    # Create a 2D histogram
+    hist, xedges, yedges, bin_indices = _hist2d_with_indices(iq_pts, bins=bins)
+
+    # Find the connected components in the histogram
+    structure = np.ones((3, 3))  # Connectivity structure for 2D neighbors
+    labeled, num_features = label(hist > 0, structure=structure)
+
+    # Find the connected region with the largest total hist count (most significant blob)
+    blob_weights = [hist[labeled == i].sum() for i in range(1, num_features + 1)]
+    most_significant_blob_idx = np.argmax(blob_weights) + 1
+
+    # Mask for points in the largest blob
+    largest_blob_mask = (labeled == most_significant_blob_idx)
+
+    # Extract points in the largest blob by mapping histogram bins back to points
+    in_largest_blob = largest_blob_mask[bin_indices]
+
+    blob_points = iq_pts[in_largest_blob]
+    blob_pt_bin_indices = bin_indices[0][in_largest_blob], bin_indices[1][in_largest_blob]
+    pt_weights = hist[blob_pt_bin_indices]
+
+
+    # Compute the center and radius
+    # center = np.average(blob_points, weights=pt_weights)
+    center = np.average(blob_points)
+    distances = np.abs(blob_points - center)
+    radius = sigma_factor * np.std(distances)
+
+    return center, radius
+
+
+def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
+                       sigma_factor: float = 3, average_radius=True, debug=True) -> List[StateCircleType]:
+    """
+    Find the state circle for an arbitrary number of prepared state data points.
+
+    The raw data from each prepared state will be masked based on its prominence comparing to data from other sates
+    before looking for the state circle.
+
+    :param state_pts: Variable number of lists of complex IQ data points for each prepared state.
+    :param bins: Number of bins for the 2D histogram.
+    :param sigma_factor: The sigma factor for the radius (e.g., 2 for 2-sigma).
+    :param average_radius: When True, average the radius of all state circles
+    :return:
+    """
+    center_list = []
+    r_list = []
+    n_states = len(state_pts)
+
+    # make individual histograms for each state using the same grid, for prominence comparison
+    hist_list = []
+    bin_indices_list = []
+    all_pts = np.concatenate(state_pts).flatten()
+    compare_hist_bin = 41 # this needs to be relatively small for the data masking to work
+    real_bins = np.linspace(all_pts.real.min(), all_pts.real.max(), compare_hist_bin)
+    imag_bins = np.linspace(all_pts.imag.min(), all_pts.imag.max(), compare_hist_bin)
+
+    for i, pts in enumerate(state_pts):
+        hist, _, _, bin_indices = _hist2d_with_indices(pts, bins=[real_bins, imag_bins])
+        hist_list.append(hist/len(pts))
+        bin_indices_list.append(bin_indices)
+
+    hist_all = np.sum(hist_list, axis=0)
+
+    # find circle for each state
+    if debug:
+        fig, axs = plt.subplots(len(state_pts), 1, figsize=(4, n_states * 3))
+        axs = [axs] if n_states == 1 else axs
+        axs[0].set_title("find_state_circles debug")
+
+    for i, pts in enumerate(state_pts):
+        # make a hist of the current state
+        hist, bin_indices = hist_list[i], bin_indices_list[i]
+
+        # mask data of the current state by comparing the hist of current data and the rest data
+        hist_diff = 2 * hist - hist_all
+        prominent_region = (hist_diff > 0)  # region in the 2D hist where current data is higher than the rest
+        data_mask = prominent_region[bin_indices]  # mask data points in that region
+        pts_vld = pts[data_mask]
+
+        # find state circle using the valid data
+        center, radius = find_most_significant_blob(pts_vld, bins, sigma_factor)
+        center_list.append(center)
+        r_list.append(radius)
+
+        if debug:
+            axs[i].hist2d(pts_vld.real, pts_vld.imag, bins=bins, cmap="hot")
+            axs[i].add_patch(patches.Circle((center.real, center.imag), radius, edgecolor="w", facecolor="none"))
+            axs[i].set_aspect(1)
+
+
+    if average_radius:
+        r_list = [np.mean(r_list)] * n_states
+
+    state_circles = [(c, r) for c, r in zip(center_list, r_list)]
+
+    return state_circles
+
+
+class KernelGeneratorBase:
+    def __init__(self, traces: Union[List, np.ndarray], g_circle: StateCircleType, e_circle: StateCircleType,
                  plot=True):
         """
         generate matched kernel based on a given set of IQ traces and specified g/e locations.
@@ -46,45 +163,44 @@ class ReadoutKernelGenerator:
         :param e_circle: (I_center + 1j * Q_center, circle_radius)
         :param plot:
         """
-        # todo: auto-fit for g_circle and e_circle
-        self.iq_traces = np.array(traces)
-        self.iq_pts = np.mean(traces, axis=1)
+        self.all_traces = np.array(traces)
+        self.all_pts = np.mean(traces, axis=1)
         self.g_circle = g_circle
         self.e_circle = e_circle
-        self.kernel = np.ones(traces.shape[1])
         self.generate_kernel(plot)
 
     def generate_kernel(self, plot=True):
-        self.g_mask = mask_state_with_circle(self.iq_pts, self.g_circle, plot=False)
-        self.e_mask = mask_state_with_circle(self.iq_pts, self.e_circle, plot=False)
-        self.g_trace_avg = np.mean(self.iq_traces[self.g_mask], axis=0)
-        self.e_trace_avg = np.mean(self.iq_traces[self.e_mask], axis=0)
+        self.g_mask = mask_state_with_circle(self.all_pts, self.g_circle)
+        self.e_mask = mask_state_with_circle(self.all_pts, self.e_circle)
+        self.g_trace_avg = np.mean(self.all_traces[self.g_mask], axis=0)
+        self.e_trace_avg = np.mean(self.all_traces[self.e_mask], axis=0)
         kernel = np.conjugate(self.g_trace_avg - self.e_trace_avg)
-        self.kernel = kernel/np.max(abs(kernel))
+        self.kernel = kernel / np.max(abs(kernel))
 
-        self.new_iq_pts = np.mean(self.iq_traces * self.kernel, axis=1)
+        self.new_iq_pts = np.mean(self.all_traces * self.kernel, axis=1)
 
         if plot:
-            fig, axs = plt.subplots(3, 1, figsize=(6,10))
+            fig, axs = plt.subplots(3, 1, figsize=(6, 10))
             axs[0].set_title("raw IQ points and g/e selection")
-            axs[0].hist2d(self.iq_pts.real, self.iq_pts.imag, bins=101, cmap="hot")
+            axs[0].hist2d(self.all_pts.real, self.all_pts.imag, bins=101, cmap="hot")
             for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
                 circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
                 axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor="w", facecolor="none"))
-                axs[0].text(circ_i+circ_r, circ_q+circ_r, state, fontsize=12, va='center', color="w")
+                axs[0].text(circ_i + circ_r, circ_q + circ_r, state, fontsize=12, va='center', color="w")
             axs[0].set_aspect('equal')
 
             axs[1].set_title("IQ traces after selection")
             trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
             for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
-                axs[1].plot(trace.real, ".-", color=trace_colors[2*i], label=f"{['g','e'][i]} trace, re")
-                axs[1].plot(trace.imag, ".-", color=trace_colors[2*i+1], label=f"{['g','e'][i]} trace, im")
+                axs[1].plot(trace.real, ".-", color=trace_colors[2 * i], label=f"{['g', 'e'][i]} trace, re")
+                axs[1].plot(trace.imag, ".-", color=trace_colors[2 * i + 1], label=f"{['g', 'e'][i]} trace, im")
                 axs[1].set_xlabel("pts")
                 axs[1].legend()
 
             axs[2].set_title("IQ points after applying kernel")
             axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag, bins=101, cmap="hot")
             axs[2].set_aspect('equal')
+            plt.tight_layout()
             plt.show()
 
         return self.kernel
@@ -94,28 +210,81 @@ class ReadoutKernelGenerator:
         plt.title("calculated kernel")
         plt.plot(self.kernel.real, label="re")
         plt.plot(self.kernel.imag, label="im")
+        plt.xlabel("pts")
+        plt.tight_layout()
         plt.legend()
 
     def save_kernel(self, save_dir, save_name=None):
         save_name = datetime.now().strftime("readoutkernel_%y%m%d_%H%M%S") if save_name is None else save_name
-        np.save(save_dir+save_name, self.kernel)
-        return save_dir+save_name
+        np.save(save_dir + save_name, self.kernel)
+        return save_dir + save_name
 
+
+class KernelFromPreparedTraces(KernelGeneratorBase):
+    def __init__(self, g_traces:ComplexDataTracesType, e_traces:ComplexDataTracesType,
+                 g_circle: StateCircleType = None, e_circle: StateCircleType = None,
+                 bins: int = 50, sigma_factor: float = 3, average_radius=True,
+                 plot=True):
+        """
+        Generate readout kernel based on the complex IQ traces from g/e state preparation.
+
+        Uses the `find_state_circles` function to find the g/e state locations when `g_circle` or `e_circle` is not
+        provided. The method should hopefully be quite robust even when the state preparation fidelity is low.
+
+        :param g_traces: complex IQ traces from g state preparation, should have the shape of (iterations, time_points)
+        :param e_traces: complex IQ traces from e state preparation, should have the shape of (iterations, time_points)
+        :param g_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
+        :param e_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
+        :param bins: number of bins in the 2D histogram for automatic searching of state circle
+        :param sigma_factor: The sigma factor for the radius of the state circle (e.g., 2 for 2-sigma).
+        :param average_radius: When True, average the radius of all state circles
+        :param plot:
+        """
+        self.g_traces_raw = g_traces
+        self.e_traces_raw = e_traces
+        self.g_pts_raw = np.mean(g_traces, axis=1)
+        self.e_pts_raw = np.mean(e_traces, axis=1)
+        self.all_traces = np.concatenate([g_traces, e_traces])
+        if (g_circle and e_circle) is None:  # at least one of the circles is not provided
+            g_cir_find, e_cir_find = find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
+                                                        sigma_factor=sigma_factor, average_radius=average_radius)
+
+        g_circle = g_circle if g_circle is not None else g_cir_find
+        e_circle = e_circle if e_circle is not None else e_cir_find
+
+        super().__init__(self.all_traces, g_circle, e_circle, plot)
+
+
+def load_kernel(kernel_path):
+    kernel = np.load(kernel_path)
+    return kernel
 
 
 if __name__ == "__main__":
     import matplotlib
+
     matplotlib.use('tkagg')
     from acadia.data import DataManager
 
-    data_dir = "/tmp/241104_150246"
+    data_dir = "/tmp/241127_133001"
     dm = DataManager()
     dm.load(data_dir)
-    all_data = np.concatenate([np.array(dm[f"traces_phi0"].records()).astype(float),
-                               np.array(dm[f"traces_phi1"].records()).astype(float)])
-    all_data = all_data.view(complex).squeeze()
+    g_traces = np.array(dm[f"traces_g"].records()).astype(float).view(complex).squeeze()
+    e_traces = np.array(dm[f"traces_e"].records()).astype(float).view(complex).squeeze()
+    all_data = np.concatenate([g_traces, e_traces])
 
-
-    rk = ReadoutKernelGenerator(all_data, (-1.6 + 0j, 0.5), (1.6 + 0j, 0.5))
+    rk = KernelFromPreparedTraces(np.repeat(g_traces, 2, axis=0), e_traces,  plot=True)
     # rk.save_kernel(r"../dev_codes//")
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
+    #
+    # pts = rk.e_pts_raw
+    # # center, radius = find_most_significant_blob(pts, sigma_factor=3)
+    #
+    # c_g, c_e = find_state_circles(rk.g_pts_raw, rk.e_pts_raw)
+    # center, radius = c_e
+    #
+    # fig, ax = plt.subplots(1, 1)
+    # ax.hist2d(pts.real, pts.imag, bins=51, cmap="hot")
+    # ax.add_patch(patches.Circle((center.real, center.imag), radius, edgecolor="w", facecolor="none"))
+    # plt.show()
+    # ax.set_aspect(1)

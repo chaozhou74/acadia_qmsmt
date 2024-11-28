@@ -206,16 +206,18 @@ if __name__ == "__main__":
     rt.fig
 
     # make a histogram by integrating the acquired traces
-    all_traces = np.concatenate([np.array(rt.data[f"traces_{s}"].records()).astype(float) for s in ["g", "e"]])
-    all_traces = all_traces.view(complex).squeeze()
+    g_traces = np.array(rt.data["traces_g"].records()).astype(float).view(complex).squeeze()
+    e_traces = np.array(rt.data["traces_e"].records()).astype(float).view(complex).squeeze()
+    all_traces = np.concatenate([g_traces, e_traces])
+
     all_pts = np.mean(all_traces, axis=1)
     fig, ax = plt.subplots(1, 1)
     ax.hist2d(all_pts.real, all_pts.imag, cmap="hot", bins=101)
     ax.set_aspect(1)
 
     
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator
-    rk = ReadoutKernelGenerator(all_traces, (13 +52j, 10), (-20 + 52j, 10))
+    from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
+    rk = KernelFromPreparedTraces(g_traces, e_traces)
 
     # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
 
