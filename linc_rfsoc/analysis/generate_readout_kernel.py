@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 from scipy.ndimage import label
+from scipy.interpolate import interp1d
 
 from linc_rfsoc.helpers.yaml_editor import update_yaml
 
@@ -161,8 +162,11 @@ class KernelGeneratorBase:
         :param g_circle: (I_center + 1j * Q_center, circle_radius)
         :param e_circle: (I_center + 1j * Q_center, circle_radius)
         :param norm_factor: normalization factor for the generated kernel
-        :param decimation_used: Decimation used when getting the `traces` data. This will only be used for generating
-            the kernel to be uploaded to cmacc. See `generate_kernel_for_upload()`
+        :param decimation_used: Decimation factor used when getting the `traces` data. This will only be used for
+            generating the kernel to be uploaded to cmacc.
+            Since by default the input data to cmacc will always have a decimation of 4, if the trace data used to
+            generate the kernel array had a different decimation factor, the resulting kernel array must be adjusted
+            (repeated or decimated) to match the expected decimation of the incoming data to cmacc.
         :param plot:
         """
         # todo: calculate optimal cmacc offset?
@@ -183,6 +187,7 @@ class KernelGeneratorBase:
         self.e_trace_avg = np.mean(self.all_traces[self.e_mask], axis=0)
         self.kernel_trace = np.conjugate(self.g_trace_avg - self.e_trace_avg)
         kernel_norm = self.kernel_trace / np.max(abs(self.kernel_trace)) * self.norm_factor # normalize to 1
+        self.kernel_trace_norm = kernel_norm
 
         # calculate expected IQ points when kernel is used
         self.new_iq_pts = np.sum(self.all_traces * kernel_norm, axis=1)
@@ -213,30 +218,39 @@ class KernelGeneratorBase:
 
         return self.kernel_trace
 
-
     def generate_kernel_for_upload(self):
         """
         Calculate the kernel array for uploading to cmacc based on the decimation used to get the `traces` data
 
-        Since by default the input data to cmacc will always have a decimation of 4, if the trace data used to
-        generate the kernel array had a different decimation factor, the resulting kernel array must be adjusted
-        (repeated or decimated) to match the expected decimation of the incoming data to cmacc.
         :return:
         """
 
         deci = self.decimation_used
-        if deci == 1:
+        scale = deci // 4
+        kernel = self.kernel_trace
+
+        if deci == 4:
+            kernel_array = kernel
+
+        elif deci == 1:
             # decimate the kernel trace by averaging every 4 adjacent points
-            length = len(self.kernel_trace) - (len(self.kernel_trace) % 4)
-            reshaped = self.kernel_trace[:length].reshape(-1, 4)
+            length = len(kernel) - (len(kernel) % 4)
+            reshaped = kernel[:length].reshape(-1, 4)
             kernel_array = reshaped.mean(axis=1)
 
-        elif (deci // 4 > 0) and (deci % 4 == 0):
-            # stretch the kernel trace by repeating each data point deci/4 times
-            # todo: do interpolation instead?
-            kernel_array = np.repeat(self.kernel_trace, int(deci) // 4)
+        elif (scale > 0) and (deci % 4 == 0):
+            # stretch the kernel trace via interpolation
+            scale = int(scale)
+            original_len = len(kernel)
+            interp_func = interp1d(np.arange(0, original_len), kernel, kind="cubic")
+            x_fine = np.linspace(0, original_len-1, (original_len-1) * scale+1)
+            kernel_interp = interp_func(x_fine)
+            # the points at the beginning will just be repeated
+            kernel_array = np.concatenate(([kernel[0]] * (scale-1), kernel_interp))
+
         else:
             raise ValueError("Invalid trace decimation, must be 1 or a positive multiple of 4 ")
+
         self.kernel_upload = kernel_array / np.max(abs(kernel_array)) * self.norm_factor # normalize to 1
 
         return self.kernel_upload
@@ -313,8 +327,8 @@ class KernelFromPreparedTraces(KernelGeneratorBase):
         :param sigma_factor: The sigma factor for the radius of the state circle (e.g., 2 for 2-sigma).
         :param average_radius: When True, average the radius of all state circles.
         :param norm_factor: normalization factor for the generated kernel.
-        :param decimation_used: Decimation used when getting the `traces` data. This will only be used for generating
-            the kernel to be uploaded to cmacc. See `KernelGeneratorBase.generate_kernel_for_upload()`
+        :param decimation_used: Decimation factor used when getting the `traces` data. This will only be used for
+            generating the kernel to be uploaded to cmacc. See `KernelGeneratorBase.decimation_used`
         :param plot:
         """
         self.g_traces_raw = g_traces
