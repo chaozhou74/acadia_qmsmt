@@ -1,4 +1,4 @@
-import numbers
+from numbers import Number
 import re
 from typing import Union
 import numpy as np
@@ -40,7 +40,7 @@ def to_complex(input):
         return np.exp(1j*angle) * amp
 
 
-def load_kernel(input:Union[str, list, float, complex]):
+def to_array(input:Union[Number, list, str]):
     """
     Based on the type of input, convert it to a numpy array.
     - If input is a number, load as np.array([input]).
@@ -50,20 +50,19 @@ def load_kernel(input:Union[str, list, float, complex]):
     :param input: Any number, list, or string representing a file path to a .npy file.
     :return: A numpy array representation of the input.
     """
-    if isinstance(input, numbers.Number):  # Check if input is a number
+    if isinstance(input, Number):  # Check if input is a number
         return np.array([input])
+
     elif isinstance(input, list):  # Check if input is a list
         return np.array(input)
+
     elif isinstance(input, str):  # Check if input is a string
         if input.endswith('.npy'):  # Ensure it's a path to a .npy file
-            try:
-                return np.load(input)
-            except Exception as e:
-                raise ValueError(f"Error loading .npy file: {e}")
+            return np.load(input)
         else:
             raise ValueError(f"Unsupported file type: {input}")
     else:
-        raise ValueError("Unsupported input type. Input must be a scalar, list, or path to a .npy file.")
+        raise ValueError("Unsupported input type. Input must be a number, list, or path to a .npy file.")
 
 
 """
@@ -72,7 +71,7 @@ handler routines
 
 PARAMETER_HANDLERS = {
     "*.signals.*.scale": to_complex,
-    "*.kernel_wf": load_kernel
+    "*.kernel_wf": to_array
 }
 
 
@@ -83,5 +82,4 @@ if __name__ == "__main__":
     print(to_complex(-0.5))
 
 
-    kn = load_kernel(0.1+0.2j)
-    print(kn)
+    print(to_array(.1+0.2j))

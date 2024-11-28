@@ -3,7 +3,7 @@ import operator
 from functools import reduce
 import ruamel.yaml as yaml
 
-from linc_rfsoc.helpers.yaml_rountine import PARAMETER_HANDLERS
+from linc_rfsoc.helpers.yaml_routine import PARAMETER_HANDLERS
 
 
 def apply_type_handlers(config: dict, handlers: dict) -> dict:
