@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Union, List, Tuple
+import os
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -75,7 +76,6 @@ def find_most_significant_blob(iq_pts: ComplexDataPointsType,
     blob_pt_bin_indices = bin_indices[0][in_largest_blob], bin_indices[1][in_largest_blob]
     pt_weights = hist[blob_pt_bin_indices]
 
-
     # Compute the center and radius
     center = np.average(blob_points, weights=pt_weights)
     distances = np.abs(blob_points - center)
@@ -106,13 +106,13 @@ def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
     hist_list = []
     bin_indices_list = []
     all_pts = np.concatenate(state_pts).flatten()
-    compare_hist_bin = 41 # this needs to be relatively small for the data masking to work
+    compare_hist_bin = 41  # this needs to be relatively small for the data masking to work
     real_bins = np.linspace(all_pts.real.min(), all_pts.real.max(), compare_hist_bin)
     imag_bins = np.linspace(all_pts.imag.min(), all_pts.imag.max(), compare_hist_bin)
 
     for i, pts in enumerate(state_pts):
         hist, _, _, bin_indices = _hist2d_with_indices(pts, bins=[real_bins, imag_bins])
-        hist_list.append(hist/len(pts))
+        hist_list.append(hist / len(pts))
         bin_indices_list.append(bin_indices)
 
     hist_all = np.sum(hist_list, axis=0)
@@ -153,30 +153,39 @@ def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
 
 class KernelGeneratorBase:
     def __init__(self, traces: Union[List, np.ndarray], g_circle: StateCircleType, e_circle: StateCircleType,
-                 plot=True):
+                 norm_factor:float = 1, decimation_used: int = 4, plot=True):
         """
         generate matched kernel based on a given set of IQ traces and specified g/e locations.
 
         :param traces: raw data complex IQ traces, should have the dimension of (iterations, time_points)
         :param g_circle: (I_center + 1j * Q_center, circle_radius)
         :param e_circle: (I_center + 1j * Q_center, circle_radius)
+        :param norm_factor: normalization factor for the generated kernel
+        :param decimation_used: Decimation used when getting the `traces` data. This will only be used for generating
+            the kernel to be uploaded to cmacc. See `generate_kernel_for_upload()`
         :param plot:
         """
-        self.all_traces = np.array(traces)
+        # todo: calculate optimal cmacc offset?
+        self.all_traces = np.array(traces, dtype=np.complex128)
         self.all_pts = np.sum(traces, axis=1)
         self.g_circle = g_circle
         self.e_circle = e_circle
-        self.generate_kernel(plot)
+        self.norm_factor = norm_factor
+        self.decimation_used = decimation_used
+        self.generate_kernel_trace(plot)
+        self.generate_kernel_for_upload()
 
-    def generate_kernel(self, plot=True):
+    def generate_kernel_trace(self, plot=True):
+        # calculate the kernel trace based on the selected data traces
         self.g_mask = mask_state_with_circle(self.all_pts, self.g_circle)
         self.e_mask = mask_state_with_circle(self.all_pts, self.e_circle)
         self.g_trace_avg = np.mean(self.all_traces[self.g_mask], axis=0)
         self.e_trace_avg = np.mean(self.all_traces[self.e_mask], axis=0)
-        kernel = np.conjugate(self.g_trace_avg - self.e_trace_avg)
-        self.kernel = kernel / np.max(abs(kernel))
+        self.kernel_trace = np.conjugate(self.g_trace_avg - self.e_trace_avg)
+        kernel_norm = self.kernel_trace / np.max(abs(self.kernel_trace)) * self.norm_factor # normalize to 1
 
-        self.new_iq_pts = np.sum(self.all_traces * self.kernel, axis=1)
+        # calculate expected IQ points when kernel is used
+        self.new_iq_pts = np.sum(self.all_traces * kernel_norm, axis=1)
 
         if plot:
             fig, axs = plt.subplots(3, 1, figsize=(6, 10))
@@ -202,51 +211,99 @@ class KernelGeneratorBase:
             plt.tight_layout()
             plt.show()
 
-        return self.kernel
+        return self.kernel_trace
 
-    def plot_kernel(self):
+
+    def generate_kernel_for_upload(self):
+        """
+        Calculate the kernel array for uploading to cmacc based on the decimation used to get the `traces` data
+
+        Since by default the input data to cmacc will always have a decimation of 4, if the trace data used to
+        generate the kernel array had a different decimation factor, the resulting kernel array must be adjusted
+        (repeated or decimated) to match the expected decimation of the incoming data to cmacc.
+        :return:
+        """
+
+        deci = self.decimation_used
+        if deci == 1:
+            # decimate the kernel trace by averaging every 4 adjacent points
+            length = len(self.kernel_trace) - (len(self.kernel_trace) % 4)
+            reshaped = self.kernel_trace[:length].reshape(-1, 4)
+            kernel_array = reshaped.mean(axis=1)
+
+        elif (deci // 4 > 0) and (deci % 4 == 0):
+            # stretch the kernel trace by repeating each data point deci/4 times
+            # todo: do interpolation instead?
+            kernel_array = np.repeat(self.kernel_trace, int(deci) // 4)
+        else:
+            raise ValueError("Invalid trace decimation, must be 1 or a positive multiple of 4 ")
+        self.kernel_upload = kernel_array / np.max(abs(kernel_array)) * self.norm_factor # normalize to 1
+
+        return self.kernel_upload
+
+
+    def plot_kernel(self, plot_uploaded=True):
+        if plot_uploaded:
+            kernel = self.kernel_upload
+        else:
+            kernel = self.kernel_trace
         plt.figure()
         plt.title("calculated kernel")
-        plt.plot(self.kernel.real, label="re")
-        plt.plot(self.kernel.imag, label="im")
+        plt.plot(kernel.real, label="re")
+        plt.plot(kernel.imag, label="im")
         plt.xlabel("pts")
         plt.tight_layout()
         plt.legend()
 
-    def save_kernel(self, save_dir, save_name=None):
-        # todo: handel decimation
-        # todo: calculate optimal cmacc offset?
-        save_name = datetime.now().strftime("kernel_%y%m%d_%H%M%S") if save_name is None else save_name
-        np.save(save_dir + save_name, self.kernel)
-        return save_dir + save_name + ".npy"
-
-
-    def update_kernel(self, yaml_file:str, channel_cfg_path:str, kernel_file_dir:str, kernel_file_name=None):
+    def save_kernel(self, directory, filename=None):
         """
+        Save the kernel array to a .npy file.
 
-        :param yaml_file:
-        :param channel_cfg_path:
-        :param save_dir:
-        :param save_name:
+        :param directory: Directory where the kernel file will be saved.
+        :param name: Name of the kernel file. Defaults to 'kernel_%y%m%d_%H%M%S.npy'.
         :return:
         """
-        if kernel_file_name is None:
-            kernel_file_name =  channel_cfg_path + "_kernel_%y%m%d_%H%M%S"
-        kernel_path = self.save_kernel(kernel_file_dir, kernel_file_name)
-        update_dict = {channel_cfg_path+".kernel_wf": kernel_path}
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+
+        save_name = datetime.now().strftime("kernel_%y%m%d_%H%M%S") if filename is None else filename
+        save_path = os.path.join(directory, save_name)
+        np.save(save_path, self.kernel_upload)
+        return save_path + ".npy"
+
+    def update_kernel(self, yaml_file: str, key_path: str, kernel_dir: str, kernel_name: str = None):
+        """
+        Update the path to the kernel file in a yaml config file.
+
+        :param yaml_file: Path to the yaml config file
+        :param key_path: Dot-separated string representing the hierarchical path to the "kernel_wf" key in the
+            nested dict structure of the YAML file (e.g., "ro_capture.kernel_wf")
+        :param kernel_dir: Directory where the new kernel file will be saved.
+        :param kernel_name: Name of the new kernel file. Default to a name based on  the channel configuration
+            path and the current timestamp.
+        :return:
+        """
+        if kernel_name is None:
+            kernel_name = key_path + "_kernel_%y%m%d_%H%M%S"
+        kernel_path = self.save_kernel(kernel_dir, kernel_name)
+        update_dict = {key_path: kernel_path}
         update_yaml(yaml_file, update_dict, keep_format=False)
 
 
 class KernelFromPreparedTraces(KernelGeneratorBase):
-    def __init__(self, g_traces:ComplexDataTracesType, e_traces:ComplexDataTracesType,
+    def __init__(self, g_traces: ComplexDataTracesType, e_traces: ComplexDataTracesType,
                  g_circle: StateCircleType = None, e_circle: StateCircleType = None,
                  bins: int = 50, sigma_factor: float = 3, average_radius=True,
+                 norm_factor:float = 1, decimation_used: int = 4,
                  plot=True, debug=False):
         """
         Generate readout kernel based on the complex IQ traces from g/e state preparation.
 
-        Uses the `find_state_circles` function to find the g/e state locations when `g_circle` or `e_circle` is not
-        provided. The method should hopefully be quite robust even when the state preparation fidelity is low.
+        Note this does not simply take the difference of the two acquired traces. Instead, it identifies the g and e
+        circles and only uses the traces that fall into those circles.
+
+        When not provided, the g/e state locations are identified using the `find_state_circles` function, which
+        should hopefully be quite robust even when the state preparation fidelity is low.
 
         :param g_traces: complex IQ traces from g state preparation, should have the shape of (iterations, time_points)
         :param e_traces: complex IQ traces from e state preparation, should have the shape of (iterations, time_points)
@@ -254,7 +311,10 @@ class KernelFromPreparedTraces(KernelGeneratorBase):
         :param e_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
         :param bins: number of bins in the 2D histogram for automatic searching of state circle
         :param sigma_factor: The sigma factor for the radius of the state circle (e.g., 2 for 2-sigma).
-        :param average_radius: When True, average the radius of all state circles
+        :param average_radius: When True, average the radius of all state circles.
+        :param norm_factor: normalization factor for the generated kernel.
+        :param decimation_used: Decimation used when getting the `traces` data. This will only be used for generating
+            the kernel to be uploaded to cmacc. See `KernelGeneratorBase.generate_kernel_for_upload()`
         :param plot:
         """
         self.g_traces_raw = g_traces
@@ -263,13 +323,13 @@ class KernelFromPreparedTraces(KernelGeneratorBase):
         self.e_pts_raw = np.sum(e_traces, axis=1)
         self.all_traces = np.concatenate([g_traces, e_traces])
         if (g_circle and e_circle) is None:  # at least one of the circles is not provided
-            g_e_circles= find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
-                                            sigma_factor=sigma_factor, average_radius=average_radius, debug=debug)
+            g_e_circles = find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
+                                             sigma_factor=sigma_factor, average_radius=average_radius, debug=debug)
 
         g_circle = g_circle if g_circle is not None else g_e_circles[0]
         e_circle = e_circle if e_circle is not None else g_e_circles[1]
 
-        super().__init__(self.all_traces, g_circle, e_circle, plot)
+        super().__init__(self.all_traces, g_circle, e_circle, norm_factor, decimation_used, plot)
 
 
 def load_kernel(kernel_path):
@@ -290,7 +350,7 @@ if __name__ == "__main__":
     e_traces = np.array(dm[f"traces_e"].records()).astype(float).view(complex).squeeze()
     all_data = np.concatenate([g_traces, e_traces])
 
-    rk = KernelFromPreparedTraces(np.repeat(g_traces, 2, axis=0), e_traces,  plot=True)
+    rk = KernelFromPreparedTraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
     # rk.save_kernel(r"../dev_codes//")
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
     #

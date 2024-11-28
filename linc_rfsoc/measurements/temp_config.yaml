@@ -29,7 +29,7 @@ ro_stimulus:
   signals:
     readout:
       data: [scipy, hann]
-      scale: (0.5, 0deg)
+      scale: (0.5, 180deg)
 
 ro_capture:
   channel: ADC0
@@ -45,5 +45,5 @@ ro_capture:
       decimation: 0
       region: plddr
   capture_delay: 300e-9
-  kernel_wf: ../dev_codes//test_kernel.npy
-  cmacc_offset: 0
+  kernel_wf: ../dev_codes/test_kernel.npy
+  cmacc_offset: 1200

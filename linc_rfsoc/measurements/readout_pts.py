@@ -35,24 +35,23 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                            }
 
         # Create an acadia object and grab a couple of its channels
-        self.acadia = acadia = Acadia()
+        acadia = Acadia()
         channel_objs = self.obtain_channels(acadia, **channel_configs)
 
         # Allocate the waveform memories that we'll need
-        q_rotation = self.allocate_waveform_mem(self.acadia, "q_stimulus", "q_rotation")
-        ro_drive = self.allocate_waveform_mem(self.acadia, "ro_stimulus", "ro_drive")
-        ro_demod = self.allocate_waveform_mem(self.acadia, "ro_capture", "ro_demod")
-
+        q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
+        ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
+        ro_pts = self.allocate_waveform_mem(acadia, "ro_capture", "ro_pts")
 
         # Create a blank waveform between qubit drive and readout drive
         q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
 
         # Create blank waveform for delay between capture and stimulus
         capture_delay = self.ro_capture["capture_delay"]
-        if capture_delay < 0:  # capture will be advanced by -capture_delay compare to stimulus
+        if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
             blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
-        elif capture_delay > 0:  # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture")(capture_delay)
+        elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
+            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
 
         # get the kernel and IQ offsets fom the config dict
         kernel_wf = self.ro_capture.get("kernel_wf", [0.1])
@@ -64,8 +63,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf,
-                                                            reset_fifo=True)
+            capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf)
 
             a.cmacc_load(capture_stream, cmacc_offset)
 
@@ -76,7 +74,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                 if capture_delay != 0:
                     a.schedule_waveform(blank_wf)
                 a.schedule_waveform(ro_drive)
-                a.stream(capture_stream, ro_demod)
+                a.stream(capture_stream, ro_pts)
 
             return kernel
 
@@ -96,7 +94,6 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         acadia.assemble()
         acadia.load()
 
-
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
 
@@ -111,11 +108,11 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
                 else:
                     pi_signal["scale"] = pi_amp
 
-                q_rotation.set(**pi_signal)
+                q_rotation.set(**pi_signal) # takes around 1ms
 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"pts_{state_}"].write(ro_demod.array)
+                self.data[f"pts_{state_}"].write(ro_pts.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -143,10 +140,9 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 
     def update(self):
         import numpy as np
-        import matplotlib.pyplot as plt
 
         # First make sure that we actually have new data to process
-        if "pts_e" not in self.data or len(self.data["pts_e"]) == 0:
+        if "pts_e" not in self.data or len(self.data["pts_e"]) < 2 :
             return
 
         # Update the progress bar based on the number of iterations that have been completed
@@ -173,13 +169,11 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
-        
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
     from linc_rfsoc.measurements import load_config
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
 
     from IPython.core.getipython import get_ipython
 
