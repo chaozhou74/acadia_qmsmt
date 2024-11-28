@@ -185,7 +185,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.measurements import load_config
+    from linc_rfsoc.measurements import load_config, CONFIG_FILE_PATH
 
 
     from IPython.core.getipython import get_ipython
@@ -210,19 +210,18 @@ if __name__ == "__main__":
     e_traces = np.array(rt.data["traces_e"].records()).astype(float).view(complex).squeeze()
     all_traces = np.concatenate([g_traces, e_traces])
 
-    all_pts = np.mean(all_traces, axis=1)
-    fig, ax = plt.subplots(1, 1)
-    ax.hist2d(all_pts.real, all_pts.imag, cmap="hot", bins=101)
-    ax.set_aspect(1)
+    # all_pts = np.mean(all_traces, axis=1)
+    # fig, ax = plt.subplots(1, 1)
+    # ax.hist2d(all_pts.real, all_pts.imag, cmap="hot", bins=101)
+    # ax.set_aspect(1)
 
     
     from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
     rk = KernelFromPreparedTraces(g_traces, e_traces)
+    rk.update_kernel(CONFIG_FILE_PATH, "ro_capture", r"../dev_codes//", "test_kernel")
 
     # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
 
-    # rk.plot_kernel()
-    # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
     
 
     

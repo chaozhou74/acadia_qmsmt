@@ -1,13 +1,14 @@
 from datetime import datetime
-from typing import Union, List, Tuple, Any
+from typing import Union, List, Tuple
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
-from IPython.core.pylabtools import figsize
 from scipy.ndimage import label
 
-StateCircleType = Tuple[complex, float]  # (I_center + 1j * Q_center, circle_radius)
+from linc_rfsoc.helpers.yaml_editor import update_yaml
+
+StateCircleType = Tuple[complex, np.floating]  # (I_center + 1j * Q_center, circle_radius)
 ComplexDataPointsType = Union[List[complex], np.ndarray[complex]]
 ComplexDataTracesType = Union[List, np.ndarray]
 
@@ -76,8 +77,7 @@ def find_most_significant_blob(iq_pts: ComplexDataPointsType,
 
 
     # Compute the center and radius
-    # center = np.average(blob_points, weights=pt_weights)
-    center = np.average(blob_points)
+    center = np.average(blob_points, weights=pt_weights)
     distances = np.abs(blob_points - center)
     radius = sigma_factor * np.std(distances)
 
@@ -85,7 +85,7 @@ def find_most_significant_blob(iq_pts: ComplexDataPointsType,
 
 
 def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
-                       sigma_factor: float = 3, average_radius=True, debug=True) -> List[StateCircleType]:
+                       sigma_factor: float = 3, average_radius=True, debug=False) -> List[StateCircleType]:
     """
     Find the state circle for an arbitrary number of prepared state data points.
 
@@ -143,7 +143,6 @@ def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
             axs[i].add_patch(patches.Circle((center.real, center.imag), radius, edgecolor="w", facecolor="none"))
             axs[i].set_aspect(1)
 
-
     if average_radius:
         r_list = [np.mean(r_list)] * n_states
 
@@ -164,7 +163,7 @@ class KernelGeneratorBase:
         :param plot:
         """
         self.all_traces = np.array(traces)
-        self.all_pts = np.mean(traces, axis=1)
+        self.all_pts = np.sum(traces, axis=1)
         self.g_circle = g_circle
         self.e_circle = e_circle
         self.generate_kernel(plot)
@@ -177,7 +176,7 @@ class KernelGeneratorBase:
         kernel = np.conjugate(self.g_trace_avg - self.e_trace_avg)
         self.kernel = kernel / np.max(abs(kernel))
 
-        self.new_iq_pts = np.mean(self.all_traces * self.kernel, axis=1)
+        self.new_iq_pts = np.sum(self.all_traces * self.kernel, axis=1)
 
         if plot:
             fig, axs = plt.subplots(3, 1, figsize=(6, 10))
@@ -186,7 +185,7 @@ class KernelGeneratorBase:
             for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
                 circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
                 axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor="w", facecolor="none"))
-                axs[0].text(circ_i + circ_r, circ_q + circ_r, state, fontsize=12, va='center', color="w")
+                axs[0].text(circ_i + circ_r * 0.8, circ_q + circ_r * 0.8, state, fontsize=12, va='center', color="w")
             axs[0].set_aspect('equal')
 
             axs[1].set_title("IQ traces after selection")
@@ -215,16 +214,34 @@ class KernelGeneratorBase:
         plt.legend()
 
     def save_kernel(self, save_dir, save_name=None):
-        save_name = datetime.now().strftime("readoutkernel_%y%m%d_%H%M%S") if save_name is None else save_name
+        # todo: handel decimation
+        # todo: calculate optimal cmacc offset?
+        save_name = datetime.now().strftime("kernel_%y%m%d_%H%M%S") if save_name is None else save_name
         np.save(save_dir + save_name, self.kernel)
-        return save_dir + save_name
+        return save_dir + save_name + ".npy"
+
+
+    def update_kernel(self, yaml_file:str, channel_cfg_path:str, kernel_file_dir:str, kernel_file_name=None):
+        """
+
+        :param yaml_file:
+        :param channel_cfg_path:
+        :param save_dir:
+        :param save_name:
+        :return:
+        """
+        if kernel_file_name is None:
+            kernel_file_name =  channel_cfg_path + "_kernel_%y%m%d_%H%M%S"
+        kernel_path = self.save_kernel(kernel_file_dir, kernel_file_name)
+        update_dict = {channel_cfg_path+".kernel_wf": kernel_path}
+        update_yaml(yaml_file, update_dict, keep_format=False)
 
 
 class KernelFromPreparedTraces(KernelGeneratorBase):
     def __init__(self, g_traces:ComplexDataTracesType, e_traces:ComplexDataTracesType,
                  g_circle: StateCircleType = None, e_circle: StateCircleType = None,
                  bins: int = 50, sigma_factor: float = 3, average_radius=True,
-                 plot=True):
+                 plot=True, debug=False):
         """
         Generate readout kernel based on the complex IQ traces from g/e state preparation.
 
@@ -242,15 +259,15 @@ class KernelFromPreparedTraces(KernelGeneratorBase):
         """
         self.g_traces_raw = g_traces
         self.e_traces_raw = e_traces
-        self.g_pts_raw = np.mean(g_traces, axis=1)
-        self.e_pts_raw = np.mean(e_traces, axis=1)
+        self.g_pts_raw = np.sum(g_traces, axis=1)
+        self.e_pts_raw = np.sum(e_traces, axis=1)
         self.all_traces = np.concatenate([g_traces, e_traces])
         if (g_circle and e_circle) is None:  # at least one of the circles is not provided
-            g_cir_find, e_cir_find = find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
-                                                        sigma_factor=sigma_factor, average_radius=average_radius)
+            g_e_circles= find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
+                                            sigma_factor=sigma_factor, average_radius=average_radius, debug=debug)
 
-        g_circle = g_circle if g_circle is not None else g_cir_find
-        e_circle = e_circle if e_circle is not None else e_cir_find
+        g_circle = g_circle if g_circle is not None else g_e_circles[0]
+        e_circle = e_circle if e_circle is not None else g_e_circles[1]
 
         super().__init__(self.all_traces, g_circle, e_circle, plot)
 

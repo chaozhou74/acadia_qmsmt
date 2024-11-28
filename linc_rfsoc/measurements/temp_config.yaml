@@ -1,5 +1,5 @@
 q_stimulus:
-  channel: "DAC0"
+  channel: DAC0
   nco_config:
     vop: 20000
     mix_reconstruction: true
@@ -10,14 +10,14 @@ q_stimulus:
       fixed_length: 200.0e-9
   signals:
     pi_pulse:
-      data: ["scipy", "hann"]
+      data: [scipy, hann]
       scale: 0.282
     pi_2_pulse:
-      data: ["scipy", "hann"]
+      data: [scipy, hann]
       scale: 0.141
 
 ro_stimulus:
-  channel: "DAC2"
+  channel: DAC2
   nco_config:
     vop: 25000
     mix_reconstruction: true
@@ -28,18 +28,22 @@ ro_stimulus:
       fixed_length: 1.6e-6
   signals:
     readout:
-      data: ["scipy", "hann"]
-      scale: (0.5, -50deg)
+      data: [scipy, hann]
+      scale: (0.5, 0deg)
 
 ro_capture:
-  channel: "ADC0"
+  channel: ADC0
   nco_config:
     nco_frequency: -9.030e9
   waveforms:
     ro_demod:
       length: 2.4e-6
+      decimation: 4
+      region: plddr
+    ro_pts:
+      length: 2.4e-6
       decimation: 0
-      region: "plddr"
+      region: plddr
   capture_delay: 300e-9
-  kernel_wf: 0.1
-  kernel_offset: 0
+  kernel_wf: ../dev_codes//test_kernel.npy
+  cmacc_offset: 0

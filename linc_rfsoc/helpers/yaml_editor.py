@@ -72,13 +72,14 @@ def to_yaml_friendly(v):
         return vv
 
 
-def update_yaml(yaml_path: str, new_param_dict: dict):
+def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True):
     """
     update a yaml config file with updated parameters, and keep the original format. 
 
     :param yaml_path: path to the yaml file to be updated
     :param new_param_dict: dictionary that contains the updated parameters. For nested parameters, the key needs be the
         key of each layer jointed with '.'
+   :param keep_format: When True, format the new parameters with the dtype of the original ones
 
     :Example:
         >>> old_config = {"config":{"relax_delay" : 100}} #to update relax_delay to 20, we do:
@@ -91,14 +92,18 @@ def update_yaml(yaml_path: str, new_param_dict: dict):
         """Access a nested object in root by item sequence."""
         return reduce(operator.getitem, items, root)
 
-    def set_by_path(root, items, value):
+    def set_by_path(root, items, value, keep_format):
         """Set a value in a nested object in root by item sequence."""
-        data_type = type(get_by_path(root, items))
-        get_by_path(root, items[:-1])[items[-1]] = data_type(value)
+        if keep_format:
+            data_type = type(get_by_path(root, items))
+            new_data = data_type(value)
+        else:
+            new_data = value
+        get_by_path(root, items[:-1])[items[-1]] = new_data
 
     config, ind, bsi = yaml.util.load_yaml_guess_indent(open(yaml_path))
     for s, val in new_param_dict.items():
-        set_by_path(config, s.split("."), to_yaml_friendly(val))
+        set_by_path(config, s.split("."), to_yaml_friendly(val), keep_format)
 
     new_yaml = yaml.YAML()
     new_yaml.default_flow_style = None
