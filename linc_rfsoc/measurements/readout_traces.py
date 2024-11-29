@@ -19,6 +19,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
     iterations: int
     plot: bool = True
     figsize: tuple[int] = None
+    update_kernel: bool = False
 
     FILE = __file__
 
@@ -125,8 +126,6 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
             import matplotlib.pyplot as plt
 
             self.fig, self.axs = plt.subplots(2, 1, figsize=self.figsize)
-            self.fig.tight_layout()
-            self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
             self.lines_re = []
             self.lines_im = []
@@ -164,7 +163,6 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                 capture_time = self.ro_capture["waveforms"]["ro_demod"]["length"] 
                 self.time_axis = np.linspace(0, capture_time, samples_per_trace, endpoint=False)
 
-
             # Sum the traces from each iteration
             # The records have shape (iterations, samples, 2)
             self.trace_summed = np.zeros((2, len(self.time_axis), 2), dtype=np.int64)
@@ -174,10 +172,8 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
             for i in range(2):
                 self.lines_re[i].update(self.time_axis, self.trace_summed[i, :,0])
                 self.lines_im[i].update(self.time_axis, self.trace_summed[i, :,1])
-                self.axs[i].relim()
-                self.axs[i].autoscale(tight=True)
                 self.fig.tight_layout()
-                self.fig.canvas.draw_idle()
+                # self.fig.canvas.draw_idle()
 
         # Save the data
         self.data.save(self.local_directory)
@@ -187,6 +183,16 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
+        
+        if self.update_kernel: # todo: this will produce ipympl errors currently
+            from linc_rfsoc.measurements import CONFIG_FILE_PATH
+            from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
+            t_data, g_traces, e_traces = self.parse_data(self.data)
+            kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=self.plot,
+                                                  decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
+            kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", self.local_directory)
+
+
 
     @staticmethod
     def parse_data(data_manager: DataManager):
@@ -209,7 +215,6 @@ if __name__ == "__main__":
     import numpy as np
     from linc_rfsoc.measurements import load_config, CONFIG_FILE_PATH
 
-
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
 
@@ -219,21 +224,19 @@ if __name__ == "__main__":
     iterations = 5000
 
 
-    rt = ReadoutTracesRuntime(**config_dict, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_traces", files=[rt.FILE, config_helper_file])
+    rt = ReadoutTracesRuntime(**config_dict, plot=plot, iterations=iterations, update_kernel=True)
+    rt.deploy("10.66.3.198", "readout_traces", files=[rt.FILE, config_helper_file], event_loop_period=1)
     rt.display()
 
-    # # some ad hoc processing, 
-    # todo: Make this not stop the live plotting from working...
-    rt._event_loop.join()
-    rt.fig
+    # # some ad hoc processing
+    # rt._event_loop.join() # this will stop live plotting from working
 
-    # generate kernel using the acquired data
-    t_data, g_traces, e_traces = rt.parse_data(rt.data)
-    from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
-    kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1,
-                                           decimation_used=rt.ro_capture["waveforms"]["ro_demod"]["decimation"])
-    kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", r"../dev_codes", "test_kernel")
-
-
+    # # generate kernel using the acquired data
     
+    # t_data, g_traces, e_traces = rt.parse_data(rt.data)
+    # from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
+    # kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,
+    #                                        decimation_used=rt.ro_capture["waveforms"]["ro_demod"]["decimation"])
+    # kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", r"../dev_codes", "test_kernel")
+
+

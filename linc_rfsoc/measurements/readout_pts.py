@@ -38,6 +38,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         acadia = Acadia()
         channel_objs = self.obtain_channels(acadia, **channel_configs)
 
+        # todo: is there a way to further simplify these block of codes?
         # Allocate the waveform memories that we'll need
         q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
         ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
@@ -169,6 +170,8 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
+
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt

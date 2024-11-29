@@ -166,10 +166,10 @@ class KernelGeneratorBase:
             generating the kernel to be uploaded to cmacc.
             Since by default the input data to cmacc will always have a decimation of 4, if the trace data used to
             generate the kernel array had a different decimation factor, the resulting kernel array must be adjusted
-            (repeated or decimated) to match the expected decimation of the incoming data to cmacc.
+            (interpolated or decimated) to match the expected decimation of the incoming data to cmacc.
         :param plot:
         """
-        # todo: calculate optimal cmacc offset?
+        # todo: calculate optimal cmacc offset? # need to know if the offset is added before or after the product. # test by setting kernel=0
         self.all_traces = np.array(traces, dtype=np.complex128)
         self.all_pts = np.sum(traces, axis=1)
         self.g_circle = g_circle
@@ -214,7 +214,7 @@ class KernelGeneratorBase:
             axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag, bins=101, cmap="hot")
             axs[2].set_aspect('equal')
             plt.tight_layout()
-            plt.show()
+            # plt.show(block=False)
 
         return self.kernel_trace
 
@@ -298,7 +298,7 @@ class KernelGeneratorBase:
         :return:
         """
         if kernel_name is None:
-            kernel_name = key_path + "_kernel_%y%m%d_%H%M%S"
+            kernel_name = key_path + datetime.now().strftime("_%y%m%d_%H%M%S")
         kernel_path = self.save_kernel(kernel_dir, kernel_name)
         update_dict = {key_path: kernel_path}
         update_yaml(yaml_file, update_dict, keep_format=False)
@@ -352,10 +352,12 @@ def load_kernel(kernel_path):
 
 
 if __name__ == "__main__":
-    import matplotlib
-
-    matplotlib.use('tkagg')
     from acadia.data import DataManager
+    import matplotlib
+    matplotlib.use('tkagg')
+    import matplotlib.pyplot as plt
+    plt.ion()
+
 
     data_dir = "/tmp/241127_133001"
     dm = DataManager()
