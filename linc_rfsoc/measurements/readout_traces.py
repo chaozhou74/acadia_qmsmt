@@ -19,7 +19,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
     iterations: int
     plot: bool = True
     figsize: tuple[int] = None
-    update_kernel: bool = False
+    generate_kernel: bool = False
 
     FILE = __file__
 
@@ -62,7 +62,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
             capture_stream = acadia.configure_dsp(self.channel_objs["ro_capture"], 
-                                                  self.ro_capture["waveforms"]["ro_demod"]["decimation"]) #todo: shorten this...
+                                                  self.ro_capture["waveforms"]["ro_demod"]["decimation"])
         
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
@@ -73,18 +73,17 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                 a.schedule_waveform(ro_drive)
                 a.stream(capture_stream, ro_demod)
 
+
         # Compile the sequence
         acadia.compile(sequence)
-
         # Attach to the hardware
         acadia.attach()
-
         # Configure channel analog parameters
         self.auto_config_ncos(acadia, **channel_configs)
-
         # Assemble and load the program
         acadia.assemble()
         acadia.load()
+
 
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
@@ -95,18 +94,13 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         for i in range(self.iterations):
             for state_ in ["g", "e"]:
                 # set the pulse amplitude
-                if state_ == "g":
-                    pi_signal["scale"] = 0
-                else:
-                    pi_signal["scale"] = pi_amp 
-
+                pi_signal["scale"] = 0 if state_ == "g" else pi_amp
                 q_rotation.set(**pi_signal) # takes around 1ms
-                
+
                 # capture data and put in the corresponding group
                 acadia.run()
-
                 self.data[f"traces_{state_}"].write(ro_demod.array)
-            
+
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
                 return
@@ -184,14 +178,23 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         if self.plot:
             self.savefig(self.fig)
         
-        if self.update_kernel: # todo: this will produce ipympl errors currently
-            from linc_rfsoc.measurements import CONFIG_FILE_PATH
-            from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
-            t_data, g_traces, e_traces = self.parse_data(self.data)
-            kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=self.plot,
-                                                  decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
-            kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", self.local_directory)
+        if self.generate_kernel:
+            self.post_processing()
 
+
+    def post_processing(self):
+        # generate readout kernel based on the acquired traces
+        from linc_rfsoc.measurements import CONFIG_FILE_PATH
+        from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
+        from linc_rfsoc.helpers.plot_utils import add_button
+
+        t_data, g_traces, e_traces = self.parse_data(self.data)
+        kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,
+                                              decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
+        update_kernel = lambda _: kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf",
+                                                           self.local_directory)
+        # make a kernel update button and maintain a reference to it for keeping it alive
+        self._update_button = add_button(kernel_gen.fig_kernel_gen, update_kernel, label="Update Kernel")
 
 
     @staticmethod
@@ -224,15 +227,14 @@ if __name__ == "__main__":
     iterations = 5000
 
 
-    rt = ReadoutTracesRuntime(**config_dict, plot=plot, iterations=iterations, update_kernel=True)
-    rt.deploy("10.66.3.198", "readout_traces", files=[rt.FILE, config_helper_file], event_loop_period=1)
+    rt = ReadoutTracesRuntime(**config_dict, plot=plot, iterations=iterations, generate_kernel=True)
+    rt.deploy("10.66.3.198", "readout_traces", files=[rt.FILE, config_helper_file], event_loop_period=0.5)
     rt.display()
 
     # # some ad hoc processing
     # rt._event_loop.join() # this will stop live plotting from working
 
     # # generate kernel using the acquired data
-    
     # t_data, g_traces, e_traces = rt.parse_data(rt.data)
     # from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
     # kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,

@@ -72,7 +72,7 @@ def to_yaml_friendly(v):
         return vv
 
 
-def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True):
+def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=False):
     """
     update a yaml config file with updated parameters, and keep the original format. 
 
@@ -80,6 +80,7 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True):
     :param new_param_dict: dictionary that contains the updated parameters. For nested parameters, the key needs be the
         key of each layer jointed with '.'
    :param keep_format: When True, format the new parameters with the dtype of the original ones
+   :param verbose: When True, print details of the update
 
     :Example:
         >>> old_config = {"config":{"relax_delay" : 100}} #to update relax_delay to 20, we do:
@@ -111,3 +112,6 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True):
 
     with open(yaml_path, 'w') as fp:
         new_yaml.dump(config, fp)
+
+    if verbose:
+        print(f"YAML file {yaml_path} updated with {new_param_dict}")

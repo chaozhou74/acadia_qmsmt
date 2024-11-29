@@ -44,7 +44,7 @@ def _hist2d_with_indices(iq_pts: ComplexDataPointsType, **kwargs):
 
 
 def find_most_significant_blob(iq_pts: ComplexDataPointsType,
-                               bins: int = 50, sigma_factor: float = 3) -> StateCircleType:
+                               bins: int = 50, sigma_factor: float = 2.5) -> StateCircleType:
     """
     Identify the most significant Gaussian blob in an 1D array of complex IQ points.
     Different blobs are separated by looking at bin connectivity.
@@ -86,7 +86,7 @@ def find_most_significant_blob(iq_pts: ComplexDataPointsType,
 
 
 def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
-                       sigma_factor: float = 3, average_radius=True, debug=False) -> List[StateCircleType]:
+                       sigma_factor: float = 2.5, average_radius=True, debug=False) -> List[StateCircleType]:
     """
     Find the state circle for an arbitrary number of prepared state data points.
 
@@ -193,30 +193,48 @@ class KernelGeneratorBase:
         self.new_iq_pts = np.sum(self.all_traces * kernel_norm, axis=1)
 
         if plot:
-            fig, axs = plt.subplots(3, 1, figsize=(6, 10))
-            axs[0].set_title("raw IQ points and g/e selection")
-            axs[0].hist2d(self.all_pts.real, self.all_pts.imag, bins=101, cmap="hot")
-            for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
-                circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
-                axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor="w", facecolor="none"))
-                axs[0].text(circ_i + circ_r * 0.8, circ_q + circ_r * 0.8, state, fontsize=12, va='center', color="w")
-            axs[0].set_aspect('equal')
-
-            axs[1].set_title("IQ traces after selection")
-            trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
-            for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
-                axs[1].plot(trace.real, ".-", color=trace_colors[2 * i], label=f"{['g', 'e'][i]} trace, re")
-                axs[1].plot(trace.imag, ".-", color=trace_colors[2 * i + 1], label=f"{['g', 'e'][i]} trace, im")
-                axs[1].set_xlabel("pts")
-                axs[1].legend()
-
-            axs[2].set_title("IQ points after applying kernel")
-            axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag, bins=101, cmap="hot")
-            axs[2].set_aspect('equal')
-            plt.tight_layout()
-            # plt.show(block=False)
+            self.plot_kernel_generation()
 
         return self.kernel_trace
+
+    def plot_kernel_generation(self, log_scale=False):
+        """
+        Plot the selection of g/e circles for kernel generation, the average of the selected g/e traces, and the
+        expected IQ points after applying kernel.
+
+        :param log_scale:
+        :return:
+        """
+        from matplotlib.colors import LogNorm
+        norm = LogNorm() if log_scale else None
+
+        fig, axs = plt.subplots(3, 1, figsize=(5, 8))
+        axs[0].set_title("raw IQ points and g/e selection")
+        axs[0].hist2d(self.all_pts.real, self.all_pts.imag, bins=101, cmap="hot", norm=norm)
+        for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
+            circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
+            axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor="w", facecolor="none"))
+            axs[0].text(circ_i + circ_r * 0.8, circ_q + circ_r * 0.8, state, fontsize=12, va='center', color="w")
+        axs[0].set_aspect('equal')
+
+        axs[1].set_title("IQ traces after selection")
+        trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
+        for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
+            axs[1].plot(trace.real, ".-", color=trace_colors[2 * i], label=f"{['g', 'e'][i]} trace, re")
+            axs[1].plot(trace.imag, ".-", color=trace_colors[2 * i + 1], label=f"{['g', 'e'][i]} trace, im")
+            axs[1].set_xlabel("pts")
+            axs[1].legend()
+
+        axs[2].set_title("IQ points after applying kernel")
+        axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag, bins=101, cmap="hot", norm=norm)
+        axs[2].set_aspect('equal')
+
+        fig.tight_layout()
+        # fig.show(block=False)
+        self.fig_kernel_gen = fig
+
+        return fig, axs
+
 
     def generate_kernel_for_upload(self):
         """
@@ -269,6 +287,7 @@ class KernelGeneratorBase:
         plt.tight_layout()
         plt.legend()
 
+
     def save_kernel(self, directory, filename=None):
         """
         Save the kernel array to a .npy file.
@@ -283,6 +302,7 @@ class KernelGeneratorBase:
         save_name = datetime.now().strftime("kernel_%y%m%d_%H%M%S") if filename is None else filename
         save_path = os.path.join(directory, save_name)
         np.save(save_path, self.kernel_upload)
+        print(f"kernel saved to: {save_path}.npy")
         return save_path + ".npy"
 
     def update_kernel(self, yaml_file: str, key_path: str, kernel_dir: str, kernel_name: str = None):
@@ -301,13 +321,13 @@ class KernelGeneratorBase:
             kernel_name = key_path + datetime.now().strftime("_%y%m%d_%H%M%S")
         kernel_path = self.save_kernel(kernel_dir, kernel_name)
         update_dict = {key_path: kernel_path}
-        update_yaml(yaml_file, update_dict, keep_format=False)
+        update_yaml(yaml_file, update_dict, keep_format=False, verbose=True)
 
 
 class KernelFromPreparedTraces(KernelGeneratorBase):
     def __init__(self, g_traces: ComplexDataTracesType, e_traces: ComplexDataTracesType,
                  g_circle: StateCircleType = None, e_circle: StateCircleType = None,
-                 bins: int = 50, sigma_factor: float = 3, average_radius=True,
+                 bins: int = 50, sigma_factor: float = 2.5, average_radius=True,
                  norm_factor:float = 1, decimation_used: int = 4,
                  plot=True, debug=False):
         """
@@ -354,7 +374,7 @@ def load_kernel(kernel_path):
 if __name__ == "__main__":
     from acadia.data import DataManager
     import matplotlib
-    matplotlib.use('tkagg')
+    matplotlib.use('qt5agg')
     import matplotlib.pyplot as plt
     plt.ion()
 
@@ -367,7 +387,10 @@ if __name__ == "__main__":
     all_data = np.concatenate([g_traces, e_traces])
 
     rk = KernelFromPreparedTraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
-    # rk.save_kernel(r"../dev_codes//")
+    from linc_rfsoc.helpers.plot_utils import add_button
+
+    save_kernel = lambda _: rk.save_kernel(r"../dev_codes//")
+    # button = add_button(rk.fig_kernel_gen, save_kernel)
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
     #
     # pts = rk.e_pts_raw
