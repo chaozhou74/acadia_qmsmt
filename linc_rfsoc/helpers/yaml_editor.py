@@ -68,7 +68,7 @@ def to_yaml_friendly(v):
                 vv[i] = to_yaml_friendly(d)
             return vv
     except TypeError:
-        vv = float(v)
+        vv = v
         return vv
 
 

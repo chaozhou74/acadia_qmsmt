@@ -1,9 +1,12 @@
 from dataclasses import dataclass
+from typing import Tuple
+import numpy as np
+from numpy.typing import NDArray
 from acadia.runtime import Runtime
+from acadia import DataManager
 
 from auto_config import AutoConfigMixin
 from auto_config import FILE as config_helper_file
-
 
 @dataclass
 class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
@@ -38,7 +41,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         acadia = Acadia()
         channel_objs = self.obtain_channels(acadia, **channel_configs)
 
-        # todo: is there a way to further simplify these block of codes?
+        
         # Allocate the waveform memories that we'll need
         q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
         ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
@@ -66,7 +69,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         def sequence(a: Acadia):
             capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf)
 
-            a.cmacc_load(capture_stream, cmacc_offset)
+            a.cmacc_load(capture_stream, cmacc_offset) # fixme: currently this only accepts positive integers, should take complex number instead
 
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
@@ -81,20 +84,16 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 
         # Compile the sequence
         kernel = acadia.compile(sequence)
-
         # Attach to the hardware
         acadia.attach()
-
         # Configure channel analog parameters
         self.auto_config_ncos(acadia, **channel_configs)
-
-        # Set the amplitude of the boxcar integration kernel
-        kernel.set(kernel_wf)
-
         # Assemble and load the program
         acadia.assemble()
         acadia.load()
 
+        # Set the amplitude of the boxcar integration kernel
+        kernel.set(kernel_wf)
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
 
@@ -104,11 +103,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         for i in range(self.iterations):
             for state_ in ["g", "e"]:
                 # set the pulse amplitude
-                if state_ == "g":
-                    pi_signal["scale"] = 0
-                else:
-                    pi_signal["scale"] = pi_amp
-
+                pi_signal["scale"] = 0 if state_ == "g" else pi_amp
                 q_rotation.set(**pi_signal) # takes around 1ms
 
                 # capture data and put in the corresponding group
@@ -126,14 +121,11 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.figsize = (3, 5) if self.figsize is None else self.figsize
 
         if self.plot:
-            from acadia.processing import DynamicReadoutHistogram
+            # from acadia.processing import DynamicReadoutHistogram
+            # todo: need to learn how this works... Currently doing a simple hist2d
+            
             import matplotlib.pyplot as plt
-
             self.fig, self.axs = plt.subplots(2, 1, figsize=self.figsize)
-            self.fig.tight_layout()
-            self.fig.subplots_adjust(left=0.25, bottom=0.25)
-
-            # self.hist = DynamicReadoutHistogram(self.ax) # todo: need to learn how this works...
 
         from tqdm.notebook import tqdm
         self.progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
@@ -154,13 +146,13 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         if self.plot:
             data = [self.data[f"pts_{s_}"].records().squeeze() for s_ in ["g", "e"]]
             for i in range(2):
-                # self.hist.update(data)
+                self.axs[i].clear()
                 self.axs[i].hist2d(data[i][:, 0], data[i][:, 1], bins=51, cmap="hot")
                 self.axs[i].relim()
                 self.axs[i].autoscale(tight=True)
-                self.fig.tight_layout()
-                self.fig.canvas.draw_idle()
                 self.axs[i].set_aspect(1)
+            self.fig.tight_layout()
+            self.fig.canvas.draw_idle()
 
         # Save the data
         self.data.save(self.local_directory)
@@ -170,18 +162,37 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
+    
+    def post_process(self):
+         g_pts, e_pts = self.parse_data(self.data)
+         for state, pts in zip(("g", "e"), (g_pts, e_pts)):
+            # todo: take threshold from input
+            pct = np.sum(np.real(pts) < 0) / len(pts)
+            print(f"population prepare {state}:", pct)
+        
 
+    @staticmethod
+    def parse_data(data_manager: DataManager) -> Tuple[NDArray[np.complex128]]:
+        """Parse the acquired data in data_manager to an easy-to-process format
+
+        :param data_manager: data manager object for data acquired using this runtime
+        """
+        dm = data_manager
+        g_pts = dm["pts_g"].records().astype(float).view(complex).squeeze()
+        e_pts = dm["pts_e"].records().astype(float).view(complex).squeeze()
+        return g_pts, e_pts
 
 
 if __name__ == "__main__":
+
+    # import matplotlib
+    # matplotlib.use("module://ipympl")
     import matplotlib.pyplot as plt
-    import numpy as np
-    from linc_rfsoc.measurements import load_config
-
     from IPython.core.getipython import get_ipython
-
     get_ipython().run_line_magic("matplotlib", "widget")
 
+    import numpy as np
+    from linc_rfsoc.measurements import load_config
     config_dict = load_config()
 
     plot = True
@@ -192,11 +203,11 @@ if __name__ == "__main__":
     rt.display()
 
     # some ad hoc processing
-    rt._event_loop.join()
-    rt.fig
+    # rt._event_loop.join()
+    # rt.fig
 
-    fig, ax = plt.subplots(1, 1)
-    for i, s_ in enumerate(["g", "e"]):
-        data = rt.data[f"pts_{s_}"].records().squeeze()
-        ax.plot(data[:, 0], data[:, 1], ".", ms=0.5)
-        ax.set_aspect(1)
+    # fig, ax = plt.subplots(1, 1)
+    # for i, s_ in enumerate(["g", "e"]):
+    #     data = rt.data[f"pts_{s_}"].records().squeeze()
+    #     ax.plot(data[:, 0], data[:, 1], ".", ms=0.5)
+    #     ax.set_aspect(1)

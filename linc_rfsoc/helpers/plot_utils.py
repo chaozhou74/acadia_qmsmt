@@ -7,7 +7,7 @@ from typing import Callable, Tuple
 def add_button(fig: Figure, event: Callable, label: str = "Update", size: Tuple[float, float] = (0.2, None)):
     """
     Add a button to the bottom of the figure. Run the `event` when the button is clicked.
-    The caller must maintain a reference to the returned widget object for the button to be alive.
+    The caller must maintain a reference to the returned widget object for the button to be active.
 
     :param fig: Figure to which the button is added
     :param event: The function to call when the button is clicked

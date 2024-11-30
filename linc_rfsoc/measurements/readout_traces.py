@@ -39,6 +39,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         acadia = Acadia()
         self.obtain_channels(acadia, **channel_configs)
 
+        # todo: is there a way to further simplify these block of codes?
         # Allocate the waveform memories that we'll need
         q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
         ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
@@ -179,21 +180,26 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
             self.savefig(self.fig)
         
         if self.generate_kernel:
-            self.post_processing()
+            self.post_process()
 
 
-    def post_processing(self):
-        # generate readout kernel based on the acquired traces
+    def post_process(self):
+        """
+        Generate readout kernel based on the acquired traces
+
+        """
         from linc_rfsoc.measurements import CONFIG_FILE_PATH
         from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
         from linc_rfsoc.helpers.plot_utils import add_button
-
+        # gather the traces
         t_data, g_traces, e_traces = self.parse_data(self.data)
+        # generate kernel
         kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,
                                               decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
+        # make a lambda function for saving the kernel and update yaml
         update_kernel = lambda _: kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf",
                                                            self.local_directory)
-        # make a kernel update button and maintain a reference to it for keeping it alive
+        # add a kernel update button to the plot and maintain a reference to it for keeping it alive
         self._update_button = add_button(kernel_gen.fig_kernel_gen, update_kernel, label="Update Kernel")
 
 

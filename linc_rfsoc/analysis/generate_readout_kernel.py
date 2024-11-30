@@ -169,7 +169,6 @@ class KernelGeneratorBase:
             (interpolated or decimated) to match the expected decimation of the incoming data to cmacc.
         :param plot:
         """
-        # todo: calculate optimal cmacc offset? # need to know if the offset is added before or after the product. # test by setting kernel=0
         self.all_traces = np.array(traces, dtype=np.complex128)
         self.all_pts = np.sum(traces, axis=1)
         self.g_circle = g_circle
@@ -183,6 +182,8 @@ class KernelGeneratorBase:
         # calculate the kernel trace based on the selected data traces
         self.g_mask = mask_state_with_circle(self.all_pts, self.g_circle)
         self.e_mask = mask_state_with_circle(self.all_pts, self.e_circle)
+        self.g_pts_masked = self.all_pts[self.g_mask]
+        self.e_pts_masked = self.all_pts[self.e_mask]
         self.g_trace_avg = np.mean(self.all_traces[self.g_mask], axis=0)
         self.e_trace_avg = np.mean(self.all_traces[self.e_mask], axis=0)
         self.kernel_trace = np.conjugate(self.g_trace_avg - self.e_trace_avg)
@@ -235,7 +236,6 @@ class KernelGeneratorBase:
 
         return fig, axs
 
-
     def generate_kernel_for_upload(self):
         """
         Calculate the kernel array for uploading to cmacc based on the decimation used to get the `traces` data
@@ -273,7 +273,6 @@ class KernelGeneratorBase:
 
         return self.kernel_upload
 
-
     def plot_kernel(self, plot_uploaded=True):
         if plot_uploaded:
             kernel = self.kernel_upload
@@ -286,7 +285,6 @@ class KernelGeneratorBase:
         plt.xlabel("pts")
         plt.tight_layout()
         plt.legend()
-
 
     def save_kernel(self, directory, filename=None):
         """
@@ -322,6 +320,52 @@ class KernelGeneratorBase:
         kernel_path = self.save_kernel(kernel_dir, kernel_name)
         update_dict = {key_path: kernel_path}
         update_yaml(yaml_file, update_dict, keep_format=False, verbose=True)
+
+    def calculate_cmacc_offset(self) -> Tuple[complex, Tuple[int, int]]:
+        """
+        Calculate the optimal cmacc offset (the preloaded value) for splitting the post-kernel g and e states into
+        different quadrants on the IQ plane.
+
+        :return: (cmacc offset, (quadrant of the g state, quadrant of the e state))
+        """
+
+        # post-kernel g and e locations
+        g_center_pk = np.sum(self.kernel_trace_norm * self.g_trace_avg)
+        e_center_pk = np.sum(self.kernel_trace_norm * self.e_trace_avg)
+
+        # I offset is just the center of the new g and e circle
+        offset_I = -(g_center_pk.real + e_center_pk.real)/2
+
+        # calculate Q offset based on the 6-sigma radius of the g states
+        radius = np.std(self.new_iq_pts[self.g_mask] - g_center_pk) * 6
+        offset_Q = ((g_center_pk.imag > 0) * 2 - 1) * radius - g_center_pk.imag
+
+        # get the quadrant of where the two states falls in
+        def _get_shifted_quadrant(center):
+            shifted_ = center + offset_I + 1j* offset_Q
+            quadrant = (3, 2, 4, 1)[2 * (shifted_.real > 0) + (shifted_.imag > 0)]
+            return quadrant
+
+        # offset = int(offset_I) + 1j * int(offset_Q) # todo: `acadia.cmacc_load` need to support complex input
+        offset = int(offset_I)
+        q_g, q_e = _get_shifted_quadrant(g_center_pk), _get_shifted_quadrant(e_center_pk)
+
+        return offset, (q_g, q_e)
+
+    def update_cmacc_offset(self, yaml_file: str, offset_key_path: str, quadrant_key_path: str):
+        """
+        Update the cmacc_offset and g_e_quadrant in a yaml config file.
+
+        :param yaml_file: Path to the yaml config file
+        :param offset_key_path: Dot-separated string representing the hierarchical path to the "cmacc_offset" key in the
+            nested dict structure of the YAML file (e.g., "ro_capture.cmacc_offset")
+        :param offset_key_path: key path to the "state_quadrants" key in the YAML file.
+        :return:
+        """
+        offset, (g_quadrant, e_quadrant) = self.calculate_cmacc_offset()
+        update_dict = {offset_key_path: offset, quadrant_key_path: [g_quadrant, e_quadrant]}
+        update_yaml(yaml_file, update_dict, keep_format=False, verbose=True)
+
 
 
 class KernelFromPreparedTraces(KernelGeneratorBase):
@@ -386,11 +430,13 @@ if __name__ == "__main__":
     e_traces = np.array(dm[f"traces_e"].records()).astype(float).view(complex).squeeze()
     all_data = np.concatenate([g_traces, e_traces])
 
-    rk = KernelFromPreparedTraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
+    kgen = KernelFromPreparedTraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
     from linc_rfsoc.helpers.plot_utils import add_button
 
-    save_kernel = lambda _: rk.save_kernel(r"../dev_codes//")
-    # button = add_button(rk.fig_kernel_gen, save_kernel)
+    save_kernel = lambda _: kgen.save_kernel(r"../dev_codes//")
+    button = add_button(kgen.fig_kernel_gen, save_kernel, "save kernel")
+
+
     # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
     #
     # pts = rk.e_pts_raw
@@ -404,3 +450,7 @@ if __name__ == "__main__":
     # ax.add_patch(patches.Circle((center.real, center.imag), radius, edgecolor="w", facecolor="none"))
     # plt.show()
     # ax.set_aspect(1)
+
+    plt.figure()
+    plt.hist2d(kgen.new_iq_pts[kgen.g_mask].real, kgen.new_iq_pts[kgen.g_mask].imag, bins=51)
+    plt.hist2d(kgen.all_pts[kgen.g_mask].real, kgen.all_pts[kgen.g_mask].imag, bins=51)
