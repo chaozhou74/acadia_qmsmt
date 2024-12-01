@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Literal
 import numpy as np
 from numpy.typing import NDArray
 from acadia.runtime import Runtime
@@ -162,14 +162,36 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
-    
-    def post_process(self):
-         g_pts, e_pts = self.parse_data(self.data)
-         for state, pts in zip(("g", "e"), (g_pts, e_pts)):
-            # todo: take threshold from input
-            pct = np.sum(np.real(pts) < 0) / len(pts)
-            print(f"population prepare {state}:", pct)
-        
+        self.post_process()
+
+    def post_process(self, i_threshold: int = 0, q_threshold: int = 0,
+                     e_quadrant: Literal[1,2,3,4] = None):
+        """ Calculate the e percentage for the prepared states
+
+        :param i_threshold: I position of the state separation line. 
+            Default to 0 assuming cmacc offset has been applied properly
+        :param q_threshold: Q position of the state separation line. 
+            Default to 0 assuming cmacc offset has been applied properly
+        :param e_quadrant: Quadrant of the e state. Default to
+            the quadrant saved in the yaml file.
+        """
+        from linc_rfsoc.analysis import population_in_quadrant
+        g_pts, e_pts = self.parse_data(self.data)
+
+        if e_quadrant is None:
+            e_quadrant = self.ro_capture.get("state_quadrants", [None, None])[1]
+            if e_quadrant is None:
+                print("e-state quadrant not provided.")
+                return [None, None]
+
+        e_pcts = []
+        for state, pts in zip(("g", "e"), (g_pts, e_pts)):
+            pct = population_in_quadrant(pts, e_quadrant, i_threshold, q_threshold)
+            e_pcts.append(pct)
+            print(f"e population, prepare {state}:", pct)
+
+        return e_pcts
+
 
     @staticmethod
     def parse_data(data_manager: DataManager) -> Tuple[NDArray[np.complex128]]:

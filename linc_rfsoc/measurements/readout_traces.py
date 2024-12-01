@@ -182,26 +182,35 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         if self.generate_kernel:
             self.post_process()
 
-
-    def post_process(self):
+    def post_process(self, g_circle:tuple[complex, float]=None, e_circle:tuple[complex, float]=None,
+                     i_threshold:int=None, q_threshold:int=None, **kwargs):
         """
-        Generate readout kernel based on the acquired traces
+        Generate readout kernel, optimal cmacc offset and state quadrants based on the acquired traces.
 
+        :param g_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
+        :param e_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
+        :param i_threshold: I position of the state separation line. Default to center of the g and e blobs.
+        :param q_threshold: Q position of the state separation line. Default to 3-sigma away from the center of the g blob.
         """
         from linc_rfsoc.measurements import CONFIG_FILE_PATH
-        from linc_rfsoc.analysis.generate_readout_kernel import KernelFromPreparedTraces
+        from linc_rfsoc.analysis.generate_readout_kernel import KernelFromGETraces
         from linc_rfsoc.helpers.plot_utils import add_button
         # gather the traces
         t_data, g_traces, e_traces = self.parse_data(self.data)
-        # generate kernel
-        kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,
-                                              decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
-        # make a lambda function for saving the kernel and update yaml
-        update_kernel = lambda _: kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf",
-                                                           self.local_directory)
-        # add a kernel update button to the plot and maintain a reference to it for keeping it alive
-        self._update_button = add_button(kernel_gen.fig_kernel_gen, update_kernel, label="Update Kernel")
 
+        # generate kernel
+        kernel_gen = KernelFromGETraces(g_traces, e_traces, g_circle, e_circle,
+                                        i_threshold, q_threshold, **kwargs, plot=True,
+                                        decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
+
+        # make a function for updating the kernel path and cmacc offset in yaml
+        def _update_kernel_and_offset(event):
+            kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", self.local_directory)
+            kernel_gen.update_cmacc_offset(CONFIG_FILE_PATH, "ro_capture.cmacc_offset", "ro_capture.state_quadrants")
+
+        # add a kernel update button to the plot and maintain a reference to it for keeping it alive
+        self._update_button = add_button(kernel_gen.fig, _update_kernel_and_offset, label="Update Kernel and offset")
+        return kernel_gen
 
     @staticmethod
     def parse_data(data_manager: DataManager):

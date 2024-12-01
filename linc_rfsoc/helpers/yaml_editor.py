@@ -2,6 +2,8 @@ import fnmatch
 import operator
 from functools import reduce
 import ruamel.yaml as yaml
+import numpy as np
+from attr.setters import convert
 
 from linc_rfsoc.helpers.yaml_routine import PARAMETER_HANDLERS
 
@@ -45,31 +47,34 @@ def load_yaml(yaml_path: str):
     return apply_type_handlers(config, PARAMETER_HANDLERS)
 
 
-def to_yaml_friendly(v):
+def to_yaml_friendly(value):
     """convert possible numpy type to native python types"""
-    if type(v) == str:
-        vv = v
-        return vv
-    if type(v) == dict:
-        vv = {}
-        for k_, v_ in v.items():
+    if type(value) == str:
+        return value
+    if type(value) == dict:
+        converted = {}
+        for k_, v_ in value.items():
             vv_ = to_yaml_friendly(v_)
-            vv[k_] = vv_
-        return vv
+            converted[k_] = vv_
+        return converted
+
     try:
-        if len(v) > 0:
+        if len(value) > 0:
             # convert np.array to list
-            try:
-                vv = v.tolist()
+            try: # not just np.ndarray, any class that has this method
+                converted = value.tolist()
             except AttributeError:
-                vv = v
+                converted = list(value)
             # convert each element
-            for i, d in enumerate(vv):
-                vv[i] = to_yaml_friendly(d)
-            return vv
+            for i, d in enumerate(converted):
+                converted[i] = to_yaml_friendly(d)
+            return converted
+
     except TypeError:
-        vv = v
-        return vv
+        if isinstance(value, np.generic): # Covert all NumPy scalar types
+            return value.item()
+        else:
+            return value
 
 
 def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=False):
