@@ -40,8 +40,7 @@ class QubitSpecRuntime(Runtime):
         readout_stimulus_waveform = acadia.create_waveform(readout_stimulus_channel, **self.readout_stimulus["waveform"])
         readout_capture_waveform = acadia.create_waveform(readout_capture_channel, **self.readout_capture["waveform"]) 
         
-        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-9, blank=True) 
-        #todo: add wait length to input
+        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-9, blank=True)
 
         # assemble channel objects
         channels_ = [qubit_channel, readout_stimulus_channel, readout_capture_channel]
@@ -50,8 +49,7 @@ class QubitSpecRuntime(Runtime):
         
         # Create a record group for saving captured data
         self.data.add_group(f"traces", uniform=True)
-        
-        # todo: this could be simplified
+
         kernel_wf = self.readout_capture["kernel_wf"]
         if type(kernel_wf) == float: # constant value kernel
             kernel_wf = np.float64(kernel_wf)
@@ -85,7 +83,6 @@ class QubitSpecRuntime(Runtime):
 
 
         # Configure channel analog parameters
-        # todo: this should be written as a generic function that automatically resets all channels used
         acadia.align_tile_latencies()
         for ch, config, wf in zip(channels_, channel_configs, channel_wfs):
             if "signal" in config: # is DAC channel
@@ -185,8 +182,7 @@ class QubitSpecRuntime(Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
-    
+
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
 

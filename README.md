@@ -1,2 +1,2 @@
 # linc_rfsoc
-temp repo for the linc msmts with rfsoc
+temp repo for the linc msmts with acadia

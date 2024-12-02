@@ -6,9 +6,6 @@ from acadia import Acadia
 FILE = __file__
 
 
-# todo: this should be moved to a separate submodule... But need to figure out a easy way to send this to the board
-
-
 class AutoConfigMixin:
     """
     takes the overall config dict and automatically applies some configurations
@@ -95,7 +92,7 @@ class AutoConfigMixin:
                 region = ref_wf_cfg.get("region", None)
 
             if decimation == 0:
-                decimation = 4 # for cmacc # todo: need to test
+                decimation = 4 # for cmacc
             waveform_args.update({"decimation": decimation, "region": region})
         
         def blank_wf_gen(length:float):
