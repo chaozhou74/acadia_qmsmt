@@ -1,17 +1,17 @@
 from dataclasses import dataclass
-from typing import Union
+from typing import Union, Tuple, Literal
 import numpy as np
+from numpy.typing import NDArray
 from acadia.runtime import Runtime
+from acadia import DataManager
 
 from auto_config import AutoConfigMixin
 from auto_config import FILE as config_helper_file
 
-
 @dataclass
 class QubitSpecRuntime(AutoConfigMixin, Runtime):
     """
-    A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
-    it on an ADC.
+    A :class:`Runtime` subclass for qubit spectroscopy
     """
 
     q_stimulus: dict
@@ -40,42 +40,37 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
         # Create an acadia object and grab a couple of its channels
         acadia = Acadia()
-        self.obtain_channels(acadia, **channel_configs)
+        channel_objs = self.obtain_channels(acadia, **channel_configs)
 
         # Allocate the waveform memories that we'll need
-        self.allocate_all_waveform_mems(acadia, **channel_configs)
-        q_rotation = self.channel_waveforms["q_stimulus"]["q_rotation"]
-        ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
-        ro_demod = self.channel_waveforms["ro_capture"]["ro_demod"]
+        q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
+        ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
+        ro_pts = self.allocate_waveform_mem(acadia, "ro_capture", "ro_pts")
 
         # Create a blank waveform between qubit drive and readout drive
         q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
 
         # Create blank waveform for delay between capture and stimulus
         capture_delay = self.ro_capture["capture_delay"]
-        if capture_delay < 0:  # capture will be advanced by -capture_delay compare to stimulus
+        if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
             blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
-        elif capture_delay > 0:  # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture")(capture_delay)
+        elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
+            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
 
-        kernel_wf = self.ro_capture.get("kernel_wf", 0.1)
-        if type(kernel_wf) == float:  # constant value kernel
-            kernel_wf = np.float64(kernel_wf)
-            kernel_cmacc = None
-        elif type(kernel_wf) == np.ndarray:
-            kernel_cmacc = kernel_wf
-
+        # get the kernel and IQ offsets fom the config dict
+        kernel_wf = self.ro_capture.get("kernel_wf", [0.1])
         cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
         self.data.add_group(f"spec", uniform=True)
+        self.data.add_group(f"freqs", uniform=False)
+        self.data[f"freqs"].write(self.qubit_frequencies)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = acadia.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_cmacc,
-                                                            reset_fifo=True)
+            capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf)
 
-            acadia.cmacc_load(capture_stream, cmacc_offset)
+            a.cmacc_load(capture_stream, cmacc_offset)
 
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
@@ -84,26 +79,22 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
                 if capture_delay != 0:
                     a.schedule_waveform(blank_wf)
                 a.schedule_waveform(ro_drive)
-                a.stream(capture_stream, ro_demod)
+                a.stream(capture_stream, ro_pts)
 
             return kernel
 
         # Compile the sequence
         kernel = acadia.compile(sequence)
-
         # Attach to the hardware
         acadia.attach()
-
         # Configure channel analog parameters
         self.auto_config_ncos(acadia, **channel_configs)
-
-        # Set the amplitude of the boxcar integration kernel
-        kernel.set(kernel_wf)
-
         # Assemble and load the program
         acadia.assemble()
         acadia.load()
 
+        # Set the amplitude of the boxcar integration kernel
+        kernel.set(kernel_wf)
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
 
@@ -115,7 +106,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"spec"].write(ro_demod.array)
+                self.data[f"spec"].write(ro_pts.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -135,8 +126,10 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
-            self.line_re = DynamicLine(self.ax, ".-")
-            self.line_im = DynamicLine(self.ax, ".-")
+            self.line_re = DynamicLine(self.ax, ".-", label="I")
+            self.line_im = DynamicLine(self.ax, ".-", label="I")
+            self.ax.set_xlabel("q drive frequency")
+            self.ax.grid()
 
         from tqdm.notebook import tqdm
         self.progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
@@ -144,7 +137,6 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
     def update(self):
         import numpy as np
-        import matplotlib.pyplot as plt
 
         n_freqs = len(self.qubit_frequencies)
 
@@ -157,22 +149,19 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations
 
-        valid_traces = completed_iterations * n_freqs
-        data = self.data["spec"].records()[:valid_traces, ...].squeeze()
-
-        # Get the collection of data and reshape it so that the axes index as: 
-        # (iteration, frequency, sample quadrature)
-        data_reshaped = data.reshape(completed_iterations, n_freqs, 2)
-        data_sum = np.sum(data_reshaped, axis=0)
-
         if self.plot:
-            # self.hist.update(data)
-            self.line_re.update(self.qubit_frequencies, data_sum[:, 0])
-            self.line_im.update(self.qubit_frequencies, data_sum[:, 1])
-            self.ax.relim()
-            self.ax.autoscale(tight=True)
+            valid_traces = completed_iterations * n_freqs
+            data = self.data["spec"].records()[:valid_traces, ...].squeeze()
+
+            # Get the collection of data and reshape it so that the axes index as: 
+            # (iteration, frequency, sample quadrature)
+            data_reshaped = data.reshape(completed_iterations, n_freqs, 2)
+            data_summed = np.sum(data_reshaped, axis=0)
+
+            self.line_re.update(self.qubit_frequencies, data_summed[:, 0])
+            self.line_im.update(self.qubit_frequencies, data_summed[:, 1])
             self.fig.tight_layout()
-            self.fig.canvas.draw_idle()
+            # self.fig.canvas.draw_idle()
 
         # Save the data
         self.data.save(self.local_directory)
@@ -182,35 +171,79 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         self.progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
+        self.post_process()
+
+    def post_process(self) -> float:
+        """ Fit the spectroscopy to a Lorentzian function to extract the qubit on-resonance frequency.
+
+        """
+        #todo: this is getting really bloated...
+        from linc_rfsoc.analysis import population_in_quadrant
+        from linc_rfsoc.analysis.fitting import rotate_iq
+        from linc_rfsoc.analysis.fitting.lorentzian import Lorentzian
+        from linc_rfsoc.measurements import CONFIG_FILE_PATH
+        from linc_rfsoc.helpers.plot_utils import add_button
+        from linc_rfsoc.helpers.yaml_editor import update_yaml
+
+        freqs, spec_pts = self.parse_data(self.data)
+        try:
+            e_quadrant = self.ro_capture.get("state_quadrants", None)[1]
+            data_to_fit = population_in_quadrant(spec_pts, e_quadrant, axis=0)
+            data_type = "e population"
+        except TypeError:
+            spec_pts = np.mean(spec_pts, axis=0)
+            data_to_fit = rotate_iq(spec_pts).real
+            data_type = "rotated I component"
+
+        fit = Lorentzian(freqs, data_to_fit)
+        f0 = fit.ufloat_results["x0"]
+        fit_fig, fit_ax = fit.plot()
+        fit_ax.set_xlabel("q drive frequency")
+        fit_ax.set_ylabel(data_type)
+
+        def _update_q_freq(event):
+            new_param_dict = {"q_stimulus.nco_config.nco_frequency": np.round(f0.n)}
+            update_yaml(CONFIG_FILE_PATH, new_param_dict, verbose=True)
+
+        # add a button for updating the qubit freq in the yaml file
+        self._update_button = add_button(fit_fig, _update_q_freq, label="Update Qubit Freq")
+
+        return f0
+
+
+    @staticmethod
+    def parse_data(data_manager: DataManager) -> NDArray[complex]:
+        """Parse the acquired data in data_manager to a ready-to-process format
+
+        :param data_manager: data manager object for data acquired using this runtime
+        """
+        dm = data_manager
+        freqs = dm["freqs"].records()[0].astype(float).squeeze()
+        spec_pts = dm["spec"].records().astype(float).view(complex).squeeze()
+        spec_pts = np.reshape(spec_pts, (-1, len(freqs)))
+        return freqs, spec_pts
+
+
 
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
     from linc_rfsoc.measurements import load_config
-    from linc_rfsoc.analysis.generate_readout_kernel import ReadoutKernelGenerator, load_kernel
 
     from IPython.core.getipython import get_ipython
-
     get_ipython().run_line_magic("matplotlib", "widget")
 
     config_dict = load_config()
 
     plot = True
-    iterations = 500
+    iterations = 50
     qubit_freqs = np.linspace(-20e6, 20e6, 101) + 8.23e9
 
     rt = QubitSpecRuntime(**config_dict, qubit_frequencies=qubit_freqs, plot=plot, iterations=iterations)
     rt.deploy("10.66.3.198", "qubit_spec", files=[rt.FILE, config_helper_file])
     rt.display()
 
-    # some ad hoc processing
+    # some ad-hoc processing
     # rt._event_loop.join()
     # rt.fig
-
-    # data = rt.data["traces"].records().astype(float).view(complex).squeeze()
-    # data = data.reshape(-1, len(qubit_freqs))
-    # data_avg = np.mean(data, axis=0)
-    # fig, axs = plt.subplots(2, 1, figsize=(6,6))
-    # axs[0].plot(qubit_freqs, data_avg.real, ".-")
-    # axs[1].plot(qubit_freqs, data_avg.imag, ".-")

@@ -101,13 +101,17 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
     def set_by_path(root, items, value, keep_format):
         """Set a value in a nested object in root by item sequence."""
         if keep_format:
-            data_type = type(get_by_path(root, items))
-            new_data = data_type(value)
+            try:
+                data_type = type(get_by_path(root, items)).__base__
+                new_data = data_type(value)
+            except Exception as e:
+                new_data = value
         else:
             new_data = value
         get_by_path(root, items[:-1])[items[-1]] = new_data
 
     config, ind, bsi = yaml.util.load_yaml_guess_indent(open(yaml_path))
+
     for s, val in new_param_dict.items():
         set_by_path(config, s.split("."), to_yaml_friendly(val), keep_format)
 
@@ -120,3 +124,9 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
 
     if verbose:
         print(f"YAML file {yaml_path} updated with {new_param_dict}")
+
+
+if __name__ == "__main__":
+    temp_yaml = "../measurements/temp_config.yaml"
+    new_param_dict = {"q_stimulus.nco_config.nco_frequency": f"{3e9:6e}"}
+    update_yaml(temp_yaml, new_param_dict, keep_format=True)

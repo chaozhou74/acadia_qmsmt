@@ -41,7 +41,6 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         acadia = Acadia()
         channel_objs = self.obtain_channels(acadia, **channel_configs)
 
-        
         # Allocate the waveform memories that we'll need
         q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
         ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")

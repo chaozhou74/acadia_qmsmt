@@ -34,20 +34,23 @@ class KernelGeneratorBase:
         self.e_circle = e_circle
         self.norm_factor = norm_factor
         self.decimation_used = decimation_used
-        self.generate_kernel_trace()
-        self.generate_kernel_for_upload()
+        self.generate_kernel_trace(g_circle, e_circle)
+        self.generate_kernel_for_upload(norm_factor, decimation_used)
         self.generate_cmacc_offset()
         if plot:
             self.plot_kernel_generation()
 
-    def generate_kernel_trace(self):
-        # calculate the kernel trace based on the selected data traces
-        self.g_mask = mask_state_with_circle(self.all_pts, self.g_circle)
-        self.e_mask = mask_state_with_circle(self.all_pts, self.e_circle)
-        self.g_pts_masked = self.all_pts[self.g_mask]
-        self.e_pts_masked = self.all_pts[self.e_mask]
+    def generate_kernel_trace(self, g_circle: StateCircleType, e_circle: StateCircleType):
+        """calculate the kernel trace based on the selected data traces
+
+        :param g_circle: (I_center + 1j * Q_center, circle_radius)
+        :param e_circle: (I_center + 1j * Q_center, circle_radius)
+        """
+        self.g_mask = mask_state_with_circle(self.all_pts, g_circle)
+        self.e_mask = mask_state_with_circle(self.all_pts, e_circle)
         self.g_trace_avg = np.mean(self.all_traces[self.g_mask], axis=0)
         self.e_trace_avg = np.mean(self.all_traces[self.e_mask], axis=0)
+
         self.kernel_trace = np.conjugate(self.g_trace_avg - self.e_trace_avg)
         kernel_norm = self.kernel_trace / np.max(abs(self.kernel_trace)) * self.norm_factor # normalize to 1
         self.kernel_trace_norm = kernel_norm
@@ -57,14 +60,14 @@ class KernelGeneratorBase:
 
         return self.kernel_trace
 
-    def generate_kernel_for_upload(self):
+    def generate_kernel_for_upload(self, norm_factor: float = 1, decimation_used: int = None):
         """
         Calculate the kernel array for uploading to cmacc based on the decimation used to get the `traces` data
 
         :return:
         """
 
-        deci = self.decimation_used
+        deci = self.decimation_used if decimation_used is None else decimation_used
         scale = deci // 4
         kernel = self.kernel_trace
 
@@ -90,7 +93,7 @@ class KernelGeneratorBase:
         else:
             raise ValueError("Invalid trace decimation, must be 1 or a positive multiple of 4 ")
 
-        self.kernel_upload = kernel_array / np.max(abs(kernel_array)) * self.norm_factor # normalize to 1
+        self.kernel_upload = kernel_array / np.max(abs(kernel_array)) * norm_factor
 
         return self.kernel_upload
 

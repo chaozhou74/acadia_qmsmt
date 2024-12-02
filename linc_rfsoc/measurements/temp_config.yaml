@@ -3,7 +3,7 @@ q_stimulus:
   nco_config:
     vop: 20000
     mix_reconstruction: true
-    nco_frequency: 8.23e9
+    nco_frequency: 8230009507.0
   waveforms:
     q_rotation:
       length: 40.0e-9
@@ -45,5 +45,6 @@ ro_capture:
       decimation: 0
       region: plddr
   capture_delay: 300e-9
-  kernel_wf: ../dev_codes/test_kernel.npy
-  cmacc_offset: 1200
+  kernel_wf: /tmp/241201_151740/ro_capture.kernel_wf_241201_151805.npy
+  cmacc_offset: 1312
+  # state_quadrants: [1, 2]

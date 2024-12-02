@@ -38,7 +38,7 @@ def quadrant_signs(quadrant:Union[int, NDArray[int]]) -> NDArray[int]:
 
 
 def population_in_quadrant(iq_pts: ComplexDataPointsType, quadrant: Literal[1,2,3,4] = None,
-                           i_threshold: int = 0, q_threshold: int = 0):
+                           i_threshold: int = 0, q_threshold: int = 0, axis:int=0):
     """
     Calculate the population of IQ data points (`iq_pts`) that fall into a specific quadrant
     of the IQ plane.
@@ -47,11 +47,14 @@ def population_in_quadrant(iq_pts: ComplexDataPointsType, quadrant: Literal[1,2,
     :param quadrant: The specific quadrant to calculate the population for.
     :param i_threshold: I value for the vertical line separating left and right quadrants.
     :param q_threshold: Q value for the horizontal line separating left and right quadrants.
+    :param axis: The iteration axis of the data. 
+        e.g. For a spectroscopy data in shape (iterations, n_freqs), axis should be 0, and the
+        return will be in shape (n_freqs)
     :return:
     """
 
     pts_shifted = iq_pts - i_threshold - 1j * q_threshold
-    pct = np.sum(find_quadrant(pts_shifted) == quadrant) / len(iq_pts)
+    pct = np.mean(find_quadrant(pts_shifted) == quadrant, axis=axis)
 
     return pct
 
