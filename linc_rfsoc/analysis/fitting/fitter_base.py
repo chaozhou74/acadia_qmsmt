@@ -1,6 +1,7 @@
 from typing import Tuple, Any, Optional, Union, Dict, List
 
 import numpy as np
+import matplotlib.pyplot as plt
 import lmfit
 from lmfit import Parameter
 from uncertainties import ufloat
@@ -76,5 +77,15 @@ class FitterBase():
 
         return lmfit_result
 
-    def plot(self):
-        pass
+    def plot(self, ax=None):
+        if ax is None:
+            fig, ax = plt.subplots(1,1)
+        else:
+            fig = None
+        ax.plot(self.coordinates, self.data, ".", label="data")
+        fine_coords = np.linspace(self.coordinates[0], self.coordinates[-1], len(self.coordinates)*10)
+        ax.plot(fine_coords, self.result.eval(coordinates=fine_coords), label="fit")
+        ax.grid()
+        fig.tight_layout()
+        ax.legend()
+        return fig, ax

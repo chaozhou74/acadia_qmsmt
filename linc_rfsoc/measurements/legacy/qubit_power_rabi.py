@@ -1,0 +1,276 @@
+from dataclasses import dataclass
+from acadia.runtime import Runtime
+from acadia.system import Waveform
+
+
+@dataclass
+class QubitPwrRabiRuntime(Runtime):
+    """
+    A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
+    it on an ADC.
+    """
+
+    qubit_amp_scales: list 
+    qubit_stimulus: dict
+    readout_stimulus: dict
+    readout_capture: dict
+
+    iterations: int
+    plot: bool = True
+    figsize: tuple[int] = None
+    
+    FILE = __file__
+        
+    def main(self):     
+        from acadia import Acadia, DataManager
+        import numpy as np
+        import logging
+        
+        logger = logging.getLogger("acadia")
+
+        # Create an acadia object and grab a couple of its channels
+        acadia = Acadia()
+        qubit_channel = acadia.channel(self.qubit_stimulus["channel"])
+        readout_stimulus_channel = acadia.channel(self.readout_stimulus["channel"])
+        readout_capture_channel = acadia.channel(self.readout_capture["channel"])
+
+
+        # Create the waveforms that we'll need 
+        qubit_stimulus_waveform = acadia.create_waveform(qubit_channel, **self.qubit_stimulus["waveform"])
+        readout_stimulus_waveform = acadia.create_waveform(readout_stimulus_channel, **self.readout_stimulus["waveform"])
+        readout_capture_waveform = acadia.create_waveform(readout_capture_channel, **self.readout_capture["waveform"]) 
+        
+        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-9, blank=True) 
+        #todo: add wait length to input
+
+        # assemble channel objects
+        channels_ = [qubit_channel, readout_stimulus_channel, readout_capture_channel]
+        channel_configs = [self.qubit_stimulus, self.readout_stimulus, self.readout_capture]
+        channel_wfs = [qubit_stimulus_waveform, readout_stimulus_waveform, readout_capture_waveform]
+        
+        # Create a record group for saving captured data
+        self.data.add_group(f"traces", uniform=True)
+        
+        # todo: this could be simplified
+        kernel_wf = self.readout_capture["kernel_wf"]
+        if type(kernel_wf) == float: # constant value kernel
+            kernel_wf = np.float64(kernel_wf)
+            kernel_cmacc = None
+        elif type(kernel_wf) == np.ndarray:
+            kernel_cmacc = kernel_wf
+
+
+        # Create a sequence for the sequencer to generate the pulse and capture it
+        def sequence(a: Acadia):
+            capture_stream, kernel = acadia.configure_cmacc(readout_capture_channel, kernel=kernel_cmacc, reset_fifo=True)
+
+            acadia.cmacc_load(capture_stream, 0)
+
+            with a.channel_synchronizer():
+                a.schedule_waveform(qubit_stimulus_waveform)
+                a.barrier()
+                a.schedule_waveform(blank_wf)
+                a.barrier()
+                a.schedule_waveform(readout_stimulus_waveform)
+                a.stream(capture_stream, readout_capture_waveform)
+                # a.schedule_waveform(blank_wf)
+                # a.barrier()
+
+            return kernel
+
+        # Compile the sequence
+        kernel = acadia.compile(sequence)
+                
+        # Attach to the hardware
+        acadia.attach()
+
+
+        # Configure channel analog parameters
+        # todo: this should be written as a generic function that automatically resets all channels used
+        acadia.align_tile_latencies() # todo: might not be necessary
+        for ch, config, wf in zip(channels_, channel_configs, channel_wfs):
+            if "signal" in config: # is DAC channel
+                wf.set(**config["signal"])
+            ch.set(nco_update_event_source="sysref", **config["datapath"])
+            acadia.reset_nco_phase(ch)
+            acadia.update_nco_phase(ch, 0)
+        acadia.update_ncos_synchronized()
+
+
+        # Set the amplitude of the boxcar integration kernel
+        kernel.set(kernel_wf)
+
+        # Assemble and load the program
+        acadia.assemble()
+        acadia.load()
+
+        amp0 = self.qubit_stimulus["signal"]["scale"]
+        for i in range(self.iterations):
+            for amp_idx, amp_scale in enumerate(self.qubit_amp_scales):
+                # set the pulse amp
+                self.qubit_stimulus["signal"]["scale"] = amp0 * amp_scale
+                qubit_stimulus_waveform.set(**self.qubit_stimulus["signal"])
+
+                # capture data and put in the corresponding group
+                acadia.run()
+                self.data[f"traces"].write(readout_capture_waveform.array)
+            
+            if self.data.serve() == DataManager.serve_hangup():
+                self.data.disconnect()
+                return
+        
+        self.final_serve()
+
+    def initialize(self):
+        # Set the matplotlib backend to one which we can actually update
+        self.figsize = (4, 3) if self.figsize is None else self.figsize
+
+        if self.plot:
+            from acadia.processing import DynamicLine
+            import matplotlib.pyplot as plt
+
+            self.fig, self.ax = plt.subplots(1, 1, figsize=self.figsize)
+            self.fig.tight_layout()
+            self.fig.subplots_adjust(left=0.25, bottom=0.25)
+
+            self.line_re = DynamicLine(self.ax, ".-")
+            self.line_im = DynamicLine(self.ax, ".-")
+
+        from tqdm.notebook import tqdm
+        self.progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
+        self.previous_completed_iterations = 0
+
+    def update(self):
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        n_amps = len(self.qubit_amp_scales)
+
+        # First make sure that we actually have new data to process
+        if f"traces" not in self.data or len(self.data[f"traces"]) < n_amps:
+            return
+
+        # Update the progress bar based on the number of iterations
+        completed_iterations = len(self.data["traces"]) // n_amps
+        self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
+        self.previous_completed_iterations = completed_iterations        
+
+
+        if self.plot:
+            valid_traces = completed_iterations*n_amps
+            data = self.data["traces"].records()[:valid_traces, ...].squeeze()
+
+            # Get the collection of data and reshape it so that the axes index as: 
+            # (iteration, frequency, sample quadrature)
+            data_reshaped = data.reshape(completed_iterations, n_amps, 2)
+            data_sum = np.sum(data_reshaped, axis=0)
+            # self.hist.update(data)
+            self.line_re.update(self.qubit_amp_scales, data_sum[:,0])
+            self.line_im.update(self.qubit_amp_scales, data_sum[:,1])
+            self.ax.relim()
+            self.ax.autoscale(tight=True)
+            self.fig.tight_layout()
+            self.fig.canvas.draw_idle()
+
+
+
+    def finalize(self):
+        super().finalize()
+        # Save the data
+        self.data.save(self.local_directory)
+        self.progress_bar.close()
+        if self.plot:
+            self.savefig(self.fig)  
+
+
+    
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from IPython.core.getipython import get_ipython
+    get_ipython().run_line_magic("matplotlib", "widget")
+
+    qubit_stimulus: dict = {
+        "channel": "DAC0",
+
+        "datapath": {
+            "vop": 20000,
+            "mix_reconstruction": True,
+            "nco_frequency": 8.23e9
+        },
+
+        "waveform": {
+            "length": 40e-9, 
+            "fixed_length": 200e-9
+        },
+        
+        "signal": {
+            "data": ("scipy", "hann"),
+            "scale": 0.282
+        }
+    }
+
+    readout_stimulus: dict = {
+        "channel": "DAC2",
+
+        "datapath": {
+            "vop":25000,
+            "mix_reconstruction": True,
+            "nco_frequency": 9.03002e9
+            # "nco_frequency": 8.23e9
+        },
+
+        "waveform": {
+            "length":200e-9, 
+            "fixed_length": 2e-6
+        },
+        
+        "signal": {
+            "data": ("scipy", "hann"),
+            "scale": 0.6
+        }
+    }
+
+    readout_capture: dict = {
+        "channel": "ADC0",
+
+        "datapath": {
+            "nco_frequency": -9.03002e9
+        },
+
+        "waveform": {
+            "length": 2000*1.25e-9,
+            "decimation": 0,
+            "region": "plddr"
+        },
+
+        "kernel_wf": 0.1
+    }
+
+    plot = True
+    iterations = 500
+    qubit_amp_scales = np.linspace(-1.5, 1.5, 61) # not the scale in "signal", is multiply factor on that
+
+
+    rt = QubitPwrRabiRuntime(qubit_amp_scales, qubit_stimulus, readout_stimulus, readout_capture, plot=plot, iterations=iterations)
+    rt.deploy("10.66.3.198", "qubit_power_rabi", files=[rt.FILE])    
+    rt.display()
+
+    # some ad hoc processing
+    # rt._event_loop.join()
+    # rt.fig
+
+    # data = rt.data["traces"].records().astype(float).view(complex).squeeze()
+    # data = data.reshape(-1, len(qubit_amp_scales))
+    # data_avg = np.mean(data, axis=0)
+    # data_pts = np.mean(data, axis=1)
+    # fig, axs = plt.subplots(2, 1, figsize=(6,6))
+    # axs[0].plot(qubit_amp_scales, data_avg.real, ".-")
+    # axs[1].plot(qubit_amp_scales, data_avg.imag, ".-")
+
+    # fig, ax = plt.subplots(1,1)
+    # ax.hist2d(data_pts.real, data_pts.imag, cmap="hot", bins=51)
+    # ax.set_aspect(1)
+    
+    

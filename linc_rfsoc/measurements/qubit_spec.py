@@ -62,7 +62,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
-        self.data.add_group(f"spec", uniform=True)
+        self.data.add_group(f"iq_pts", uniform=True)
         self.data.add_group(f"freqs", uniform=False)
         self.data[f"freqs"].write(self.qubit_frequencies)
 
@@ -97,6 +97,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         kernel.set(kernel_wf)
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
+        q_rotation.set(**self.q_stimulus["signals"]["pi_pulse"])
 
         for i in range(self.iterations):
             for freq_idx, freq in enumerate(self.qubit_frequencies):
@@ -106,7 +107,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"spec"].write(ro_pts.array)
+                self.data[f"iq_pts"].write(ro_pts.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -141,17 +142,17 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         n_freqs = len(self.qubit_frequencies)
 
         # First make sure that we actually have new data to process
-        if "spec" not in self.data or len(self.data["spec"]) < n_freqs:
+        if "iq_pts" not in self.data or len(self.data["iq_pts"]) < n_freqs:
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["spec"]) // n_freqs
+        completed_iterations = len(self.data["iq_pts"]) // n_freqs
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations
 
         if self.plot:
             valid_traces = completed_iterations * n_freqs
-            data = self.data["spec"].records()[:valid_traces, ...].squeeze()
+            data = self.data["iq_pts"].records()[:valid_traces, ...].squeeze()
 
             # Get the collection of data and reshape it so that the axes index as: 
             # (iteration, frequency, sample quadrature)
@@ -185,14 +186,14 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         from linc_rfsoc.helpers.plot_utils import add_button
         from linc_rfsoc.helpers.yaml_editor import update_yaml
 
-        freqs, spec_pts = self.parse_data(self.data)
+        freqs, iq_pts = self.parse_data(self.data)
         try:
             e_quadrant = self.ro_capture.get("state_quadrants", None)[1]
-            data_to_fit = population_in_quadrant(spec_pts, e_quadrant, axis=0)
+            data_to_fit = population_in_quadrant(iq_pts, e_quadrant, axis=0)
             data_type = "e population"
         except TypeError:
-            spec_pts = np.mean(spec_pts, axis=0)
-            data_to_fit = rotate_iq(spec_pts).real
+            iq_pts = np.mean(iq_pts, axis=0)
+            data_to_fit = rotate_iq(iq_pts).real
             data_type = "rotated I component"
 
         fit = Lorentzian(freqs, data_to_fit)
@@ -219,9 +220,9 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         """
         dm = data_manager
         freqs = dm["freqs"].records()[0].astype(float).squeeze()
-        spec_pts = dm["spec"].records().astype(float).view(complex).squeeze()
-        spec_pts = np.reshape(spec_pts, (-1, len(freqs)))
-        return freqs, spec_pts
+        iq_pts = dm["iq_pts"].records().astype(float).view(complex).squeeze()
+        iq_pts = np.reshape(iq_pts, (-1, len(freqs)))
+        return freqs, iq_pts
 
 
 
