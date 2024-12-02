@@ -242,7 +242,7 @@ if __name__ == "__main__":
     config_dict = load_config()
 
     plot = True
-    iterations = 50
+    iterations = 200
     qubit_amp_scales = np.linspace(-1.5, 1.5, 61) # not the scale in "signal", is multiply factor on that
 
 

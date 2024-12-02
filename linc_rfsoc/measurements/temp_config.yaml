@@ -3,7 +3,7 @@ q_stimulus:
   nco_config:
     vop: 20000
     mix_reconstruction: true
-    nco_frequency: 8229966255.0
+    nco_frequency: 8229954037.0
   waveforms:
     q_rotation:
       length: 40.0e-9
@@ -11,7 +11,7 @@ q_stimulus:
   signals:
     pi_pulse:
       data: [scipy, hann]
-      scale: 0.2732
+      scale: 0.27
     pi_2_pulse:
       data: [scipy, hann]
       scale: 0.141
@@ -45,6 +45,6 @@ ro_capture:
       decimation: 0
       region: plddr
   capture_delay: 300e-9
-  kernel_wf: /tmp/241201_151740/ro_capture.kernel_wf_241201_151805.npy
-  cmacc_offset: 1312
+  kernel_wf: /tmp/241202_140226/ro_capture.kernel_wf_241202_140845.npy
+  cmacc_offset: 1100
   state_quadrants: [1, 2]

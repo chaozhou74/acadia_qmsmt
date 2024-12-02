@@ -21,6 +21,7 @@ def add_button(fig: Figure, event: Callable, label: str = "Update", size: Tuple[
     # Initialize button metadata if not already present
     button_w, button_h = size
     if not hasattr(fig, "_button_positions"):
+        fig.tight_layout()
         if button_h is None:
             button_h = 0.1 * 1 / len(axes)
         fig._button_positions = {"row_widths": [[]], "row_heights": [button_h], "n_plots": len(axes)}

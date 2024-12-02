@@ -50,14 +50,14 @@ def to_array(input:Union[Number, list, str]):
     :param input: Any number, list, or string representing a file path to a .npy file.
     :return: A numpy array representation of the input.
     """
-    if isinstance(input, Number):  # Check if input is a number
+    if isinstance(input, Number):
         return np.array([input])
 
-    elif isinstance(input, list):  # Check if input is a list
+    elif isinstance(input, list): 
         return np.array(input)
 
-    elif isinstance(input, str):  # Check if input is a string
-        if input.endswith('.npy'):  # Ensure it's a path to a .npy file
+    elif isinstance(input, str): 
+        if input.endswith('.npy'): # Ensure it's a path to a .npy file
             return np.load(input)
         else:
             raise ValueError(f"Unsupported file type: {input}")
