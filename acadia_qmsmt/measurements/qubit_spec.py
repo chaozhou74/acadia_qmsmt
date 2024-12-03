@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from typing import Union, Tuple, Literal
+from typing import Union
 import numpy as np
 from numpy.typing import NDArray
 from acadia.runtime import Runtime
 from acadia import DataManager
 
 from auto_config import AutoConfigMixin
-from auto_config import FILE as config_helper_file
 
 @dataclass
 class QubitSpecRuntime(AutoConfigMixin, Runtime):
@@ -24,11 +23,11 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
     plot: bool = True
     figsize: tuple[int] = None
 
-    FILE = __file__
+    def __post_init__(self):
+        self.FILES = [__file__, super().FILE]
 
     def main(self):
         from acadia import Acadia, DataManager
-        import numpy as np
         import logging
 
         logger = logging.getLogger("acadia")
@@ -178,7 +177,6 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         """ Fit the spectroscopy to a Lorentzian function to extract the qubit on-resonance frequency.
 
         """
-        #todo: this is getting really bloated...
         from acadia_qmsmt.analysis import population_in_quadrant
         from acadia_qmsmt.analysis.fitting import rotate_iq
         from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
@@ -242,7 +240,7 @@ if __name__ == "__main__":
     qubit_freqs = np.linspace(-20e6, 20e6, 101) + 8.23e9
 
     rt = QubitSpecRuntime(**config_dict, qubit_frequencies=qubit_freqs, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "qubit_spec", files=[rt.FILE, config_helper_file])
+    rt.deploy("10.66.3.198", "qubit_spec", files=rt.FILES)
     rt.display()
 
     # some ad-hoc processing

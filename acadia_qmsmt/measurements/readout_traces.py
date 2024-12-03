@@ -3,7 +3,7 @@ from acadia.runtime import Runtime
 from acadia import DataManager
 
 from auto_config import AutoConfigMixin
-from auto_config import FILE as config_helper_file
+# from auto_config import FILE as config_helper_file
 
 @dataclass
 class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
@@ -21,7 +21,8 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
     figsize: tuple[int] = None
     generate_kernel: bool = False
 
-    FILE = __file__
+    def __post_init__(self):
+        self.FILES = [__file__, super().FILE]
 
     def main(self):
         from acadia import Acadia, DataManager
@@ -243,7 +244,7 @@ if __name__ == "__main__":
 
 
     rt = ReadoutTracesRuntime(**config_dict, plot=plot, iterations=iterations, generate_kernel=True)
-    rt.deploy("10.66.3.198", "readout_traces", files=[rt.FILE, config_helper_file], event_loop_period=0.5)
+    rt.deploy("10.66.3.198", "readout_traces", files=rt.FILES, event_loop_period=0.5)
     rt.display()
 
     # # some ad hoc processing

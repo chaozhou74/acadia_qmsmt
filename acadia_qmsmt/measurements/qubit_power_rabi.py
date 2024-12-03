@@ -1,12 +1,11 @@
 from dataclasses import dataclass
-from typing import Union, Tuple, Literal
+from typing import Union
 import numpy as np
 from numpy.typing import NDArray
 from acadia.runtime import Runtime
 from acadia import DataManager
 
 from auto_config import AutoConfigMixin
-from auto_config import FILE as config_helper_file
 
 @dataclass
 class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
@@ -24,11 +23,11 @@ class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
     plot: bool = True
     figsize: tuple[int] = None
 
-    FILE = __file__
+    def __post_init__(self):
+        self.FILES = [__file__, super().FILE]
 
     def main(self):
         from acadia import Acadia, DataManager
-        import numpy as np
         import logging
 
         logger = logging.getLogger("acadia")
@@ -247,7 +246,7 @@ if __name__ == "__main__":
 
 
     rt = QubitPwrRabiRuntime(**config_dict, qubit_amp_scales=qubit_amp_scales, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "qubit_power_rabi", files=[rt.FILE, config_helper_file])    
+    rt.deploy("10.66.3.198", "qubit_power_rabi", files=rt.FILES)    
     rt.display()
 
     # some ad-hoc processing

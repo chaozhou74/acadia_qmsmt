@@ -6,7 +6,6 @@ from acadia.runtime import Runtime
 from acadia import DataManager
 
 from auto_config import AutoConfigMixin
-from auto_config import FILE as config_helper_file
 
 @dataclass
 class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
@@ -23,11 +22,11 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
     plot: bool = True
     figsize: tuple[int] = None
 
-    FILE = __file__
+    def __post_init__(self):
+        self.FILES = [__file__, super().FILE]
 
     def main(self):
         from acadia import Acadia, DataManager
-        import numpy as np
         import logging
 
         logger = logging.getLogger("acadia")
@@ -131,7 +130,6 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         self.previous_completed_iterations = 0
 
     def update(self):
-        import numpy as np
 
         # First make sure that we actually have new data to process
         if "pts_e" not in self.data or len(self.data["pts_e"]) < 2 :
@@ -220,7 +218,7 @@ if __name__ == "__main__":
     iterations = 5000
 
     rt = ReadoutPtsRuntime(**config_dict, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "readout_pts", files=[rt.FILE, config_helper_file])
+    rt.deploy("10.66.3.198", "readout_pts", files=rt.FILES)
     rt.display()
 
     # some ad hoc processing

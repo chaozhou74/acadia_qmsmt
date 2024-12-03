@@ -45,6 +45,6 @@ ro_capture:
       decimation: 0
       region: plddr
   capture_delay: 300e-9
-  kernel_wf: /tmp/241202_140226/ro_capture.kernel_wf_241202_140845.npy
-  cmacc_offset: 1100
+  kernel_wf: /tmp/241203_133452/ro_capture.kernel_wf_241203_133624.npy
+  cmacc_offset: 1230
   state_quadrants: [1, 2]

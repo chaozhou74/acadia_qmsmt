@@ -5,10 +5,10 @@ from acadia import Acadia
 from acadia.waveforms import ChannelWaveform
 from acadia.rfdc import Channel
 
-FILE = __file__
 
 
-# todo: integrate this to acadia so we don't need to send this to the board everytime.
+
+# todo: integrate this to acadia so we don't need to send this to the board every time.
 #  but this also means things here need to be more generic (other than being specific to a project)
 
 
@@ -16,7 +16,8 @@ class AutoConfigMixin:
     """
     takes the overall config dict and automatically applies some configurations
     """
-
+    FILE = __file__
+    
     def obtain_channels(self, acadia: Acadia, **configs) -> Dict[str, Channel]:
         """
         Obtain all acadia channels used in the configs dict and put them in a collection.
