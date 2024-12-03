@@ -3,7 +3,6 @@ import operator
 from functools import reduce
 import ruamel.yaml as yaml
 import numpy as np
-from attr.setters import convert
 
 from acadia_qmsmt.helpers.yaml_routine import PARAMETER_HANDLERS
 
@@ -88,7 +87,7 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
    :param verbose: When True, print details of the update
 
     :Example:
-        >>> old_config = {"config":{"relax_delay" : 100}} #to update relax_delay to 20, we do:
+        >>> old_config = {"config":{"relax_delay" : 100}} #to update relax_delay to 20, use:
         >>> update_yaml(yaml_path, {"config.relax_delay": 20})
 
     :return:

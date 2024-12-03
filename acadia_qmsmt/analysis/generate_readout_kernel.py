@@ -335,11 +335,11 @@ if __name__ == "__main__":
     kgen = KernelFromGETraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
     from acadia_qmsmt.helpers.plot_utils import add_button
 
-    save_kernel = lambda _: kgen.save_kernel(r"../dev_codes//")
+    save_kernel = lambda _: kgen.save_kernel(r"../_develop//")
     button = add_button(kgen.fig, save_kernel, "save kernel")
 
 
-    # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
+    # kernel=load_kernel(r"../_develop//"+"readoutkernel_241105_113318.npy")
     #
     # pts = rk.e_pts_raw
     # # center, radius = find_most_significant_blob(pts, sigma_factor=3)

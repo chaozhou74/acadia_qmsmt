@@ -254,6 +254,6 @@ if __name__ == "__main__":
     # from acadia_qmsmt.analysis.generate_readout_kernel import KernelFromPreparedTraces
     # kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,
     #                                        decimation_used=rt.ro_capture["waveforms"]["ro_demod"]["decimation"])
-    # kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", r"../dev_codes", "test_kernel")
+    # kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", r"../_develop", "test_kernel")
 
 

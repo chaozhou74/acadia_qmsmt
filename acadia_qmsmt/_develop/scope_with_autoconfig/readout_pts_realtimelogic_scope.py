@@ -213,7 +213,7 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from acadia_qmsmt.dev_codes.scope_with_autoconfig import load_config
+    from acadia_qmsmt._develop.scope_with_autoconfig import load_config
 
     from IPython.core.getipython import get_ipython
 

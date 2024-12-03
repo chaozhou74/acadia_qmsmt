@@ -230,10 +230,10 @@ if __name__ == "__main__":
 
 
     # rk = ReadoutKernelGenerator(all_data, (-13 + 5j, 2), (13 - 5j, 2))
-    # print(rk.save_kernel(r"../dev_codes//", "test_kernel"))
+    # print(rk.save_kernel(r"../_develop//", "test_kernel"))
 
     # rk.plot_kernel()
-    # kernel=load_kernel(r"../dev_codes//"+"readoutkernel_241105_113318.npy")
+    # kernel=load_kernel(r"../_develop//"+"readoutkernel_241105_113318.npy")
     
 
     
