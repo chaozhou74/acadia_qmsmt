@@ -1,9 +1,9 @@
 from distutils.core import setup
 
 setup(
-      name='linc_rfsoc',
+      name='acadia_qmsmt',
       version='0.0.1',
-      packages=['linc_rfsoc'],
+      packages=['acadia_qmsmt'],
       
       extras_require={
         "host": [
