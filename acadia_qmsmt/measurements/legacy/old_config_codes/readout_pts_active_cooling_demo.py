@@ -56,7 +56,7 @@ class ActiveCoolingRuntime(AutoConfigMixin, Runtime):
         if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
             blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
         elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
+            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_pts")(capture_delay)
 
         # get the kernel and IQ offsets fom the config dict
         kernel_wf = self.ro_capture.get("kernel_wf", [0.1])

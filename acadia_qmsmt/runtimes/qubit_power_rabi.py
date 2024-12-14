@@ -1,30 +1,40 @@
 from dataclasses import dataclass
-from typing import Union
+from typing import Literal, Union
 import numpy as np
-from numpy.typing import NDArray
 from acadia.runtime import Runtime
 from acadia import DataManager
 
-from auto_config import AutoConfigMixin
+try: # on target, import from the local module that got sent over
+    from qmsmt_runtime import SingleQubitRuntime
+except ModuleNotFoundError: # on host, import from the installed module
+    from acadia_qmsmt.runtimes.qmsmt_runtime import SingleQubitRuntime
+
 
 @dataclass
-class QubitSpecRuntime(AutoConfigMixin, Runtime):
+class QubitPwrRabiRuntime(SingleQubitRuntime, Runtime):
     """
-    A :class:`Runtime` subclass for qubit spectroscopy
+    A :class:`Runtime` subclass for qubit powerRabi
     """
+
+    yaml_path: str
 
     q_stimulus: dict
     ro_stimulus: dict
     ro_capture: dict
 
-    qubit_frequencies: Union[list, np.ndarray]
+    qubit_amp_scales: Union[list, np.ndarray]
 
     iterations: int
     plot: bool = True
     figsize: tuple[int] = None
 
     def __post_init__(self):
-        self.FILES = [__file__, super().FILE]
+        config_dict = {"q_stimulus": self.q_stimulus,
+                       "ro_stimulus": self.ro_stimulus,
+                       "ro_capture": self.ro_capture
+                       }
+        super().__init__(**config_dict)
+        self._gather_files()
 
     def main(self):
         from acadia import Acadia, DataManager
@@ -32,29 +42,23 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
         logger = logging.getLogger("acadia")
 
-        channel_configs = {"q_stimulus": self.q_stimulus,
-                           "ro_stimulus": self.ro_stimulus,
-                           "ro_capture": self.ro_capture
-                           }
-
         # Create an acadia object and grab a couple of its channels
-        acadia = Acadia()
-        channel_objs = self.obtain_channels(acadia, **channel_configs)
+        acadia = self.init_system()
 
         # Allocate the waveform memories that we'll need
-        q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
-        ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
-        ro_pts = self.allocate_waveform_mem(acadia, "ro_capture", "ro_pts")
+        q_rotation = self.allocate_waveform_mem("q_stimulus", "q_rotation")
+        ro_drive = self.allocate_waveform_mem("ro_stimulus", "ro_drive")
+        ro_pts = self.allocate_waveform_mem("ro_capture", "ro_pts")
 
         # Create a blank waveform between qubit drive and readout drive
-        q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
+        q_blank_wf = self.blank_waveform_generator("q_stimulus")(40e-9)
 
         # Create blank waveform for delay between capture and stimulus
         capture_delay = self.ro_capture["capture_delay"]
         if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
-            blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
+            blank_wf = self.blank_waveform_generator("ro_stimulus")(-capture_delay)
         elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
+            blank_wf = self.blank_waveform_generator("ro_capture", "ro_pts")(capture_delay)
 
         # get the kernel and IQ offsets fom the config dict
         kernel_wf = self.ro_capture.get("kernel_wf", [0.1])
@@ -62,12 +66,12 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
 
         # Create the record groups for saving captured data
         self.data.add_group(f"iq_pts", uniform=True)
-        self.data.add_group(f"freqs", uniform=False)
-        self.data[f"freqs"].write(self.qubit_frequencies)
+        self.data.add_group(f"amp_scales", uniform=False)
+        self.data[f"amp_scales"].write(self.qubit_amp_scales)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf)
+            capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_wf)
 
             a.cmacc_load(capture_stream, cmacc_offset)
 
@@ -87,7 +91,7 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         # Attach to the hardware
         acadia.attach()
         # Configure channel analog parameters
-        self.auto_config_ncos(acadia, **channel_configs)
+        self.configure_ncos()
         # Assemble and load the program
         acadia.assemble()
         acadia.load()
@@ -96,13 +100,14 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         kernel.set(kernel_wf)
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
-        q_rotation.set(**self.q_stimulus["signals"]["pi_pulse"])
 
+        pi_signal = self.q_stimulus["signals"]["pi_pulse"]
+        amp0 = pi_signal["scale"]
         for i in range(self.iterations):
-            for freq_idx, freq in enumerate(self.qubit_frequencies):
-                # set the qubit nco freq
-                acadia.update_nco_frequency(self.channel_objs["q_stimulus"], freq)
-                acadia.update_ncos_synchronized()
+            for amp_idx, amp_scale in enumerate(self.qubit_amp_scales):
+                # set the pulse amp
+                pi_signal["scale"] = amp0 * amp_scale
+                q_rotation.set(**pi_signal)
 
                 # capture data and put in the corresponding group
                 acadia.run()
@@ -126,9 +131,9 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
-            self.line_re = DynamicLine(self.ax, ".-", label="I")
-            self.line_im = DynamicLine(self.ax, ".-", label="I")
-            self.ax.set_xlabel("q drive frequency")
+            self.line_re = DynamicLine(self.ax, ".-")
+            self.line_im = DynamicLine(self.ax, ".-")
+            self.ax.set_xlabel("q drive relative scale")
             self.ax.grid()
 
         from tqdm.notebook import tqdm
@@ -138,28 +143,28 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
     def update(self):
         import numpy as np
 
-        n_freqs = len(self.qubit_frequencies)
+        n_amps = len(self.qubit_amp_scales)
 
         # First make sure that we actually have new data to process
-        if "iq_pts" not in self.data or len(self.data["iq_pts"]) < n_freqs:
+        if f"iq_pts" not in self.data or len(self.data[f"iq_pts"]) < n_amps:
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["iq_pts"]) // n_freqs
+        completed_iterations = len(self.data["iq_pts"]) // n_amps
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations
 
         if self.plot:
-            valid_traces = completed_iterations * n_freqs
+            valid_traces = completed_iterations * n_amps
             data = self.data["iq_pts"].records()[:valid_traces, ...].squeeze()
 
             # Get the collection of data and reshape it so that the axes index as: 
-            # (iteration, frequency, sample quadrature)
-            data_reshaped = data.reshape(completed_iterations, n_freqs, 2)
+            # (iteration, amps, sample quadrature)
+            data_reshaped = data.reshape(completed_iterations, n_amps, 2)
             data_summed = np.sum(data_reshaped, axis=0)
 
-            self.line_re.update(self.qubit_frequencies, data_summed[:, 0])
-            self.line_im.update(self.qubit_frequencies, data_summed[:, 1])
+            self.line_re.update(self.qubit_amp_scales, data_summed[:,0])
+            self.line_im.update(self.qubit_amp_scales, data_summed[:,1])
             self.fig.tight_layout()
             # self.fig.canvas.draw_idle()
 
@@ -174,18 +179,19 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
         self.post_process()
 
     def post_process(self) -> float:
-        """ Fit the spectroscopy to a Lorentzian function to extract the qubit on-resonance frequency.
+        """ Fit the Rabi result to a sinusoidal to extract the qubit pi-pulse amplitude.
 
         """
+        #todo: this is getting really bloated...
         from acadia_qmsmt.analysis import population_in_quadrant
         from acadia_qmsmt.analysis.fitting import rotate_iq
-        from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
-        from acadia_qmsmt.measurements import CONFIG_FILE_PATH
+        from acadia_qmsmt.analysis.fitting.cosine import Cosine
+
         from acadia_qmsmt.helpers.plot_utils import add_button
         from acadia_qmsmt.helpers.yaml_editor import update_yaml
 
-        freqs, iq_pts = self.parse_data(self.data)
-        try:
+        amps, iq_pts = self.parse_data(self.data)
+        try:# todo: pack this to a function
             e_quadrant = self.ro_capture.get("state_quadrants", None)[1]
             data_to_fit = population_in_quadrant(iq_pts, e_quadrant, axis=0)
             data_type = "e population"
@@ -194,33 +200,36 @@ class QubitSpecRuntime(AutoConfigMixin, Runtime):
             data_to_fit = rotate_iq(iq_pts).real
             data_type = "rotated I component"
 
-        fit = Lorentzian(freqs, data_to_fit)
-        f0 = fit.ufloat_results["x0"]
+        fit = Cosine(amps, data_to_fit)
+        scale2 = abs(1/fit.ufloat_results["f"]/2)
         fit_fig, fit_ax = fit.plot()
-        fit_ax.set_xlabel("q drive frequency")
+        fit_ax.set_xlabel("q drive amplitude factor")
         fit_ax.set_ylabel(data_type)
 
         def _update_q_freq(event):
-            new_param_dict = {"q_stimulus.nco_config.nco_frequency": np.round(f0.n)}
-            update_yaml(CONFIG_FILE_PATH, new_param_dict, verbose=True)
+            #todo: currently the amp is loaded as a complex number, but this is a good example
+            # that shows using amp and phase might be more convenient
+            amp0 = abs(self.q_stimulus["signals"]["pi_pulse"]["scale"]) 
+            new_param_dict = {"q_stimulus.signals.pi_pulse.scale": np.round(amp0*scale2.n, 4)}
+            update_yaml(self.yaml_path, new_param_dict, verbose=True)
 
         # add a button for updating the qubit freq in the yaml file
-        self._update_button = add_button(fit_fig, _update_q_freq, label="Update Qubit Freq")
+        self._update_button = add_button(fit_fig, _update_q_freq, label="Update Qubit Amp")
 
-        return f0
+        return scale2
 
 
     @staticmethod
-    def parse_data(data_manager: DataManager) -> NDArray[complex]:
+    def parse_data(data_manager: DataManager):
         """Parse the acquired data in data_manager to a ready-to-process format
 
         :param data_manager: data manager object for data acquired using this runtime
         """
         dm = data_manager
-        freqs = dm["freqs"].records()[0].astype(float).squeeze()
+        amps = dm["amp_scales"].records()[0].astype(float).squeeze()
         iq_pts = dm["iq_pts"].records().astype(float).view(complex).squeeze()
-        iq_pts = np.reshape(iq_pts, (-1, len(freqs)))
-        return freqs, iq_pts
+        iq_pts = np.reshape(iq_pts, (-1, len(amps)))
+        return amps, iq_pts
 
 
 
@@ -236,11 +245,12 @@ if __name__ == "__main__":
     config_dict = load_config()
 
     plot = True
-    iterations = 50
-    qubit_freqs = np.linspace(-20e6, 20e6, 101) + 8.23e9
+    iterations = 200
+    qubit_amp_scales = np.linspace(-1.5, 1.5, 61) # not the scale in "signal", is multiply factor on that
 
-    rt = QubitSpecRuntime(**config_dict, qubit_frequencies=qubit_freqs, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "qubit_spec", files=rt.FILES)
+
+    rt = QubitPwrRabiRuntime(**config_dict, qubit_amp_scales=qubit_amp_scales, plot=plot, iterations=iterations)
+    rt.deploy("10.66.3.198", "qubit_power_rabi", files=rt.FILES)    
     rt.display()
 
     # some ad-hoc processing

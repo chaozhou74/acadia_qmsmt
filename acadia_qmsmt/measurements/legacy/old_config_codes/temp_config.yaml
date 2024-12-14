@@ -45,6 +45,6 @@ ro_capture:
       decimation: 0
       region: plddr
   capture_delay: 300e-9
-  kernel_wf: -0.1
-  cmacc_offset: 500
+  kernel_wf: 0.1
+  cmacc_offset: 798
   state_quadrants: [4, 3]

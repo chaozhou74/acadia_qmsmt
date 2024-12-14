@@ -90,7 +90,7 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
         >>> old_config = {"config":{"relax_delay" : 100}} #to update relax_delay to 20, use:
         >>> update_yaml(yaml_path, {"config.relax_delay": 20})
 
-    :return:
+    :return: yaml dict with updated parameters, plain text version, no handler is applied.
     """
 
     def get_by_path(root, items):
@@ -123,6 +123,8 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
 
     if verbose:
         print(f"YAML file {yaml_path} updated with {new_param_dict}")
+    
+    return config
 
 
 if __name__ == "__main__":

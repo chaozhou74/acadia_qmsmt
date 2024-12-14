@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Union
+from typing import Tuple, Literal
 import numpy as np
 from numpy.typing import NDArray
 from acadia.runtime import Runtime
@@ -8,16 +8,15 @@ from acadia import DataManager
 from auto_config import AutoConfigMixin
 
 @dataclass
-class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
+class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
     """
-    A :class:`Runtime` subclass for qubit powerRabi
+    A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
+    it on an ADC.
     """
 
     q_stimulus: dict
     ro_stimulus: dict
     ro_capture: dict
-
-    qubit_amp_scales: Union[list, np.ndarray]
 
     iterations: int
     plot: bool = True
@@ -54,22 +53,21 @@ class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
         if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
             blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
         elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
+            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_pts")(capture_delay)
 
         # get the kernel and IQ offsets fom the config dict
         kernel_wf = self.ro_capture.get("kernel_wf", [0.1])
         cmacc_offset = self.ro_capture.get("cmacc_offset", 0)
 
         # Create the record groups for saving captured data
-        self.data.add_group(f"iq_pts", uniform=True)
-        self.data.add_group(f"amp_scales", uniform=False)
-        self.data[f"amp_scales"].write(self.qubit_amp_scales)
+        self.data.add_group(f"pts_g", uniform=True)
+        self.data.add_group(f"pts_e", uniform=True)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
             capture_stream, kernel = a.configure_cmacc(channel_objs["ro_capture"], kernel=kernel_wf)
 
-            a.cmacc_load(capture_stream, cmacc_offset)
+            a.cmacc_load(capture_stream, cmacc_offset) # fixme: currently this only accepts positive integers, should take complex number instead
 
             with a.channel_synchronizer():
                 a.schedule_waveform(q_rotation)
@@ -97,17 +95,18 @@ class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
 
+        # average iterations for preparing qubit in g and e
         pi_signal = self.q_stimulus["signals"]["pi_pulse"]
-        amp0 = pi_signal["scale"]
+        pi_amp = pi_signal["scale"]
         for i in range(self.iterations):
-            for amp_idx, amp_scale in enumerate(self.qubit_amp_scales):
-                # set the pulse amp
-                pi_signal["scale"] = amp0 * amp_scale
-                q_rotation.set(**pi_signal)
+            for state_ in ["g", "e"]:
+                # set the pulse amplitude
+                pi_signal["scale"] = 0 if state_ == "g" else pi_amp
+                q_rotation.set(**pi_signal) # takes around 1ms
 
                 # capture data and put in the corresponding group
                 acadia.run()
-                self.data[f"iq_pts"].write(ro_pts.array)
+                self.data[f"pts_{state_}"].write(ro_pts.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -117,52 +116,40 @@ class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
 
     def initialize(self):
         # Set the matplotlib backend to one which we can actually update
-        self.figsize = (4, 3) if self.figsize is None else self.figsize
+        self.figsize = (3, 5) if self.figsize is None else self.figsize
 
         if self.plot:
-            from acadia.processing import DynamicLine
+            # from acadia.processing import DynamicReadoutHistogram
+            # todo: need to learn how this works... Currently doing a simple hist2d
+            
             import matplotlib.pyplot as plt
-
-            self.fig, self.ax = plt.subplots(1, 1, figsize=self.figsize)
-            self.fig.tight_layout()
-            self.fig.subplots_adjust(left=0.25, bottom=0.25)
-
-            self.line_re = DynamicLine(self.ax, ".-")
-            self.line_im = DynamicLine(self.ax, ".-")
-            self.ax.set_xlabel("q drive relative scale")
-            self.ax.grid()
+            self.fig, self.axs = plt.subplots(2, 1, figsize=self.figsize)
 
         from tqdm.notebook import tqdm
         self.progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.previous_completed_iterations = 0
 
     def update(self):
-        import numpy as np
-
-        n_amps = len(self.qubit_amp_scales)
 
         # First make sure that we actually have new data to process
-        if f"iq_pts" not in self.data or len(self.data[f"iq_pts"]) < n_amps:
+        if "pts_e" not in self.data or len(self.data["pts_e"]) < 2 :
             return
 
-        # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["iq_pts"]) // n_amps
+        # Update the progress bar based on the number of iterations that have been completed
+        completed_iterations = len(self.data["pts_e"])
         self.progress_bar.update(completed_iterations - self.previous_completed_iterations)
         self.previous_completed_iterations = completed_iterations
 
         if self.plot:
-            valid_traces = completed_iterations * n_amps
-            data = self.data["iq_pts"].records()[:valid_traces, ...].squeeze()
-
-            # Get the collection of data and reshape it so that the axes index as: 
-            # (iteration, amps, sample quadrature)
-            data_reshaped = data.reshape(completed_iterations, n_amps, 2)
-            data_summed = np.sum(data_reshaped, axis=0)
-
-            self.line_re.update(self.qubit_amp_scales, data_summed[:,0])
-            self.line_im.update(self.qubit_amp_scales, data_summed[:,1])
+            data = [self.data[f"pts_{s_}"].records().squeeze() for s_ in ["g", "e"]]
+            for i in range(2):
+                self.axs[i].clear()
+                self.axs[i].hist2d(data[i][:, 0], data[i][:, 1], bins=51, cmap="hot")
+                self.axs[i].relim()
+                self.axs[i].autoscale(tight=True)
+                self.axs[i].set_aspect(1)
             self.fig.tight_layout()
-            # self.fig.canvas.draw_idle()
+            self.fig.canvas.draw_idle()
 
         # Save the data
         self.data.save(self.local_directory)
@@ -174,81 +161,72 @@ class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
             self.savefig(self.fig)
         self.post_process()
 
-    def post_process(self) -> float:
-        """ Fit the Rabi result to a sinusoidal to extract the qubit pi-pulse amplitude.
+    def post_process(self, i_threshold: int = 0, q_threshold: int = 0,
+                     e_quadrant: Literal[1,2,3,4] = None):
+        """ Calculate the e percentage for the prepared states
 
+        :param i_threshold: I position of the state separation line. 
+            Default to 0 assuming cmacc offset has been applied properly
+        :param q_threshold: Q position of the state separation line. 
+            Default to 0 assuming cmacc offset has been applied properly
+        :param e_quadrant: Quadrant of the e state. Default to
+            the quadrant saved in the yaml file.
         """
-        #todo: this is getting really bloated...
         from acadia_qmsmt.analysis import population_in_quadrant
-        from acadia_qmsmt.analysis.fitting import rotate_iq
-        from acadia_qmsmt.analysis.fitting.cosine import Cosine
-        from acadia_qmsmt.measurements import CONFIG_FILE_PATH
-        from acadia_qmsmt.helpers.plot_utils import add_button
-        from acadia_qmsmt.helpers.yaml_editor import update_yaml
+        g_pts, e_pts = self.parse_data(self.data)
 
-        amps, iq_pts = self.parse_data(self.data)
-        try:
-            e_quadrant = self.ro_capture.get("state_quadrants", None)[1]
-            data_to_fit = population_in_quadrant(iq_pts, e_quadrant, axis=0)
-            data_type = "e population"
-        except TypeError:
-            iq_pts = np.mean(iq_pts, axis=0)
-            data_to_fit = rotate_iq(iq_pts).real
-            data_type = "rotated I component"
+        if e_quadrant is None:
+            e_quadrant = self.ro_capture.get("state_quadrants", [None, None])[1]
+            if e_quadrant is None:
+                print("e-state quadrant not provided.")
+                return [None, None]
 
-        fit = Cosine(amps, data_to_fit)
-        scale2 = abs(1/fit.ufloat_results["f"]/2)
-        fit_fig, fit_ax = fit.plot()
-        fit_ax.set_xlabel("q drive amplitude factor")
-        fit_ax.set_ylabel(data_type)
+        e_pcts = []
+        for state, pts in zip(("g", "e"), (g_pts, e_pts)):
+            pct = population_in_quadrant(pts, e_quadrant, i_threshold, q_threshold)
+            e_pcts.append(pct)
+            print(f"e population, prepare {state}:", pct)
 
-        def _update_q_freq(event):
-            #todo: currently the amp is loaded as a complex number, but this is a good example
-            # that shows using amp and phase might be more convenient
-            amp0 = abs(self.q_stimulus["signals"]["pi_pulse"]["scale"]) 
-            new_param_dict = {"q_stimulus.signals.pi_pulse.scale": np.round(amp0*scale2.n, 4)}
-            update_yaml(CONFIG_FILE_PATH, new_param_dict, verbose=True)
-
-        # add a button for updating the qubit freq in the yaml file
-        self._update_button = add_button(fit_fig, _update_q_freq, label="Update Qubit Amp")
-
-        return scale2
+        return e_pcts
 
 
     @staticmethod
-    def parse_data(data_manager: DataManager) -> NDArray[complex]:
-        """Parse the acquired data in data_manager to a ready-to-process format
+    def parse_data(data_manager: DataManager) -> Tuple[NDArray[np.complex128]]:
+        """Parse the acquired data in data_manager to an easy-to-process format
 
         :param data_manager: data manager object for data acquired using this runtime
         """
         dm = data_manager
-        amps = dm["amp_scales"].records()[0].astype(float).squeeze()
-        iq_pts = dm["iq_pts"].records().astype(float).view(complex).squeeze()
-        iq_pts = np.reshape(iq_pts, (-1, len(amps)))
-        return amps, iq_pts
-
-
+        g_pts = dm["pts_g"].records().astype(float).view(complex).squeeze()
+        e_pts = dm["pts_e"].records().astype(float).view(complex).squeeze()
+        return g_pts, e_pts
 
 
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from acadia_qmsmt.measurements import load_config
 
+    # import matplotlib
+    # matplotlib.use("module://ipympl")
+    import matplotlib.pyplot as plt
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
 
+    import numpy as np
+    from acadia_qmsmt.measurements import load_config
     config_dict = load_config()
 
     plot = True
-    iterations = 200
-    qubit_amp_scales = np.linspace(-1.5, 1.5, 61) # not the scale in "signal", is multiply factor on that
+    iterations = 5000
 
-
-    rt = QubitPwrRabiRuntime(**config_dict, qubit_amp_scales=qubit_amp_scales, plot=plot, iterations=iterations)
-    rt.deploy("10.66.3.198", "qubit_power_rabi", files=rt.FILES)    
+    rt = ReadoutPtsRuntime(**config_dict, plot=plot, iterations=iterations)
+    rt.deploy("10.66.3.198", "readout_pts", files=rt.FILES)
     rt.display()
 
-    # some ad-hoc processing
+    # some ad hoc processing
     # rt._event_loop.join()
     # rt.fig
+
+    # fig, ax = plt.subplots(1, 1)
+    # for i, s_ in enumerate(["g", "e"]):
+    #     data = rt.data[f"pts_{s_}"].records().squeeze()
+    #     ax.plot(data[:, 0], data[:, 1], ".", ms=0.5)
+    #     ax.set_aspect(1)

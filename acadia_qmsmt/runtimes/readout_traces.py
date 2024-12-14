@@ -1,16 +1,28 @@
 from dataclasses import dataclass
+import numpy as np
 from acadia.runtime import Runtime
 from acadia import DataManager
 
-from auto_config import AutoConfigMixin
-# from auto_config import FILE as config_helper_file
+try: # on target, import from the local module that got sent over
+    from qmsmt_runtime import SingleQubitRuntime 
+except ModuleNotFoundError: # on host, import from the installed module
+    from acadia_qmsmt.runtimes.qmsmt_runtime import SingleQubitRuntime
+
+# todo: this works now but is there a better way to do this??
+
 
 @dataclass
-class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
+class ReadoutTracesRuntime(SingleQubitRuntime, Runtime):
     """
-    A :class:`Runtime` subclass for sending a signal out of a DAC and capturing
-    it on an ADC.
+    Capture readout traces with qubit prepared in g and e.
+
+    g state preparation is done by just relaxing.
+    e state preparation is done using the pi_pulse parameters in q_stimulus["waveforms"]["q_rotation"] and
+    q_stimulus["signals"]["pi_pulse"]
+
+    postprocess is able to generate readout kernel even when the state preparation is imperfect.
     """
+    yaml_path: str
 
     q_stimulus: dict
     ro_stimulus: dict
@@ -22,48 +34,46 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
     generate_kernel: bool = False
 
     def __post_init__(self):
-        self.FILES = [__file__, super().FILE]
+        config_dict = {"q_stimulus": self.q_stimulus,
+                       "ro_stimulus": self.ro_stimulus,
+                       "ro_capture": self.ro_capture
+                       }
+        super().__init__(**config_dict)
+        self._gather_files()
 
     def main(self):
         from acadia import Acadia, DataManager
         import numpy as np
         import logging
         
-        logger = logging.getLogger("acadia")
-
-        channel_configs = {"q_stimulus": self.q_stimulus,
-                           "ro_stimulus": self.ro_stimulus,
-                           "ro_capture": self.ro_capture
-                           }
+        self.logger = logging.getLogger("acadia")
 
         # Create an acadia object and grab a couple of its channels
-        acadia = Acadia()
-        self.obtain_channels(acadia, **channel_configs)
+        acadia = self.init_system()
 
-        # todo: is there a way to further simplify these block of codes?
         # Allocate the waveform memories that we'll need
-        q_rotation = self.allocate_waveform_mem(acadia, "q_stimulus", "q_rotation")
-        ro_drive = self.allocate_waveform_mem(acadia, "ro_stimulus", "ro_drive")
-        ro_demod = self.allocate_waveform_mem(acadia, "ro_capture", "ro_demod")
+        q_rotation = self.allocate_waveform_mem("q_stimulus", "q_rotation")
+        ro_drive = self.allocate_waveform_mem("ro_stimulus", "ro_drive")
+        ro_demod = self.allocate_waveform_mem("ro_capture", "ro_demod")
         
         # Create a blank waveform between qubit drive and readout drive
-        q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)
+        q_blank_wf = self.blank_waveform_generator("q_stimulus")(40e-9)
 
         # Create blank waveform for delay between capture and stimulus
         capture_delay = self.ro_capture["capture_delay"]
         if capture_delay < 0: # stimulus will be delayed by -capture_delay compare to capture
-            blank_wf = self.blank_waveform_generator(acadia, "ro_stimulus")(-capture_delay)
+            blank_wf = self.blank_waveform_generator("ro_stimulus")(-capture_delay)
         elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = self.blank_waveform_generator(acadia, "ro_capture", "ro_demod")(capture_delay)
+            blank_wf = self.blank_waveform_generator("ro_capture", "ro_demod")(capture_delay)
         
         # Create the record groups for saving captured data
         self.data.add_group("traces_g", uniform=True)
         self.data.add_group("traces_e", uniform=True)
         self.data.add_group("t_data", uniform=False)
 
-        # Create a sequence for the sequencer to generate the pulse and capture it
+        # Core FPGA (PL) sequence
         def sequence(a: Acadia):
-            capture_stream = acadia.configure_dsp(self.channel_objs["ro_capture"], 
+            capture_stream = a.configure_dsp(self.channel_objs["ro_capture"],
                                                   self.ro_capture["waveforms"]["ro_demod"]["decimation"])
         
             with a.channel_synchronizer():
@@ -80,17 +90,17 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         acadia.compile(sequence)
         # Attach to the hardware
         acadia.attach()
-        # Configure channel analog parameters
-        self.auto_config_ncos(acadia, **channel_configs)
         # Assemble and load the program
         acadia.assemble()
         acadia.load()
+        # Configure channel analog parameters
+        self.configure_ncos()
 
 
         # set waveform for ro drive
         ro_drive.set(**self.ro_stimulus["signals"]["readout"])
 
-        # average iterations for preparing qubit in g and e
+        # Core python loop that will be running on the ARM (PS)
         pi_signal = self.q_stimulus["signals"]["pi_pulse"]
         pi_amp = pi_signal["scale"]
         for i in range(self.iterations):
@@ -107,6 +117,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                 self.data.disconnect()
                 return
         
+        # calculate t_list based on capture time and length of capture waveform
         capture_time = self.ro_capture["waveforms"]["ro_demod"]["length"] 
         t_data = np.linspace(0, capture_time, len(ro_demod.array), endpoint=False)
         self.data["t_data"].write(t_data)
@@ -193,9 +204,9 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
         :param i_threshold: I position of the state separation line. Default to center of the g and e blobs.
         :param q_threshold: Q position of the state separation line. Default to 3-sigma away from the center of the g blob.
         """
-        from acadia_qmsmt.measurements import CONFIG_FILE_PATH
         from acadia_qmsmt.analysis.generate_readout_kernel import KernelFromGETraces
         from acadia_qmsmt.helpers.plot_utils import add_button
+
         # gather the traces
         t_data, g_traces, e_traces = self.parse_data(self.data)
 
@@ -204,10 +215,10 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
                                         i_threshold, q_threshold, **kwargs, plot=True,
                                         decimation_used=self.ro_capture["waveforms"]["ro_demod"]["decimation"])
 
-        # make a function for updating the kernel path and cmacc offset in yaml
+        # make a nullary function for updating the kernel path and cmacc offset in yaml
         def _update_kernel_and_offset(event):
-            kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", self.local_directory)
-            kernel_gen.update_cmacc_offset(CONFIG_FILE_PATH, "ro_capture.cmacc_offset", "ro_capture.state_quadrants")
+            kernel_gen.update_kernel(self.yaml_path, "ro_capture.kernel_wf", self.local_directory)
+            kernel_gen.update_cmacc_offset(self.yaml_path, "ro_capture.cmacc_offset", "ro_capture.state_quadrants")
 
         # add a kernel update button to the plot and maintain a reference to it for keeping it alive
         self._update_button = add_button(kernel_gen.fig, _update_kernel_and_offset, label="Update Kernel and offset")
@@ -215,7 +226,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
 
     @staticmethod
     def parse_data(data_manager: DataManager):
-        """Parse the acquired data in data_manager to an easy-to-process format
+        """Parse the acquired data in data_manager to a ready-to-process format
 
         :param data_manager: data manager object for data acquired using this runtime
         """
@@ -232,7 +243,7 @@ class ReadoutTracesRuntime(AutoConfigMixin, Runtime):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
-    from acadia_qmsmt.measurements import load_config, CONFIG_FILE_PATH
+    from acadia_qmsmt.measurements import load_config
 
     from IPython.core.getipython import get_ipython
     get_ipython().run_line_magic("matplotlib", "widget")
@@ -240,10 +251,9 @@ if __name__ == "__main__":
     config_dict = load_config()
 
     plot = True
-    iterations = 5000
+    iterations = 500
 
-
-    rt = ReadoutTracesRuntime(**config_dict, plot=plot, iterations=iterations, generate_kernel=True)
+    rt = ReadoutTracesRuntime(**config_dict, iterations=iterations, plot=plot, generate_kernel=True)
     rt.deploy("10.66.3.198", "readout_traces", files=rt.FILES, event_loop_period=0.5)
     rt.display()
 
@@ -255,6 +265,7 @@ if __name__ == "__main__":
     # from acadia_qmsmt.analysis.generate_readout_kernel import KernelFromPreparedTraces
     # kernel_gen = KernelFromPreparedTraces(g_traces, e_traces, norm_factor=1, plot=True,
     #                                        decimation_used=rt.ro_capture["waveforms"]["ro_demod"]["decimation"])
-    # kernel_gen.update_kernel(CONFIG_FILE_PATH, "ro_capture.kernel_wf", r"../_develop", "test_kernel")
+    # kernel_gen.update_kernel(rt.yaml_path, "ro_capture.kernel_wf", r"../_develop", "test_kernel")
+
 
 
