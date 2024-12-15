@@ -4,7 +4,7 @@ from acadia.runtime import Runtime
 from acadia import DataManager
 
 try: # on target, import from the local module that got sent over
-    from qmsmt_runtime import SingleQubitRuntime 
+    from qmsmt_runtime import SingleQubitRuntime
 except ModuleNotFoundError: # on host, import from the installed module
     from acadia_qmsmt.runtimes.qmsmt_runtime import SingleQubitRuntime
 

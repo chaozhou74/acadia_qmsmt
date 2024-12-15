@@ -1,7 +1,7 @@
 import sys
 from typing import Callable, Literal, Dict, List
 
-from acadia.waveforms import ChannelWaveform
+from acadia.waveforms import ChannelWaveform, Waveform
 from acadia import Acadia
 
 class QMsmtRuntimeBase():
@@ -166,7 +166,68 @@ class QMsmtRuntimeBase():
 
 class SingleQubitRuntime(QMsmtRuntimeBase):
     def __init__(self, **config_dict: dict):
+        """
+        Runtime class that contains experiment specific functions, including sub_sequence functions
+        """
         super().__init__(**config_dict)
 
-    # todo: more experiment specific functions can be added here. 
-    #   e.g. sub_sequence functions
+    def subsqeuence_cool_qubit(self, acadia:Acadia, capture_cfg:dict, capture_dst:Waveform,
+                               ro_drive_wf:ChannelWaveform, capture_blank_wf:ChannelWaveform,
+                               q_pi_pulse_wf:ChannelWaveform, q_blank_wf:ChannelWaveform):
+        """
+        A sub-sequence that cools the qubit to its ground state using measurement and conditional flips.
+
+        :param acadia: Acadia instance where the sequence belongs to
+        :param capture_cfg: configuration dict for the  ADC capture channel
+        :param capture_dst: destination memory for the captured measurement data
+        :param ro_drive_wf: readout drive waveform for the measurement pulse
+        :param capture_blank_wf: blank waveform for the delay between ro drive and capture
+        :param q_pi_pulse_wf: qubit pi_pulse waveform for flipping the qubit when measured in e
+        :param q_blank_wf: qubit blank waveform between qubit flip and measurement
+        :return:
+        """
+
+        capture_delay = capture_cfg.get("capture_delay", 0)
+        cmacc_offset = capture_cfg.get("cmacc_offset", 0)
+        kernel_wf = capture_cfg.get("kernel_wf", [0.1])
+        g_quadrant = capture_cfg["state_quadrants"][0]
+
+        a = acadia
+
+        ## Step 1: Do a first msmt
+        capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_wf,
+                                                   reset_fifo=True, accumulator_done=False)
+
+        a.cmacc_load(capture_stream, cmacc_offset)
+
+        with a.channel_synchronizer():
+            if capture_delay != 0:
+                a.schedule_waveform(capture_blank_wf)
+            a.schedule_waveform(ro_drive_wf)
+            a.stream(capture_stream, capture_dst)
+
+        # put the first msmt result in a register
+        reg = a.sequencer().Register()
+        reg.load(a.cmacc_get_quadrant(capture_stream))
+
+        ## Step 2: Measure + conditional flip, until we get the ground state
+        # todo: try getting the number of msmts in this loop using a counter register
+        with a.sequencer().repeat_until(reg == getattr(a, f"CMACC_QUADRANT_{g_quadrant}")):
+            capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel,
+                                                       reset_fifo=True, accumulator_done=False)
+
+            a.cmacc_load(capture_stream, cmacc_offset)  # todo: extra bias can be added here.
+
+            with a.channel_synchronizer():
+                a.schedule_waveform(q_pi_pulse_wf)
+                a.schedule_waveform(q_blank_wf)
+                a.barrier()
+                if capture_delay != 0:
+                    a.schedule_waveform(capture_blank_wf)
+                a.schedule_waveform(ro_drive_wf)
+                # this will keep overwriting the re_pts1 waveform
+                # the final value will always be in the g state quadrant since that's the condition for exiting the loop
+                a.stream(capture_stream, capture_dst)
+
+            # `cmacc_get_quadrant` will wait until cmacc is done
+            reg.load(a.cmacc_get_quadrant(capture_stream))
