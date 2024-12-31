@@ -1,6 +1,6 @@
 q_stimulus:
   channel: DAC0
-  nco_config:
+  channel_config:
     vop: 20000
     mix_reconstruction: true
     nco_frequency: 8229954037.0
@@ -18,7 +18,7 @@ q_stimulus:
 
 ro_stimulus:
   channel: DAC2
-  nco_config:
+  channel_config:
     vop: 25000
     mix_reconstruction: true
     nco_frequency: 9.030e9
@@ -33,18 +33,20 @@ ro_stimulus:
 
 ro_capture:
   channel: ADC0
-  nco_config:
+  channel_config:
     nco_frequency: -9.030e9
   waveforms:
-    ro_demod:
+    readout_trace:
       length: 2.4e-6
       decimation: 4
       region: plddr
-    ro_pts:
+    readout_accumulated:
       length: 2.4e-6
       decimation: 0
       region: plddr
   capture_delay: 300e-9
-  kernel_wf: -0.1
-  cmacc_offset: 500
+  kernels: 
+    boxcar: 
+      data: -0.1
+      offset: 500 + 3j
   state_quadrants: [4, 3]
