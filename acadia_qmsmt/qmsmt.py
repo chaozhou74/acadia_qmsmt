@@ -429,7 +429,7 @@ class MeasurableResonator:
         """
 
         self._stimulus.set_nco_frequency(frequency)
-        self._capture.set_nco_frequency(-frequency)
+        self._capture.set_nco_frequency(frequency)
         self._stimulus.reset_nco_phase()
         self._capture.reset_nco_phase()
         if sync:
