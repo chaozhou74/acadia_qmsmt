@@ -7,7 +7,7 @@ from scipy.optimize import curve_fit
 from acadia import Acadia, DataManager, Runtime, Waveform
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig
 
-class ResonatorSpecRuntime(QMsmtRuntime):
+class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for readout spectroscopy
     """
@@ -261,6 +261,6 @@ class ResonatorSpecRuntime(QMsmtRuntime):
 
 if __name__ == "__main__":
     freqs = np.linspace(-20e6, 20e6, 101) + 8.23e9
-    rt = ResonatorSpecRuntime(stimulus="stimulus", capture="capture", frequencies=freqs, plot=True, iterations=50)
+    rt = ResonatorSpectroscopyRuntime(stimulus="stimulus", capture="capture", frequencies=freqs, plot=True, iterations=50)
     rt.deploy("10.66.3.198")
     rt.display()

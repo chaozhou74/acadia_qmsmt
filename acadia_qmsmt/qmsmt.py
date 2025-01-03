@@ -3,7 +3,7 @@ import shutil
 import os
 from typing import Callable, Literal, Dict, List, Any
 
-from acadia import Acadia, Runtime, ChannelWaveform, Waveform
+from acadia import Acadia, Channel, Runtime, ChannelWaveform, Waveform, Operation
 
 __all__ = ["InputOutput", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
 
@@ -16,23 +16,25 @@ class InputOutput:
     """
 
     def __init__(self, acadia: Acadia, config: Dict[str,Any]):
-        self._config = config
-        self._acadia = acadia
-        self._channel = acadia.channel(config["channel"])
+        self._config: Dict[str,Any] = config
+        self._acadia: Acadia = acadia
+        self._channel: Channel = acadia.channel(config["channel"])
         self._allocated_waveforms: Dict[str,ChannelWaveform] = {}
 
 
     def get_waveform(self, waveform_name: str = None) -> ChannelWaveform:
         """
-        A shortcut function for allocating waveform memory for a specified channel and waveform
-        using pre-defined configurations.
+        A shortcut function for allocating waveform memory for a specified 
+        channel and waveform using pre-defined configurations.
 
-        Serves as a shortcut for creating waveform objects based on the parameters defined in
-        config["waveforms"][`waveform_name`].
+        Serves as a shortcut for creating waveform objects based on the 
+        parameters defined in config["waveforms"][`waveform_name`].
 
-        If no name is provided, the first waveform in the list of available waveforms is used.
+        If no name is provided, the first waveform in the list of available
+        waveforms is used.
 
-        :param waveform_name: Name of the waveform defined under the "waveforms" sub-dictionary for the given channel
+        :param waveform_name: Name of the waveform defined under the 
+            "waveforms" sub-dictionary for the given channel
         :return: Allocated Waveform object
         """
         if waveform_name is None:
@@ -106,7 +108,7 @@ class InputOutput:
                 self._allocated_waveforms[waveform_name].set(set_value)
 
     @property
-    def channel(self):
+    def channel(self) -> Channel:
         return self._channel
 
     def __getattr__(self, name: str):
@@ -159,7 +161,7 @@ class QMsmtRuntime(Runtime):
 
         # Store the names and config dicts for all the 
         # members identified as channel configurations
-        self._ios = {}
+        self._ios: Dict[str,InputOutput] = {}
         for name,type_hint in self._get_fields().items():
             if type_hint is IOConfig:
                 value = getattr(self, name)
@@ -291,9 +293,6 @@ class MeasurableResonator:
         self._capture = capture
         self._stream = None
         self._kernels = {}
-        # Store a list of used 
-        self._capture_waveforms = []
-        self._stimulus_waveforms = []
 
     def prepare_cmacc(self, 
                 kernel_name: str = None,
@@ -401,13 +400,23 @@ class MeasurableResonator:
                 stimulus_waveform_name: str = None, 
                 capture_waveform_name: str = None):
         """
-        Schedules the measurement in the channel synchronizer. Note that 
-        prepare_cmacc must have been called before this.
+        Schedules the measurement. This function should be called inside of a 
+        channel synchronizer, and prepare_cmacc must have been called before 
+        this. 
         """
         self._capture_waveform = self._capture.get_waveform(capture_waveform_name)
         self._stimulus_waveform = self._stimulus.get_waveform(stimulus_waveform_name)
         self._stimulus._acadia.schedule_waveform(self._stimulus_waveform)
         self._capture._acadia.stream(self._stream, self._capture_waveform)
+
+    def get_measurement(self) -> Operation:
+        """
+        Blocks until the measurement is complete, as indicated by the CMACC
+        completion status bit.
+        """
+
+        # `Acadia.cmacc_get_quadrant` will wait until cmacc is done
+        return self._capture._acadia.cmacc_get_quadrant(self._stream)
 
 
     def load_kernels(self) -> None:
@@ -436,75 +445,93 @@ class MeasurableResonator:
             self._stimulus._acadia.update_ncos_synchronized()
 
 
-class MeasurableQubit:
+class Qubit:
     """
-    A collection of functions that are useful for manipulating and measuring a qubit
-    with a dispersive readout resonator.
+    A collection of functions that are useful for manipulating and measuring a qubit.
     """
 
-    def __init__(self, **config_dict: dict):
+    def __init__(self, stimulus: InputOutput):
         """
         Runtime class that contains experiment specific functions, including sub_sequence functions
         """
-        super().__init__(**config_dict)
+        self._stimulus = stimulus
 
-    def subsqeuence_cool_qubit(self, acadia:Acadia, capture_cfg:dict, capture_dst:Waveform,
-                               ro_drive_wf:ChannelWaveform, capture_blank_wf:ChannelWaveform,
-                               q_pi_pulse_wf:ChannelWaveform, q_blank_wf:ChannelWaveform):
+    def set_frequency(self, frequency: float, sync: bool = True):
         """
-        A sub-sequence that cools the qubit to its ground state using measurement and conditional flips.
-
-        :param acadia: Acadia instance where the sequence belongs to
-        :param capture_cfg: configuration dict for the  ADC capture channel
-        :param capture_dst: destination memory for the captured measurement data
-        :param ro_drive_wf: readout drive waveform for the measurement pulse
-        :param capture_blank_wf: blank waveform for the delay between ro drive and capture
-        :param q_pi_pulse_wf: qubit pi_pulse waveform for flipping the qubit when measured in e
-        :param q_blank_wf: qubit blank waveform between qubit flip and measurement
-        :return:
+        The frequencies of both the stimulus and the capture are updated and 
+        optionally synchronized.
         """
 
-        capture_delay = capture_cfg.get("capture_delay", 0)
-        cmacc_offset = capture_cfg.get("cmacc_offset", 0)
-        kernel_wf = capture_cfg.get("kernel_wf", [0.1])
-        g_quadrant = capture_cfg["state_quadrants"][0]
+        self._stimulus.set_nco_frequency(frequency)
+        self._stimulus.reset_nco_phase()
+        if sync:
+            self._stimulus._acadia.update_ncos_synchronized()
 
-        a = acadia
+    def pulse(self, waveform_name: str = None) -> None:
+        """
+        Apply a pulse to the qubit. The waveform name is passed directly to 
+        :meth:`InputOutput.get_waveform`; see documentation therein for 
+        argument behavior.
+        """
 
-        ## Step 1: Do a first msmt
-        capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel_wf,
-                                                   reset_fifo=True, accumulator_done=False)
+        waveform = self._stimulus.get_waveform(waveform_name)
+        self._stimulus._acadia.schedule_waveform(waveform)
 
-        a.cmacc_load(capture_stream, cmacc_offset)
+    def prepare(self, 
+                state_target_name: str,
+                measurement_resonator: MeasurableResonator,
+                pulse_waveform_name: str = None,
+                measurement_stimulus_waveform_name: str = None,
+                measurement_capture_waveform_name: str = None,
+                measurement_cmacc_kernel: str = None) -> None:
+        """
+        A subsequence that prepares the qubit in a given state by measuring and
+        conditionally applying a waveform. All mneasurement names are passed 
+        directly to :meth:`InputOutput.get_waveform`; see documentation therein 
+        for argument behavior.
 
-        with a.channel_synchronizer():
-            if capture_delay != 0:
-                a.schedule_waveform(capture_blank_wf)
-            a.schedule_waveform(ro_drive_wf)
-            a.stream(capture_stream, capture_dst)
+        :param state_target_name: The name of the target state to prepare. This
+            should be a key in the `state_quadrants` section of the capture
+            configuration, whose value is the quadrant number for a measurement
+            result in the given state. For example, if a measurement of a system
+            in state "g" would result in a value in the 4th quadrant of the IQ
+            plane, the line `"g": 4` should be in the capture configuration,
+            and state_target_name should be set to `"g"` to prepare that state.
+        :type state_target_name: str 
+        :param measurement_resonator: The resonator to be used for measurement
+            and conditional operations.
+        :type measurement_resonator: :class:`MeasurableResonator`
+        :param pulse_waveform_name: The name of the waveform to be played when 
+            the qubit is measured to be in any other state than the target. 
+        :type pulse_waveform_name: str
+        :param measurement_stimulus_waveform_name: The name of the measurement
+            resonator stimulus waveform.
+        :type measurement_stimulus_waveform_name: str
+        :param measurement_stimulus_waveform_name: The name of the measurement
+            resonator capture waveform.
+        :type measurement_capture_waveform_name: str
+        """
 
-        # put the first msmt result in a register
+        a = self._stimulus._acadia
+        target_quadrant = measurement_resonator._capture._config["state_quadrants"][state_target_name]
+        quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{g_quadrant}")
         reg = a.sequencer().Register()
-        reg.load(a.cmacc_get_quadrant(capture_stream))
+        
+        ## Step 1: Do a first msmt and store the result in a register
+        measurement_resonator.prepare_cmacc(measurement_cmacc_kernel)
+        with a.channel_synchronizer():
+            measurement_resonator.measure()
+
+        reg.load(measurement_resonator.get_measurement())
 
         ## Step 2: Measure + conditional flip, until we get the ground state
         # todo: try getting the number of msmts in this loop using a counter register
-        with a.sequencer().repeat_until(reg == getattr(a, f"CMACC_QUADRANT_{g_quadrant}")):
-            capture_stream, kernel = a.configure_cmacc(self.channel_objs["ro_capture"], kernel=kernel,
-                                                       reset_fifo=True, accumulator_done=False)
-
-            a.cmacc_load(capture_stream, cmacc_offset)  # todo: extra bias can be added here.
+        with a.sequencer().repeat_until(reg == quadrant_reg_value):
+            measurement_resonator.prepare_cmacc(measurement_cmacc_kernel)
 
             with a.channel_synchronizer():
-                a.schedule_waveform(q_pi_pulse_wf)
-                a.schedule_waveform(q_blank_wf)
+                self.pulse(pulse_waveform_name)
                 a.barrier()
-                if capture_delay != 0:
-                    a.schedule_waveform(capture_blank_wf)
-                a.schedule_waveform(ro_drive_wf)
-                # this will keep overwriting the re_pts1 waveform
-                # the final value will always be in the g state quadrant since that's the condition for exiting the loop
-                a.stream(capture_stream, capture_dst)
+                measurement_resonator.measure()
 
-            # `cmacc_get_quadrant` will wait until cmacc is done
-            reg.load(a.cmacc_get_quadrant(capture_stream))
+            reg.load(measurement_resonator.get_measurement())

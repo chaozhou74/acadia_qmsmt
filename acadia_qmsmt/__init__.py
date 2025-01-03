@@ -1,3 +1,3 @@
-from .qmsmt import InputOutput, QMsmtRuntime, MeasurableResonator, MeasurableQubit, IOConfig
+from .qmsmt import InputOutput, QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
-__all__ = ["InputOutput", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit", "IOConfig"]
+__all__ = ["InputOutput", "QMsmtRuntime", "MeasurableResonator", "Qubit", "IOConfig"]
