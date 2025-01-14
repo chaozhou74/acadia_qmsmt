@@ -43,12 +43,12 @@ class ReadoutPtsRuntime(AutoConfigMixin, Runtime):
         ro_drive = self.channel_waveforms["ro_stimulus"]["ro_drive"]
 
         # need two copies for changing qubit pulse within one sequence
-        q_rotation_pi = acadia.create_waveform(self.channel_objs["q_stimulus"],  **self.q_stimulus["waveforms"]["q_rotation"])
-        q_rotation_pi2 = acadia.create_waveform(self.channel_objs["q_stimulus"],  **self.q_stimulus["waveforms"]["q_rotation"])
+        q_rotation_pi = acadia.create_waveform_memory(self.channel_objs["q_stimulus"],  **self.q_stimulus["waveforms"]["q_rotation"])
+        q_rotation_pi2 = acadia.create_waveform_memory(self.channel_objs["q_stimulus"],  **self.q_stimulus["waveforms"]["q_rotation"])
 
-        ro_demod0 = acadia.create_waveform(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
-        ro_demod1 = acadia.create_waveform(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
-        ro_demod2 = acadia.create_waveform(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
+        ro_demod0 = acadia.create_waveform_memory(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
+        ro_demod1 = acadia.create_waveform_memory(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
+        ro_demod2 = acadia.create_waveform_memory(self.channel_objs["ro_capture"], length=2.4e-6, decimation=0, region="plddr")
 
         # Create a blank waveform between qubit drive and readout drive
         q_blank_wf = self.blank_waveform_generator(acadia, "q_stimulus")(40e-9)

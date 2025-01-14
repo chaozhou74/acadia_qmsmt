@@ -33,7 +33,7 @@ class AutoConfigMixin:
             channel_obj = self.channel_objs[ch_name]
             # config each waveform in the channel
             for wf_name, wf_cgf in config["waveforms"].items():
-                wf_obj = acadia.create_waveform(channel_obj, **wf_cgf)
+                wf_obj = acadia.create_waveform_memory(channel_obj, **wf_cgf)
                 self.channel_waveforms[ch_name][wf_name] = wf_obj
 
     def auto_config_ncos(self, acadia: Acadia, nco_update_event_source="sysref", 
@@ -94,7 +94,7 @@ class AutoConfigMixin:
             waveform_args.update({"decimation": decimation, "region": region})
         
         def blank_wf_gen(length:float):
-            blank_wf = acadia.create_waveform(channel_obj, length=length, **waveform_args)
+            blank_wf = acadia.create_waveform_memory(channel_obj, length=length, **waveform_args)
             return blank_wf
         
         return blank_wf_gen

@@ -1,35 +1,69 @@
 import fnmatch
 import operator
+import re
 from functools import reduce
+from typing import Union, Dict, List, Any
+
 import ruamel.yaml as yaml
 import numpy as np
 
-from acadia_qmsmt.helpers.yaml_routine import PARAMETER_HANDLERS
-
-
-def apply_type_handlers(config: dict, handlers: dict) -> dict:
+def parse(input: Any) -> Any:
     """
-    Recursively applies type handlers to matched paths in the configuration dict.
-
-    :param config: The nested configuration dict.
-    :param handlers: A dictionary mapping wildcard path patterns (as strings) to handler functions.
-
-    :return: The modified configuration dictionary with transformations applied.
+    Convert input of format "a+bj", "(a, b pi)", "(a, b deg)" to complex numbers
+    :param input:
+    :return:
     """
 
-    def _recursive_apply(data, path):
-        if isinstance(data, dict):
-            for key, value in data.items():
-                new_path = path + (key,)
-                data[key] = _recursive_apply(value, new_path)
-        else:
-            # Match the path using the wildcard handlers
-            for pattern, handler in handlers.items():
-                if fnmatch.fnmatch(".".join(path), pattern):
-                    return handler(data)
-        return data
+    if isinstance(input, list):
+        return [parse(e) for e in input]
+    elif isinstance(input, dict):
+        return {k: parse(v) for k,v in input.items()}
+    elif input is None or isinstance(input, (bool, int, float, complex)):
+        return input
+    elif not isinstance(input, str):
+        raise ValueError(f"Unsupported input type {type(input)}. Input must be a number, list, or path to a .npy file.")
 
-    return _recursive_apply(config, ())
+    # strip the spaces
+    input_str = input.replace(" ", "")
+
+    # Case 1: ints
+    try:
+        return int(input_str)
+    except:
+        pass
+
+    # Case 2: floats
+    try:
+        return float(input_str)
+    except:
+        pass
+
+    # Case 3: Complex, written as "a+bj" or variations like "a", "bj", "a+bj"
+    try:
+        return complex(input_str)
+    except ValueError:
+        pass
+
+    # Case 4: Complex, written as "(a, b pi)"
+    match_pi = re.match(r"\(\s*([\d\.\-eE]+)\s*,\s*([\d\.\-eE]+)pi\s*\)", input_str)
+    if match_pi:
+        amp = float(match_pi.group(1))
+        angle = float(match_pi.group(2)) * np.pi  # Convert angle in pi to radians
+        return np.exp(1j*angle) * amp
+
+    # Case 5: Complex, written as "(a, b deg)"
+    match_deg = re.match(r"\(\s*([\d\.\-eE]+)\s*,\s*([\d\.\-eE]+)deg\s*\)", input_str)
+    if match_deg:
+        amp = float(match_deg.group(1))
+        angle = float(match_deg.group(2))/180*np.pi  # Convert angle in degrees to radians
+        return np.exp(1j*angle) * amp
+
+    # Case 6: Numpy objects
+    if input.endswith('.npy') or input.endswith('.npz'):
+        return np.load(input)
+
+    # An arbitrary string
+    return input
 
 
 def load_yaml(yaml_path: str):
@@ -43,7 +77,7 @@ def load_yaml(yaml_path: str):
     yml = yaml.YAML(typ='safe', pure=True)
     with open(yaml_path, 'r') as file:
         config = yml.load(file)
-    return apply_type_handlers(config, PARAMETER_HANDLERS)
+    return parse(config)
 
 
 def to_yaml_friendly(value):

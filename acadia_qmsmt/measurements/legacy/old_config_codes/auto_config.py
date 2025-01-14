@@ -2,7 +2,7 @@ from copy import deepcopy
 from typing import Callable, Literal, Dict
 
 from acadia import Acadia
-from acadia.waveforms import ChannelWaveform
+from acadia.waveforms import ChannelWaveformMemory
 from acadia.rfdc import Channel
 
 
@@ -34,7 +34,7 @@ class AutoConfigMixin:
         return self.channel_objs
 
 
-    def allocate_waveform_mem(self, acadia: Acadia, channel_name: str, waveform_name: str) -> ChannelWaveform:
+    def allocate_waveform_mem(self, acadia: Acadia, channel_name: str, waveform_name: str) -> ChannelWaveformMemory:
         """
         A shortcut function for allocating waveform memory for a specified channel and waveform
         using pre-defined configurations.
@@ -45,11 +45,11 @@ class AutoConfigMixin:
         :param acadia: Acadia instance for creating waveforms.
         :param channel_name: Name of the channel where the waveform will be used
         :param channel_name: Name of the waveform defined under the "waveforms" sub-dictionary for the given channel
-        :return: Allocated Waveform object
+        :return: Allocated WaveformMemory object
         """
         channel_obj = self.channel_objs[channel_name]
         wf_cgf = self.channel_configs[channel_name]["waveforms"][waveform_name]
-        return acadia.create_waveform(channel_obj, **wf_cgf)
+        return acadia.create_waveform_memory(channel_obj, **wf_cgf)
 
 
     def allocate_all_waveform_mems(self, acadia: Acadia, **configs):
@@ -140,8 +140,8 @@ class AutoConfigMixin:
                 decimation = 4  # for cmacc # todo: need to test
             waveform_args.update({"decimation": decimation, "region": region})
 
-        def blank_wf_gen(length: float) -> ChannelWaveform:
-            blank_wf = acadia.create_waveform(channel_obj, length=length, **waveform_args)
+        def blank_wf_gen(length: float) -> ChannelWaveformMemory:
+            blank_wf = acadia.create_waveform_memory(channel_obj, length=length, **waveform_args)
             return blank_wf
 
         return blank_wf_gen

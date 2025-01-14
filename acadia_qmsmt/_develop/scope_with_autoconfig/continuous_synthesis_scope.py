@@ -22,7 +22,7 @@ class ContinuousSynthesisRuntime(Runtime):
         acadia = Acadia()
 
         channel = acadia.channel(self.stimulus["channel"])
-        pulse = acadia.create_waveform(channel, **self.stimulus["waveform"])
+        pulse = acadia.create_waveform_memory(channel, **self.stimulus["waveform"])
         
         def sequence(a: Acadia):
             with a.sequencer().loop():

@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime, Waveform
+from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 class QubitSpectroscopyRuntime(QMsmtRuntime):
@@ -21,8 +21,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
     saturation_pulse_fixed_length: float = 1e-3 - 100e-9
     saturation_pulse_ramp_time: float = 100e-9
     saturation_pulse_amplitude: float = 0.1
-    cmacc_kernel: str = "boxcar"
-    readout_stimulus_signal_name: str = "smoothed_boxcar"
+    readout_window_name: str = None
+    readout_stimulus_waveform_name: str = None
     plot: bool = True
     figsize: tuple[int] = None
 
@@ -40,7 +40,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         # Create the qubit saturation waveform manually, as this is not a waveform
         # that the user will likely need to keep in the configuration file after this
         # measurement
-        saturation_waveform = self.acadia.create_waveform(
+        saturation_waveform = self.acadia.create_waveform_memory(
             qubit._stimulus.channel, 
             length=self.saturation_pulse_ramp_time, 
             fixed_length=self.saturation_pulse_fixed_length)
@@ -48,7 +48,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         self.data.add_group(f"iq_pts", uniform=True)
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.cmacc_kernel)
+            readout_resonator.prepare_cmacc(self.readout_window_name)
 
             with a.channel_synchronizer():
                 a.schedule_waveform(saturation_waveform)
@@ -61,9 +61,9 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         self.acadia.assemble()
         self.acadia.load()
 
-        readout_resonator.load_kernels()
-        readout_stimulus_io.load_memory(readout=self.readout_stimulus_signal_name)
-        saturation_waveform.set(self.saturation_pulse_amplitude)
+        readout_resonator.load_windows()
+        readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
+        saturation_waveform.set("hann", self.saturation_pulse_amplitude)
 
         for i in range(self.iterations):
             for frequency in self.qubit_frequencies:
@@ -72,7 +72,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
                 # capture data and put in the corresponding group
                 self.acadia.run()
 
-                wf = readout_capture_io.get_waveform("readout_accumulated")
+                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"iq_pts"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
@@ -134,8 +134,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
         # Only continue processing data if we have at least one complete iteration
         if completed_iterations != 0:
-            valid_traces = completed_iterations*len(self.qubit_frequencies)
-            self.process_data(valid_traces)
+            self.process_data(completed_iterations)
             self.update_plot()               
             self.data.save(self.local_directory)
 
@@ -150,7 +149,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             self.savefig(self.fig)
         self.fit_lorentzian()
 
-    def process_data(self, valid_traces):
+    def process_data(self, completed_iterations):
+        valid_traces = completed_iterations*len(self.qubit_frequencies)
         data = self.data["iq_pts"].records()[:valid_traces, ...]
 
         # Get the collection of data and reshape it so that the axes index as: 
@@ -171,8 +171,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
         # Convert the summed sample data to a complex number and choose 
         # the scale so that we turn the sum into a mean
-        total_scale = valid_traces // len(self.qubit_frequencies)
-        self.data_complex = Waveform.sample_to_complex(self.data_summed, scale=total_scale)
+        self.data_complex = WaveformMemory.sample_to_complex(self.data_summed, scale=float(completed_iterations))
         self.data_mags = np.abs(self.data_complex)
         self.data_phases = np.angle(self.data_complex)
 

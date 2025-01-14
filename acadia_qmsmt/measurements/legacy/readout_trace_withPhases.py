@@ -30,8 +30,8 @@ class ReadoutTestRuntime_dsp(Runtime):
         capture_channel = acadia.channel(self.capture["channel"])
 
         # Create the waveforms that we'll need 
-        stimulus_waveform = acadia.create_waveform(stimulus_channel, **self.stimulus["waveform"])
-        capture_waveform = acadia.create_waveform(capture_channel, **self.capture["waveform"]) 
+        stimulus_waveform = acadia.create_waveform_memory(stimulus_channel, **self.stimulus["waveform"])
+        capture_waveform = acadia.create_waveform_memory(capture_channel, **self.capture["waveform"]) 
         
         # Create a record group for saving captured data
         for i in range(len(self.phases)):

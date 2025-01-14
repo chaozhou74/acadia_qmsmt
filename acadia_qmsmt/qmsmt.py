@@ -1,9 +1,12 @@
 import sys
 import shutil
 import os
-from typing import Callable, Literal, Dict, List, Any
+from typing import Callable, Literal, Dict, List, Any, Union
+from copy import copy
 
-from acadia import Acadia, Channel, Runtime, ChannelWaveform, Waveform, Operation
+from numpy.typing import NDArray
+
+from acadia import Acadia, Channel, Runtime, ChannelWaveformMemory, WaveformMemory, Operation
 
 __all__ = ["InputOutput", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
 
@@ -19,33 +22,33 @@ class InputOutput:
         self._config: Dict[str,Any] = config
         self._acadia: Acadia = acadia
         self._channel: Channel = acadia.channel(config["channel"])
-        self._allocated_waveforms: Dict[str,ChannelWaveform] = {}
+        self._allocated_memories: Dict[str,ChannelWaveformMemory] = {}
 
 
-    def get_waveform(self, waveform_name: str = None) -> ChannelWaveform:
+    def get_waveform_memory(self, waveform_memory_name: str = None) -> ChannelWaveformMemory:
         """
         A shortcut function for allocating waveform memory for a specified 
         channel and waveform using pre-defined configurations.
 
-        Serves as a shortcut for creating waveform objects based on the 
-        parameters defined in config["waveforms"][`waveform_name`].
+        Serves as a shortcut for creating waveform memory objects based on the 
+        parameters defined in ``config["memories"][waveform_memory_name]``.
 
-        If no name is provided, the first waveform in the list of available
-        waveforms is used.
+        If no name is provided, the first memory in the list of available
+        memories is used.
 
-        :param waveform_name: Name of the waveform defined under the 
-            "waveforms" sub-dictionary for the given channel
-        :return: Allocated Waveform object
+        :param waveform_memory_name: Name of the waveform memory defined under the 
+            "memories" sub-dictionary for the given channel
+        :return: Allocated WaveformMemory object
         """
-        if waveform_name is None:
-            waveform_name = self._config["waveforms"].keys()[0]
+        if waveform_memory_name is None:
+            waveform_memory_name = list(self._config["memories"].keys())[0]
 
         # If we haven't yet allocated memory for the waveform, do so
-        if waveform_name not in self._allocated_waveforms:
-            wf_cgf = self._config["waveforms"][waveform_name]
-            self._allocated_waveforms[waveform_name] = self._acadia.create_waveform(self._channel, **wf_cgf)
+        if waveform_memory_name not in self._allocated_memories:
+            wf_cgf = self._config["memories"][waveform_memory_name]
+            self._allocated_memories[waveform_memory_name] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
 
-        return self._allocated_waveforms[waveform_name]
+        return self._allocated_memories[waveform_memory_name]
 
 
     def blank_waveform_generator(self, reference_waveform: str = None) -> Callable:
@@ -67,7 +70,7 @@ class InputOutput:
         if not self._channel.is_dac:
             if reference_waveform is None:
                 # check if all the waveform mem configuration in the channel has the same settings
-                for i, wf_cfg in enumerate(self._config["waveforms"].values()):
+                for i, wf_cfg in enumerate(self._config["memories"].values()):
                     d, r = wf_cfg.get("decimation", None), wf_cfg.get("region", None)
                     if i == 0:
                         decimation, region = d, r
@@ -75,7 +78,7 @@ class InputOutput:
                         raise ValueError(
                             f"for blank waveform in an ADC channel, a reference waveform name must be provided")
             else:
-                ref_wf_cfg = self._config["waveforms"][reference_waveform]
+                ref_wf_cfg = self._config["memories"][reference_waveform]
                 decimation = ref_wf_cfg.get("decimation", None)
                 region = ref_wf_cfg.get("region", None)
 
@@ -83,29 +86,63 @@ class InputOutput:
                 decimation = 4  # for cmacc 
             waveform_args.update({"decimation": decimation, "region": region})
 
-        def blank_wf_gen(length: float) -> ChannelWaveform:
-            blank_wf = self.acadia.create_waveform(self._channel, length=length, **waveform_args)
+        def blank_wf_gen(length: float) -> ChannelWaveformMemory:
+            blank_wf = self.acadia.create_waveform_memory(self._channel, length=length, **waveform_args)
             return blank_wf
 
         return blank_wf_gen
 
-    def load_memory(self, **kwargs):
+    def load_waveforms(self, **kwargs):
         """
         Populate the memory of previously allocated waveforms. The names of 
-        the keyword arguments should correspond to waveform names, and the 
-        values should be either strings that correspond to signal names in the
-        config dictionary or a value to be directly passed to :meth:`Waveform.set`.
+        the keyword arguments should correspond to waveform memory names in the 
+        ``"memories"`` section of the configuration, and the values should be 
+        either strings that correspond to waveform names in the ``"waveforms"`` 
+        section of the configuration or a value to be directly passed to 
+        :meth:`WaveformMemory.set`. 
+        
+        This is a shortcut for calling :meth:`load_waveform` for all allocated
+        memories and loading them with their specified configurations. To 
+        temporarily override values from the configuration, use 
+        :meth:`load_waveform`.
         """
 
-        for waveform_name, signal in kwargs.items():
-            if waveform_name not in self._allocated_waveforms:
-                raise ValueError(f"Waveform {waveform_name} requested to be "
-                                    "loaded but was never allocated.")
-            set_value = self._config["signals"][signal] if isinstance(signal, str) else signal
-            if isinstance(set_value, dict):
-                self._allocated_waveforms[waveform_name].set(**set_value)
-            else:
-                self._allocated_waveforms[waveform_name].set(set_value)
+        for memory_name, waveform in kwargs.items():
+            self.load_waveform(memory_name, waveform)
+
+    def load_waveform(self, 
+                        memory_name: str, 
+                        waveform: Union[str,NDArray,float,complex], 
+                        **kwargs):
+        """
+        Populate a waveform memory, optionally
+        overriding parameters in the configuration when ``signal`` is a `str`.
+        If ``signal`` is ``None``, the first signal in the configuration is
+        used. If none are found, an error is thrown.
+        """
+        if memory_name not in self._allocated_memories:
+            raise ValueError(f"WaveformMemory {memory_name} requested to be "
+                                "loaded but was never allocated.")
+
+        if waveform is None:
+            if "waveforms" not in self._config or len(self._config["waveforms"]) == 0:
+                raise ValueError("Passing a waveform name for an IO requires a"
+                                f" populated ``waveforms`` section in the corresponding"
+                                f" configuration.")
+            set_value = list(self._config["waveforms"].values())[0]
+
+        elif isinstance(waveform, str):
+            if "waveforms" not in self._config:
+                raise ValueError("Passing a waveform name for an IO requires a"
+                                f" populated ``waveforms`` section in the corresponding"
+                                f" configuration section.")
+            set_value = self._config["waveforms"][waveform]
+        else:
+            set_value = signal
+
+        set_kwargs = copy(set_value) if isinstance(set_value, dict) else {"data": set_value}
+        set_kwargs.update(kwargs)
+        self._allocated_memories[memory_name].set(**set_kwargs)
 
     @property
     def channel(self) -> Channel:
@@ -129,7 +166,7 @@ class IOConfig:
 class QMsmtRuntime(Runtime):
     """
     A base class that provides shortcut functions that simplifies the 
-    configuration of analog channels and pulse waveforms based on the 
+    configuration of analog channels and waveform memories based on the 
     channel configurations in provided fields (where fields are defined
     in the definition of :class:`Runtime`). This will be the base class 
     of other runtime classes that use configuration based on a yaml file.
@@ -260,7 +297,8 @@ class QMsmtRuntime(Runtime):
         dict will be updated.
         """
 
-        if isinstance(getattr(self, ioconfig_name), dict):
+        ioconfig = getattr(self, ioconfig_name)
+        if isinstance(ioconfig, dict):
             # Update the dict
             # Split the provided path, populating a list with a sequence
             # of keys which we need to use to recusrsively index into the 
@@ -275,10 +313,13 @@ class QMsmtRuntime(Runtime):
 
             # Finally, actually assign the value
             cfg[index_paths[0]] = value
-        else:
+        elif isinstance(ioconfig, str):
             # Update the yaml
             from acadia_qmsmt.helpers.yaml_editor import update_yaml
-            update_yaml(self._ios[ioconfig_name]._config["yaml_path"], {config_field: value})
+            yaml_path = self._ios[ioconfig_name]._config["yaml_path"]
+            update_yaml(yaml_path, {f"{ioconfig}.{config_field}": value})
+        else:
+            raise TypeError(f"Unable to update IO config when provided as type {type(ioconfig)}")
 
 
 class MeasurableResonator:
@@ -292,10 +333,10 @@ class MeasurableResonator:
         self._stimulus = stimulus
         self._capture = capture
         self._stream = None
-        self._kernels = {}
+        self._windows = {}
 
     def prepare_cmacc(self, 
-                kernel_name: str = None,
+                window_name: str = None,
                 output_type: Literal["upper", "lower", "input", None] = "upper",
                 output_last_only: bool = True):
         """
@@ -309,16 +350,18 @@ class MeasurableResonator:
         entire captured trace is decimated into a single point.
 
         
-        :param kernel_name: The name of the kernel to be used (and newly 
+        :param window_name: The name of the window to be used (and newly 
             allocated, if necessary). The name should be a key in the 
-            "kernels" section of the configuration for the provided capture.
-            The value of the kernel may be a float, in which case a boxcar kernel
-            is allocated. Note that this does not actually populate the kernel
-            memory with that float, but simply specifies that a boxcar kernel
-            will be used so that only a single point in kernel memory is allocated.
-            The value of the kernel may also be an array, in which case a kernel 
-            of the appropriate size is allocated.
-        :type kernel_name: str
+            "windows" section of the configuration for the provided capture.
+            The value of the window (as provided in the configuration's ``data`` 
+            key may be a float, in which case a boxcar window
+            is allocated. Note that this does not actually populate the window
+            memory with that float, but simply specifies that a boxcar window
+            will be used so that only a single point in window memory is allocated.
+            The value of the window may also be an array, in which case a window 
+            of the appropriate size is allocated. If the name is ``None``, the 
+            first configuration entry is used.
+        :type window_name: str
         :param output_type: The output port of the CMACC is driven by a multiplexer,
             which allows the user to decide which data is written into memory. 
             The output port has 32 bits per quadrature, but the internal accumulator
@@ -340,46 +383,39 @@ class MeasurableResonator:
         :type output_last_only: bool
         """
 
-        # First, we'll determine what kernel we need
-        # Here we'll cache allocated kernels. If we previously used a kernel, 
+        # First, we'll determine what window we need
+        # Here we'll cache allocated windows. If we previously used a window, 
         # we'll retrieve its memory, otherwise we'll allocate it fresh
-        if kernel_name is None:
-            if "_default" in self.kernels:
-                # If we already allocated a boxcar kernel, use it
-                kernel_arg = self._kernels["_default"]
-                kernel_cache_key = "_default"
-            else:
-                # we'll create a boxcar kernel by passing None
-                kernel_arg = None
-                kernel_cache_key = "_default"
-            cmacc_offset = 0
-        elif kernel_name in self._kernels:
-            # Regardless of what the kernel is, if we have it already,
-            # we'll pass in its Waveform so that we don't re-allocate it
-            kernel_arg = self._kernels[kernel_name]
-            kernel_cache_key = kernel_name
+        if window_name is None:
+            window_name = list(self._capture._config["windows"].keys())[0]
+            
+        if window_name in self._windows:
+            # Regardless of what the window is, if we have it already,
+            # we'll pass in its WaveformMemory so that we don't re-allocate it
+            kernel_arg = self._windows[window_name]
+            window_cache_key = window_name
 
             # Because the offset is just a number (and not a thing that needs
             # to be allocated), we can just get it from the config every time
-            cmacc_offset = self._capture._config["kernels"][kernel_name].get("offset", 0)
+            cmacc_offset = self._capture._config["windows"][window_name].get("offset", 0)
         else:
-            # Allocate the waveform anew 
+            # Allocate the memory anew 
             # We'll interpret the type of the argument slightly differently 
-            # than configure_cmacc expects; if the kernel argument is a float,
-            # we'll interpret this as the amplitude of a boxcar kernel, in contrast
+            # than configure_cmacc expects; if the window argument is a float,
+            # we'll interpret this as the amplitude of a boxcar window, in contrast
             # to configure_cmacc interpreting a float argument as the length in seconds
-            # that the kernel should be. The behavior here will be different as this is a
+            # that the window should be. The behavior here will be different as this is a
             # much more likely use case and will be much more intuitive in the config file
-            kernel_config = self._capture._config["kernels"][kernel_name]["data"]
-            kernel_arg = None if isinstance(kernel_config, float) else kernel_config
-            kernel_cache_key = kernel_name
-            cmacc_offset = self._capture._config["kernels"][kernel_name].get("offset", 0)
+            window_config = self._capture._config["windows"][window_name]["data"]
+            kernel_arg = None if isinstance(window_config, float) else window_config
+            window_cache_key = window_name
+            cmacc_offset = self._capture._config["windows"][window_name].get("offset", 0)
 
         # If we've used this measurement before, retrieve the stream, otherwise create a new one
         src_arg = self._capture._channel if self._stream is None else self._stream
 
-        # Configure the CMACC
-        stream, kernel = self._capture._acadia.configure_cmacc(
+        # Configure the CMACC and retrieve the allocated stream and window memory
+        stream, window_mem = self._capture._acadia.configure_cmacc(
             src=src_arg,
             kernel=kernel_arg,
             write_mode=output_type,
@@ -388,24 +424,24 @@ class MeasurableResonator:
             accumulator_done=False
         )
 
-        # Cache the relevant stream and kernel
+        # Cache the relevant stream and window
         # If we had already allocated and cached these, this will just store 
         # them back with the same values
         self._stream = stream
-        self._kernels[kernel_cache_key] = kernel
+        self._windows[window_cache_key] = window_mem
 
         self._capture._acadia.cmacc_load(stream, cmacc_offset)
 
     def measure(self, 
-                stimulus_waveform_name: str = None, 
-                capture_waveform_name: str = None):
+                stimulus_waveform_memory_name: str = None, 
+                capture_waveform_memory_name: str = None):
         """
         Schedules the measurement. This function should be called inside of a 
         channel synchronizer, and prepare_cmacc must have been called before 
         this. 
         """
-        self._capture_waveform = self._capture.get_waveform(capture_waveform_name)
-        self._stimulus_waveform = self._stimulus.get_waveform(stimulus_waveform_name)
+        self._capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory_name)
+        self._stimulus_waveform = self._stimulus.get_waveform_memory(stimulus_waveform_memory_name)
         self._stimulus._acadia.schedule_waveform(self._stimulus_waveform)
         self._capture._acadia.stream(self._stream, self._capture_waveform)
 
@@ -419,16 +455,16 @@ class MeasurableResonator:
         return self._capture._acadia.cmacc_get_quadrant(self._stream)
 
 
-    def load_kernels(self) -> None:
+    def load_windows(self) -> None:
         """
-        Load the kernel memory with the values specified in the configuration.
+        Load the CMACC window memory with the values specified in the configuration.
         
         This should occur after the sequence has been compiled and the relevant
         Acadia object attached.
         """
 
-        for kernel_name, kernel_memory in self._kernels.items():
-            kernel_memory.set(self._capture._config["kernels"][kernel_name]["data"])
+        for window_name, window_memory in self._windows.items():
+            window_memory.set(self._capture._config["windows"][window_name]["data"])
 
 
     def set_frequency(self, frequency: float, sync: bool = True):
@@ -467,27 +503,27 @@ class Qubit:
         if sync:
             self._stimulus._acadia.update_ncos_synchronized()
 
-    def pulse(self, waveform_name: str = None) -> None:
+    def pulse(self, waveform_memory_name: str = None) -> None:
         """
-        Apply a pulse to the qubit. The waveform name is passed directly to 
-        :meth:`InputOutput.get_waveform`; see documentation therein for 
+        Apply a pulse to the qubit. The waveform memory name is passed directly to 
+        :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
         argument behavior.
         """
 
-        waveform = self._stimulus.get_waveform(waveform_name)
-        self._stimulus._acadia.schedule_waveform(waveform)
+        waveform_memory = self._stimulus.get_waveform_memory(waveform_memory_name)
+        self._stimulus._acadia.schedule_waveform(waveform_memory)
 
     def prepare(self, 
                 state_target_name: str,
                 measurement_resonator: MeasurableResonator,
-                pulse_waveform_name: str = None,
-                measurement_stimulus_waveform_name: str = None,
-                measurement_capture_waveform_name: str = None,
-                measurement_cmacc_kernel: str = None) -> None:
+                pulse_waveform_memory_name: str = None,
+                measurement_stimulus_waveform_memory_name: str = None,
+                measurement_capture_waveform_memory_name: str = None,
+                measurement_cmacc_window: str = None) -> None:
         """
         A subsequence that prepares the qubit in a given state by measuring and
         conditionally applying a waveform. All mneasurement names are passed 
-        directly to :meth:`InputOutput.get_waveform`; see documentation therein 
+        directly to :meth:`InputOutput.get_waveform_memory`; see documentation therein 
         for argument behavior.
 
         :param state_target_name: The name of the target state to prepare. This
@@ -501,15 +537,15 @@ class Qubit:
         :param measurement_resonator: The resonator to be used for measurement
             and conditional operations.
         :type measurement_resonator: :class:`MeasurableResonator`
-        :param pulse_waveform_name: The name of the waveform to be played when 
+        :param pulse_waveform_memory_name: The name of the waveform memory to be played when 
             the qubit is measured to be in any other state than the target. 
-        :type pulse_waveform_name: str
-        :param measurement_stimulus_waveform_name: The name of the measurement
+        :type pulse_waveform_memory_name: str
+        :param measurement_stimulus_waveform_memory_name: The name of the measurement
             resonator stimulus waveform.
-        :type measurement_stimulus_waveform_name: str
-        :param measurement_stimulus_waveform_name: The name of the measurement
+        :type measurement_stimulus_waveform_memory_name: str
+        :param measurement_stimulus_waveform_memory_name: The name of the measurement
             resonator capture waveform.
-        :type measurement_capture_waveform_name: str
+        :type measurement_capture_waveform_memory_name: str
         """
 
         a = self._stimulus._acadia
@@ -518,7 +554,7 @@ class Qubit:
         reg = a.sequencer().Register()
         
         ## Step 1: Do a first msmt and store the result in a register
-        measurement_resonator.prepare_cmacc(measurement_cmacc_kernel)
+        measurement_resonator.prepare_cmacc(measurement_cmacc_window)
         with a.channel_synchronizer():
             measurement_resonator.measure()
 
@@ -527,10 +563,10 @@ class Qubit:
         ## Step 2: Measure + conditional flip, until we get the ground state
         # todo: try getting the number of msmts in this loop using a counter register
         with a.sequencer().repeat_until(reg == quadrant_reg_value):
-            measurement_resonator.prepare_cmacc(measurement_cmacc_kernel)
+            measurement_resonator.prepare_cmacc(measurement_cmacc_window)
 
             with a.channel_synchronizer():
-                self.pulse(pulse_waveform_name)
+                self.pulse(pulse_waveform_memory_name)
                 a.barrier()
                 measurement_resonator.measure()
 

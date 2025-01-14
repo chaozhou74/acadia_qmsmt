@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from acadia.runtime import Runtime
-from acadia.system import Waveform
+from acadia.system import WaveformMemory
 
 
 @dataclass
@@ -36,11 +36,11 @@ class QubitSpecRuntime(Runtime):
 
 
         # Create the waveforms that we'll need 
-        qubit_stimulus_waveform = acadia.create_waveform(qubit_channel, **self.qubit_stimulus["waveform"])
-        readout_stimulus_waveform = acadia.create_waveform(readout_stimulus_channel, **self.readout_stimulus["waveform"])
-        readout_capture_waveform = acadia.create_waveform(readout_capture_channel, **self.readout_capture["waveform"]) 
+        qubit_stimulus_waveform = acadia.create_waveform_memory(qubit_channel, **self.qubit_stimulus["waveform"])
+        readout_stimulus_waveform = acadia.create_waveform_memory(readout_stimulus_channel, **self.readout_stimulus["waveform"])
+        readout_capture_waveform = acadia.create_waveform_memory(readout_capture_channel, **self.readout_capture["waveform"]) 
         
-        blank_wf = acadia.create_waveform(readout_stimulus_channel, length=200e-9, blank=True)
+        blank_wf = acadia.create_waveform_memory(readout_stimulus_channel, length=200e-9, blank=True)
 
         # assemble channel objects
         channels_ = [qubit_channel, readout_stimulus_channel, readout_capture_channel]

@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime, Waveform
+from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig
 
 class ResonatorSpectroscopyRuntime(QMsmtRuntime):
@@ -21,8 +21,8 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     plot: bool = True
     figsize: tuple[int] = None
 
-    cmacc_kernel: str = "boxcar"
-    stimulus_signal_name: str = "smoothed_boxcar"
+    capture_window_name: str = None
+    stimulus_waveform_name: str = None
     electrical_delay: float = 0
 
     def main(self):
@@ -39,7 +39,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            resonator.prepare_cmacc(self.cmacc_kernel)
+            resonator.prepare_cmacc(self.capture_window_name)
 
             with a.channel_synchronizer():
                 # Measure the resonator by driving the "readout" waveform on the stimulus IO
@@ -56,10 +56,10 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         self.acadia.assemble()
         self.acadia.load()
 
-        # Load the kernel memory with the data from the config file
-        resonator.load_kernels()
+        # Load the window memory with the data from the config file
+        resonator.load_windows()
         # Load the stimulus waveform named "readout" with the specified signal
-        stimulus_io.load_memory(readout=self.stimulus_signal_name)
+        stimulus_io.load_waveform("readout", self.stimulus_waveform_name)
 
         for i in range(self.iterations):
             for frequency in self.frequencies:
@@ -68,7 +68,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
                 # capture data and put in the corresponding group
                 self.acadia.run()
 
-                wf = capture_io.get_waveform("readout_accumulated")
+                wf = capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"iq_pts"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
@@ -144,8 +144,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         # Only continue processing data if we have at least one complete iteration
         if completed_iterations != 0:
-            valid_traces = completed_iterations*len(self.frequencies)
-            self.process_data(valid_traces)
+            self.process_data(completed_iterations)
             self.update_plot()               
             self.data.save(self.local_directory)
 
@@ -160,7 +159,8 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
             self.savefig(self.fig)
         self.fit_lorentzian()
 
-    def process_data(self, valid_traces):
+    def process_data(self, completed_iterations):
+        valid_traces = completed_iterations*len(self.frequencies)
         data = self.data["iq_pts"].records()[:valid_traces, ...]
 
         # Get the collection of data and reshape it so that the axes index as: 
@@ -183,10 +183,14 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         # the scale so that we turn the sum into a mean
         # Simultaneously, choose the scale so that the result is independent
         # of amplitude
-        signal_config = self._ios["stimulus"]._config["signals"][self.stimulus_signal_name]
-        signal_scale = signal_config["scale"] if "scale" in signal_config else 1.0
-        total_scale = (valid_traces // len(self.frequencies)) / signal_scale 
-        self.data_complex = Waveform.sample_to_complex(self.data_summed, scale=total_scale)
+        if self.stimulus_waveform_name is None:
+            waveform_config = list(self.io("stimulus")._config["waveforms"].values())[0]
+        else:
+            waveform_config = self.io("stimulus")._config["waveforms"][self.stimulus_waveform_name]
+        
+        waveform_scale = waveform_config["scale"] if "scale" in waveform_config else 1.0
+        total_scale = completed_iterations / waveform_scale 
+        self.data_complex = WaveformMemory.sample_to_complex(self.data_summed, scale=total_scale)
         self.data_mags = np.abs(self.data_complex)
         self.data_phases = np.angle(self.data_complex)
 

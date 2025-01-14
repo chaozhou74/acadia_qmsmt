@@ -32,14 +32,14 @@ class ReadoutTestRuntime_test(Runtime):
         capture_delay = self.capture_delay
 
         # Create the waveforms that we'll need 
-        stimulus_waveform = acadia.create_waveform(stimulus_channel, **self.stimulus["waveform"])
-        capture_waveform = acadia.create_waveform(capture_channel, **self.capture["waveform"]) 
+        stimulus_waveform = acadia.create_waveform_memory(stimulus_channel, **self.stimulus["waveform"])
+        capture_waveform = acadia.create_waveform_memory(capture_channel, **self.capture["waveform"]) 
         
         # Create blank waveform for delay between capture and stimulus
         if capture_delay < 0: # capture will be advanced by -capture_delay compare to stimulus
-            blank_wf = acadia.create_waveform(stimulus_channel, length=-capture_delay, blank=True)
+            blank_wf = acadia.create_waveform_memory(stimulus_channel, length=-capture_delay, blank=True)
         elif capture_delay > 0: # capture will be delayed by capture_delay compare to stimulus
-            blank_wf = acadia.create_waveform(capture_channel, length=capture_delay, blank=True,
+            blank_wf = acadia.create_waveform_memory(capture_channel, length=capture_delay, blank=True,
                                               decimation=self.capture["waveform"]["decimation"], 
                                               region=self.capture["waveform"]["region"])
 
