@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia.utils import clock_monotonic_ns
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 class ReadoutCalibrationRuntime(QMsmtRuntime):
@@ -239,9 +240,6 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         self.iterations_previous = 0
         self.time_axis = None
         
-        # we'll fit gmms for each setting of frequency and amplitude
-        self.gmms = np.empty((len(self.readout_frequencies), len(self.readout_amplitudes)), dtype=object)
-
         # we need to hold onto the plot objects so that we can clear them each time we update the plot
         self.cluster_circles = [] 
         self.histogram_plot = None
@@ -250,8 +248,8 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         # along with the GMM fit parameters, we'll store the cluster properties
         # This is really only needed for separating traces by sequence, but will
         # also be good for plotting so that we can show the cluster selection circles
-        self.cluster_centers = np.empty((len(self.readout_frequencies), len(self.readout_amplitudes), self.num_clusters, 2), dtype=np.float64)
-        self.cluster_radii = np.empty((len(self.readout_frequencies), len(self.readout_amplitudes), self.num_clusters), dtype=np.float64)
+        self.cluster_centers = np.empty((self.num_clusters, 2), dtype=np.float64)
+        self.cluster_radii = np.empty((self.num_clusters), dtype=np.float64)
         
         # Because different numbers of traces will be in different clusters, 
         # we need to make a ragged array
@@ -259,9 +257,9 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         # each integer is a row index after selecting the traces for a given 
         # frequency and amplitude and reshaping the resulting array to have shape 
         # (completed_iterations*num_clusters, samples_per_trace, 2)
-        self.cluster_trace_indices = np.empty((len(self.readout_frequencies), len(self.readout_amplitudes), self.num_clusters), dtype=object)
-        for idx_f, idx_a, idx_p in product(range(len(self.readout_frequencies)), range(len(self.readout_amplitudes)), range(self.num_clusters)):
-            self.cluster_trace_indices[idx_f, idx_a, idx_p] = []
+        self.cluster_trace_indices = np.empty(self.num_clusters, dtype=object)
+        for idx_p in range(self.num_clusters):
+            self.cluster_trace_indices[idx_p] = []
 
         self.average_traces = None
 
@@ -279,9 +277,6 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         # Only continue processing data if we have at least one complete iteration
         if completed_iterations > 1:
             self.update_plot(lock=False) # The lock is already acquired by the event loop         
-            
-            if completed_iterations % 200 == 0:
-                self.data.save(self.local_directory)
 
         self.iterations_previous = completed_iterations
 
@@ -291,8 +286,12 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         # if self.plot:
         #     self.savefig(self.fig, close_canvas=False)
 
-    def process_data(self):
+    def process_data(self, idx_f: int, idx_a: int):
         from sklearn.mixture import GaussianMixture
+        import logging
+        logger = logging.getLogger("acadia")
+
+        tstart = clock_monotonic_ns()
         
         records_per_iteration = self.num_clusters*len(self.readout_amplitudes)*len(self.readout_frequencies)
         completed_iterations = len(self.data["traces"]) // records_per_iteration
@@ -302,101 +301,132 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         # Get the collection of data and reshape it so that the axes index as: 
         # (iteration, frequency, amplitude, sequence, sample time, sample quadrature)
         samples_per_trace = data.shape[-2]
-        self.data_reshaped = data.reshape(-1, len(self.readout_frequencies), len(self.readout_amplitudes), self.num_clusters, samples_per_trace, 2)
+        data_reshaped = data.reshape(completed_iterations, len(self.readout_frequencies), len(self.readout_amplitudes), self.num_clusters, samples_per_trace, 2)
+        self.data_traces = data_reshaped[:, idx_f, idx_a, :, :, :]
 
         # Sum over the trace length to get an integrated point
         # Don't sum over iterations
-        self.data_iq_points = np.sum(self.data_reshaped, axis=4, keepdims=False)
+        tstart_iq = clock_monotonic_ns()
+        self.data_iq_points = np.sum(self.data_traces, axis=2, keepdims=False)
+        tfinish_iq = clock_monotonic_ns()
 
-        # Identify clusters by fitting to gaussian mixture model
-        for idx_f, idx_a in product(range(len(self.readout_frequencies)), range(len(self.readout_amplitudes))):
-            # First, slice the data to make life easier later
-            data_iq_points_fa = self.data_iq_points[:, idx_f, idx_a, :, :] # (iterations, self.num_clusters, 2)
-            traces_fa = self.data_reshaped[:, idx_f, idx_a, :, :, :] # (iterations, self.num_clusters, samples_per_trace, 2)
+        gmm_fit_time = 0
+        gmm_predict_time = 0
+        trace_indices_time = 0
+        trace_average_time = 0
+        bincount_time = 0
 
-            # Fit all the data to a GMM
-            gmm = GaussianMixture(n_components=self.num_clusters, covariance_type="spherical")
-            gmm.fit(data_iq_points_fa.reshape(-1,2).astype("<f8"))
-            self.gmms[idx_f, idx_a] = gmm
+        # Fit all the data to a GMM
+        t1 = clock_monotonic_ns()
+        gmm = GaussianMixture(n_components=self.num_clusters, covariance_type="spherical")
+        gmm.fit(self.data_iq_points.reshape(-1,2).astype("<f8"))
+        self.gmm = gmm
+        t2 = clock_monotonic_ns()
+        gmm_fit_time += t2 - t1
 
-            # Now that we have a trained model, go back and predict the class of every 
-            # point, but reshape it so that we can index the predictions by the
-            # sequence that prepared the corresponding IQ point
-            # We only need this so that we can relate the GMM class labels to the 
-            # sequences that prepared them
-            predictions = gmm.predict(data_iq_points_fa.reshape(-1,2)).reshape(-1, self.num_clusters)
+        # Now that we have a trained model, go back and predict the class of every 
+        # point, but reshape it so that we can index the predictions by the
+        # sequence that prepared the corresponding IQ point
+        # We only need this so that we can relate the GMM class labels to the 
+        # sequences that prepared them
+        t1 = clock_monotonic_ns()
+        predictions = gmm.predict(self.data_iq_points.reshape(-1,2)).reshape(-1, self.num_clusters)
+        t2 = clock_monotonic_ns()
+        gmm_predict_time += t2 - t1
 
-            # Now that we've done the fit, because the GMM randomly assigns
-            # labels to the output classes, we need to figure out which class
-            # corresponds to each sequence
-            # For each sequence, find the most populated cluster that 
-            # hasn't already been identified 
-            # Repeat for all sequences (there are always an equal number of 
-            # sequences as clusters, so this will fully match everything)
-            sequence_to_gmm_class = np.zeros(self.num_clusters, dtype=np.int32)
-            gmm_class_to_sequence = np.zeros(self.num_clusters, dtype=np.int32)
+        # Now that we've done the fit, because the GMM randomly assigns
+        # labels to the output classes, we need to figure out which class
+        # corresponds to each sequence
+        # For each sequence, find the most populated cluster that 
+        # hasn't already been identified 
+        # Repeat for all sequences (there are always an equal number of 
+        # sequences as clusters, so this will fully match everything)
+        t1 = clock_monotonic_ns()
+        sequence_to_gmm_class = np.zeros(self.num_clusters, dtype=np.int32)
+        gmm_class_to_sequence = np.zeros(self.num_clusters, dtype=np.int32)
+        
+        for idx_p in range(self.num_clusters):
+            # np.bincount returns an array where the value at index i is 
+            # the number of times that i appears in the input array
+            # therefore, if we pass in the array of predictions, 
+            # the indices of bincount correspond to cluster indices
+            # and the value at a index j tells us how many points are in
+            # cluster j
+            bincount = np.bincount(predictions[:,idx_p], minlength=self.num_clusters)
+            
 
-            for idx_p in range(self.num_clusters):
-                # np.bincount returns an array where the value at index i is 
-                # the number of times that i appears in the input array
-                # therefore, if we pass in the array of predictions, 
-                # the indices of bincount correspond to cluster indices
-                # and the value at a index j tells us how many points are in
-                # cluster j
-                bincount = np.bincount(predictions[:,idx_p], minlength=self.num_clusters)
+            # For all the bins we've already found, mask their bin counts
+            # so that we don't include them when trying to find the most 
+            # populated bin
+            bincount[sequence_to_gmm_class[:idx_p]] = -1
 
-                # For all the bins we've already found, mask their bin counts
-                # so that we don't include them when trying to find the most 
-                # populated bin
-                bincount[sequence_to_gmm_class[:idx_p]] = -1
+            most_populated_cluster = np.argmax(bincount)
+            sequence_to_gmm_class[idx_p] = most_populated_cluster
+            gmm_class_to_sequence[most_populated_cluster] = idx_p
 
-                most_populated_cluster = np.argmax(bincount)
-                sequence_to_gmm_class[idx_p] = most_populated_cluster
-                gmm_class_to_sequence[most_populated_cluster] = idx_p
+        t2 = clock_monotonic_ns()
+        bincount_time += t2 - t1
 
-            # Determine the locations and sizes of the inclusion zones for each cluster
-            for idx_p in range(self.num_clusters):
-                settings = self.circle_settings[idx_p]
-                gmm_class = sequence_to_gmm_class[idx_p]
-                cluster_radius = settings["radius"].value*np.sqrt(gmm.covariances_[gmm_class])
-                cluster_center = gmm.means_[gmm_class,:] + np.array([settings["I_offset"].value, settings["Q_offset"].value])
-                self.cluster_centers[idx_f, idx_a, idx_p, :] = cluster_center
-                self.cluster_radii[idx_f, idx_a, idx_p] = cluster_radius
+        # Determine the locations and sizes of the inclusion zones for each cluster
+        for idx_p in range(self.num_clusters):
+            settings = self.circle_settings[idx_p]
+            gmm_class = sequence_to_gmm_class[idx_p]
+            cluster_radius = settings["radius"].value*np.sqrt(gmm.covariances_[gmm_class])
+            cluster_center = gmm.means_[gmm_class,:] + np.array([settings["I_offset"].value, settings["Q_offset"].value])
+            self.cluster_centers[idx_p, :] = cluster_center
+            self.cluster_radii[idx_p] = cluster_radius
 
-            # Find all the traces in the inclusion zone for each cluster
-            # Use the predicted class for each IQ point, and if the point 
-            # falls in the corresponding inclusion zone, associate it with
-            # the sequence that created that class
-            # Although we have to iterate over sequences/clusters, we don't actually
-            # care which sequence the point came from, since we use the prediction
-            # to associate it with a cluster
-            for idx_p in range(self.num_clusters):
-                self.cluster_trace_indices[idx_f, idx_a, idx_p].clear()
+        # Find all the traces in the inclusion zone for each cluster
+        # Use the predicted class for each IQ point, and if the point 
+        # falls in the corresponding inclusion zone, associate it with
+        # the sequence that created that class
+        # Although we have to iterate over sequences/clusters, we don't actually
+        # care which sequence the point came from, since we use the prediction
+        # to associate it with a cluster
+        t1 = clock_monotonic_ns()
+        for idx_p in range(self.num_clusters):
+            self.cluster_trace_indices[idx_p].clear()
 
-            for iteration,idx_p in product(range(completed_iterations), range(self.num_clusters)):
-                predicted_sequence = gmm_class_to_sequence[predictions[iteration,idx_p]]
-                point = self.data_iq_points[iteration, idx_f, idx_a, idx_p, :]
-                trace = self.data_reshaped[iteration, idx_f, idx_a, idx_p, :, :]
-                cluster_center = self.cluster_centers[idx_f, idx_a, predicted_sequence, :]
-                cluster_radius = self.cluster_radii[idx_f, idx_a, predicted_sequence]
-                point_distance = np.sqrt(np.sum((cluster_center - point)**2))
-                if point_distance < cluster_radius:
-                    # Add the indices to the corresponding array
-                    self.cluster_trace_indices[idx_f, idx_a, predicted_sequence].append(iteration*self.num_clusters + idx_p)
+        for iteration,idx_p in product(range(completed_iterations), range(self.num_clusters)):
+            predicted_sequence = gmm_class_to_sequence[predictions[iteration,idx_p]]
+            point = self.data_iq_points[iteration, idx_p, :]
+            cluster_center = self.cluster_centers[predicted_sequence, :]
+            cluster_radius = self.cluster_radii[predicted_sequence]
+            point_distance = np.sqrt(np.sum((cluster_center - point)**2))
+            if point_distance < cluster_radius:
+                # Add the indices to the corresponding array
+                self.cluster_trace_indices[predicted_sequence].append(iteration*self.num_clusters + idx_p)
+        t2 = clock_monotonic_ns()
+        trace_indices_time += t2 - t1
 
-            # Now that we have all the traces that integrate into a given cluster, 
-            # compute and save the average traces for each cluster
-            # We want this both for plotting and for computing the matched filter
-            if self.average_traces is None:
-                self.average_traces = np.empty((len(self.readout_frequencies), len(self.readout_amplitudes), self.num_clusters, samples_per_trace, 2), dtype=np.float64)
+        # Now that we have all the traces that integrate into a given cluster, 
+        # compute and save the average traces for each cluster
+        # We want this both for plotting and for computing the matched filter
+        if self.average_traces is None:
+            self.average_traces = np.empty((self.num_clusters, samples_per_trace, 2), dtype=np.float64)
 
-            traces_all = self.data_reshaped[:, idx_f, idx_a, :, :, :].reshape(completed_iterations*self.num_clusters, samples_per_trace, 2)
-            for idx_p in range(self.num_clusters):
-                trace_indices = np.array(self.cluster_trace_indices[idx_f, idx_a, idx_p], dtype=np.uint64)
-                if len(trace_indices) > 0:
-                    np.mean(traces_all[trace_indices, :, :], axis=0, out=self.average_traces[idx_f, idx_a, idx_p, :, :])
+        t1 = clock_monotonic_ns()
+        traces_all = self.data_traces.reshape(completed_iterations*self.num_clusters, samples_per_trace, 2)
+        for idx_p in range(self.num_clusters):
+            trace_indices = np.array(self.cluster_trace_indices[idx_p], dtype=np.uint64)
+            if len(trace_indices) > 0:
+                np.mean(traces_all[trace_indices, :, :], axis=0, out=self.average_traces[idx_p, :, :])
+        t2 = clock_monotonic_ns()
+        trace_average_time += t2 - t1        
+
+        tfinish = clock_monotonic_ns()
+
+        total_time = tfinish-tstart
+        iq_time = tfinish_iq-tstart_iq
+        logger.info(f"With {completed_iterations} iterations, processing took {total_time*1e-6} ms."
+            f" This is comprised of: integrating traces ({iq_time*1e-6} ms, {round(100 * iq_time / total_time,2)}%),"
+            f" fitting a GMM ({gmm_fit_time*1e-6} ms, {round(100 * gmm_fit_time / total_time,2)}%),"
+            f" classifying the IQ data with the GMM ({gmm_predict_time*1e-6} ms, {round(100 * gmm_predict_time / total_time,2)}%),"
+            f" matching clusters to sequences ({bincount_time*1e-6} ms, {round(100 * bincount_time / total_time,2)}%),"
+            f" binning traces into clusters ({trace_indices_time*1e-6} ms, {round(100 * trace_indices_time / total_time,2)}%),"
+            f" and averaging binned traces ({trace_average_time*1e-6} ms, {round(100 * trace_average_time / total_time,2)}%).")
+        
                         
-
     def update_plot(self, lock: bool = True, process: bool = True):
         """
         Update the view of the plot. We can choose to optionally acquire the update 
@@ -404,19 +434,15 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         runtime event loop
         """
         if self.plot:
-            if lock and not self._update_lock.acquire(timeout=5):
-                raise ValueError("Failed to acquire update lock when updating plot")
-
-            if process:
-                self.process_data()
-
             from matplotlib.patches import Circle
             from matplotlib.colors import Normalize, LogNorm
 
+            if lock and not self._update_lock.acquire(timeout=5):
+                raise ValueError("Failed to acquire update lock when updating plot")
+
             # Index the selected data
-            idx_f = self.frequency_dropdown.index
-            idx_a = self.amplitude_dropdown.index 
-            idx_p = self.histogram_view_dropdown.index
+            if process:
+                self.process_data(self.frequency_dropdown.index, self.amplitude_dropdown.index)
 
             # Create the histogram view
             if self.histogram_plot is not None:
@@ -424,14 +450,14 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
             # Given all the points we collected, compute bin edges so that the histogram view 
             # will contain all the points regardless of which sequence we choose to view
-            all_I_values = np.reshape(self.data_iq_points[:, idx_f, idx_a, :, 0], -1)
+            all_I_values = np.reshape(self.data_iq_points[:, :, 0], -1)
             histogram_I_edges = np.histogram_bin_edges(all_I_values, bins=self.histogram_bins_I)
-            all_Q_values = np.reshape(self.data_iq_points[:, idx_f, idx_a, :, 1], -1)
+            all_Q_values = np.reshape(self.data_iq_points[:, :, 1], -1)
             histogram_Q_edges = np.histogram_bin_edges(all_Q_values, bins=self.histogram_bins_Q)
             
             histogram, _, _ = np.histogram2d(
-                self.data_iq_points[:, idx_f, idx_a, idx_p, 0], 
-                self.data_iq_points[:, idx_f, idx_a, idx_p, 1], 
+                self.data_iq_points[:, self.histogram_view_dropdown.index, 0], 
+                self.data_iq_points[:, self.histogram_view_dropdown.index, 1], 
                 bins=[histogram_I_edges, histogram_Q_edges],
                 density=True)
             
@@ -467,8 +493,8 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
                 # Plot the cluster in a circle
                 if self.circle_settings[i]["show"].value:
-                    e = Circle(xy=self.cluster_centers[idx_f, idx_a, i, :], 
-                                radius=self.cluster_radii[idx_f, idx_a, i],
+                    e = Circle(xy=self.cluster_centers[i, :], 
+                                radius=self.cluster_radii[i],
                                 fill=self.histogram_circle_fill, 
                                 facecolor=self.histogram_circle_facecolor,
                                 edgecolor=self.histogram_circle_edgecolor,
@@ -480,7 +506,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
                     # Add text identifying the circle
                     ann = self.ax_histogram.annotate(
-                        xy=self.cluster_centers[idx_f, idx_a, i, :],
+                        xy=self.cluster_centers[i, :],
                         text=f"{i}",
                         weight="bold", 
                         color="green", 
@@ -491,7 +517,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                     self.cluster_circles.append(ann)
                 
             # Update the average traces
-            samples_per_trace = self.data_reshaped.shape[4]
+            samples_per_trace = self.data_traces.shape[2]
             if self.time_axis is None:
                 self.time_axis = np.linspace(
                     start=0, 
@@ -499,13 +525,13 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                     num=samples_per_trace, 
                     endpoint=False)
 
-            traces_all = self.data_reshaped[:, idx_f, idx_a, :, :, :].reshape(-1, samples_per_trace, 2)
+            traces_all = self.data_traces.reshape(-1, samples_per_trace, 2)
             for idx_p in range(self.num_clusters):
-                trace_indices = np.array(self.cluster_trace_indices[idx_f, idx_a, idx_p], dtype=np.uint64)
+                trace_indices = np.array(self.cluster_trace_indices[idx_p], dtype=np.uint64)
                 self.circle_settings[idx_p]["label"].value = f"<b>Cluster {idx_p}</b> (n = {len(trace_indices)}/{self.data_iq_points.shape[0]*self.num_clusters})"
                 if len(trace_indices) > 0:
-                    self.lines_re[idx_p].update(self.time_axis, self.average_traces[idx_f, idx_a, idx_p, :, 0], rescale_axis=False)
-                    self.lines_im[idx_p].update(self.time_axis, self.average_traces[idx_f, idx_a, idx_p, :, 1], rescale_axis=False)
+                    self.lines_re[idx_p].update(self.time_axis, self.average_traces[idx_p, :, 0], rescale_axis=False)
+                    self.lines_im[idx_p].update(self.time_axis, self.average_traces[idx_p, :, 1], rescale_axis=False)
                     self.ax_traces[idx_p].relim()
                     self.ax_traces[idx_p].autoscale(tight=True)
 
@@ -515,8 +541,6 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                 self._update_lock.release()
 
     def save_matched_filter(self, 
-                            idx_frequency: int = None, 
-                            idx_amplitude: int = None, 
                             idx_trace1: int = None, 
                             idx_trace2: int = None, 
                             name: str = None,
@@ -527,24 +551,18 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
         if lock and not self._update_lock.acquire(timeout=5):
             raise ValueError("Failed to acquire update lock when saving matched filter")
-
-        if idx_frequency is None:
-            idx_frequency = self.frequency_dropdown.index
-
-        if idx_amplitude is None:
-            idx_amplitude = self.amplitude_dropdown.index
         
         if idx_trace1 is None:
             idx_trace1 = self.matched_filter_trace1_dropdown.value
 
         if idx_trace2 is None:
-            trace2 = self.matched_filter_trace2_dropdown.value
+            idx_trace2 = self.matched_filter_trace2_dropdown.value
 
         if name is None:
             name = self.matched_filter_name_input.value
 
         # View the trace data as complex 
-        traces_complex = self.average_traces[idx_frequency, idx_amplitude, :, :, :].view(np.complex128)
+        traces_complex = self.average_traces.view(np.complex128).reshape(self.num_clusters, self.average_traces.shape[1])
 
         # Subtract the average traces and normalize the kernel
         # We want to normalize it by its maximum magnitude
@@ -557,7 +575,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         transformed_iq1 = np.dot(kernel_trace, traces_complex[idx_trace1, :])
         transformed_iq2 = np.dot(kernel_trace, traces_complex[idx_trace2, :])
         center = (transformed_iq1 + transformed_iq2) / 2.0
-        center_rounded = (int(round(center.real)), int(round(center.imag)))
+        offset = (-int(round(center.real)), -int(round(center.imag)))
 
         # Save into a numpy file and update the configuration
         filename = f"{name}_{os.path.basename(self.local_directory)}.npy"
@@ -569,15 +587,13 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         from acadia_qmsmt.helpers.yaml_editor import update_yaml
         window_info = {"data": filename, 
                         "stimulus_waveform_name": self.readout_stimulus_waveform_name,
-                        "offset": center_rounded}
+                        "offset": offset}
         self.update_ioconfig("readout_capture", f"windows.{name}", window_info)
 
         if lock:
             self._update_lock.release()
 
     def save_gmm(self, 
-                idx_frequency: int = None, 
-                idx_amplitude: int = None, 
                 name: int = None,
                 lock: bool = True):
         """
@@ -586,20 +602,12 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         if lock and not self._update_lock.acquire(timeout=5):
             raise ValueError("Failed to acquire update lock when saving GMM")
 
-        if idx_frequency is None:
-            idx_frequency = self.frequency_dropdown.index
-
-        if idx_amplitude is None:
-            idx_amplitude = self.amplitude_dropdown.index
-
         if name is None:
             name = self.gmm_name_input.value
 
         filename = f"{name}_{os.path.basename(self.local_directory)}.npz"
         if isinstance(self.readout_capture, str):
             filename = f"{self.readout_capture}_{filename}"
-
-        gmm = self.gmms[idx_frequency, idx_amplitude]
 
         if lock:
             self._update_lock.release()
