@@ -143,7 +143,7 @@ class KernelGeneratorBase:
             kernel_name = key_path + datetime.now().strftime("_%y%m%d_%H%M%S")
         kernel_path = self.save_kernel(kernel_dir, kernel_name)
         update_dict = {key_path: kernel_path}
-        update_yaml(yaml_file, update_dict, keep_format=False, verbose=True)
+        update_yaml(yaml_file, update_dict, keep_dtype=False, verbose=True)
 
     def plot_kernel_generation(self, log_scale=False):
         """
@@ -309,7 +309,7 @@ class KernelFromGETraces(KernelGeneratorBase):
         :return:
         """
         update_dict = {offset_key_path: self.cmacc_offset, quadrant_key_path: [*self.state_quadrants]}
-        update_yaml(yaml_file, update_dict, keep_format=False, verbose=True)
+        update_yaml(yaml_file, update_dict, keep_dtype=False, verbose=True)
 
 
 def load_kernel(kernel_path):
