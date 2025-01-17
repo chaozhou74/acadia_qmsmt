@@ -4,6 +4,7 @@ import os
 from typing import Callable, Literal, Dict, List, Any, Union
 from copy import copy
 
+import numpy as np
 from numpy.typing import NDArray
 
 from acadia import Acadia, Channel, Runtime, ChannelWaveformMemory, WaveformMemory, Operation
@@ -397,7 +398,7 @@ class MeasurableResonator:
 
             # Because the offset is just a number (and not a thing that needs
             # to be allocated), we can just get it from the config every time
-            cmacc_offset = self._capture._config["windows"][window_name].get("offset", 0)
+            cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
         else:
             # Allocate the memory anew 
             # We'll interpret the type of the argument slightly differently 
@@ -409,7 +410,7 @@ class MeasurableResonator:
             window_config = self._capture._config["windows"][window_name]["data"]
             kernel_arg = None if isinstance(window_config, float) else window_config
             window_cache_key = window_name
-            cmacc_offset = self._capture._config["windows"][window_name].get("offset", 0)
+            cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
 
         # If we've used this measurement before, retrieve the stream, otherwise create a new one
         src_arg = self._capture._channel if self._stream is None else self._stream
@@ -430,7 +431,10 @@ class MeasurableResonator:
         self._stream = stream
         self._windows[window_cache_key] = window_mem
 
-        self._capture._acadia.cmacc_load(stream, cmacc_offset)
+        # Convert the offset appropriately so that negative numbers are 
+        # accepted (constants in the compiler must be unsigned)
+        offset_converted = [int(np.int32(q).astype(np.uint32)) for q in cmacc_offset]
+        self._capture._acadia.cmacc_load(stream, offset_converted)
 
     def measure(self, 
                 stimulus_waveform_memory_name: str = None, 

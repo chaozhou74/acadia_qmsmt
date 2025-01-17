@@ -168,6 +168,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
             self.amplitude_dropdown = Dropdown(options=self.readout_amplitudes, description="Amplitude:", layout=Layout(max_width="95%"), style={"description_width": "initial"})
             self.histogram_view_dropdown = Dropdown(options=list(range(self.num_clusters)), description="View sequence:", layout=Layout(max_width="95%"), style={"description_width": "initial"})
             self.histogram_scale_dropdown = Dropdown(options=["linear", "log"], description="Scale:", layout=Layout(max_width="95%"), style={"description_width": "initial"})
+            self.rescale_axes_checkbox = Checkbox(value=True, description="Rescale histogram axes upon update", layout=Layout(max_width="95%"), style={"description_width": "initial"})
             refresh_button = Button(description="Refresh Plots", layout=Layout(align_self="center"))
             refresh_button.on_click(lambda change: self.update_plot())
 
@@ -178,12 +179,14 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                 self.amplitude_dropdown, 
                 self.histogram_view_dropdown, 
                 self.histogram_scale_dropdown,
+                self.rescale_axes_checkbox,
                 refresh_button], layout=global_view_settings_layout)
             
             # Settings for filter calculation
             self.matched_filter_trace1_dropdown = Dropdown(value=0, options=list(range(self.num_clusters)), description="Cluster 1:", layout=Layout(max_width="95%"), style={"description_width": "initial"})
             self.matched_filter_trace2_dropdown = Dropdown(value=1, options=list(range(self.num_clusters)), description="Cluster 2:", layout=Layout(max_width="95%"), style={"description_width": "initial"})
             self.matched_filter_name_input = Text(description="Name:", value="matched", layout=Layout(max_width="95%"), style={"description_width": "initial"})
+            self.matched_filter_scale_input = FloatText(description="Scale:", value=1, layout=Layout(max_width="95%"), style={"description_width": "initial"})
             self.matched_filter_save_button = Button(description="Save", layout=Layout(max_width="30%", align_self="center"))
             self.matched_filter_save_button.on_click(lambda args: self.save_matched_filter())
             matched_filter_layout = Layout(display="flex", flex_flow="column", align_items="stretch")
@@ -191,21 +194,22 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                 Label(value="Matched linear filter", layout=Layout(max_width="95%", align_self="center"), style={"description_width": "initial"}),
                 self.matched_filter_trace1_dropdown,
                 self.matched_filter_trace2_dropdown,
+                self.matched_filter_scale_input,
                 self.matched_filter_name_input, 
                 self.matched_filter_save_button], layout=matched_filter_layout)
             
             # Settings for GMM training
-            self.gmm_name_input = Text(description="Name:", value="gmm", layout=Layout(max_width="95%"), style={"description_width": "initial"})
-            self.gmm_save_button = Button(description="Save", layout=Layout(max_width="30%", align_self="center"))
-            self.gmm_save_button.on_click(lambda args: self.save_gmm())
-            gmm_layout = Layout(display="flex", flex_flow="column", align_items="stretch")
-            gmm_box = Box(children=[
-                Label(value="Gaussian mixture model", layout=Layout(max_width="95%", align_self="center"), style={"description_width": "initial"}),
-                self.gmm_name_input, 
-                self.gmm_save_button], layout=gmm_layout)
+            # self.gmm_name_input = Text(description="Name:", value="gmm", layout=Layout(max_width="95%"), style={"description_width": "initial"})
+            # self.gmm_save_button = Button(description="Save", layout=Layout(max_width="30%", align_self="center"))
+            # self.gmm_save_button.on_click(lambda args: self.save_gmm())
+            # gmm_layout = Layout(display="flex", flex_flow="column", align_items="stretch")
+            # gmm_box = Box(children=[
+            #     Label(value="Gaussian mixture model", layout=Layout(max_width="95%", align_self="center"), style={"description_width": "initial"}),
+            #     self.gmm_name_input, 
+            #     self.gmm_save_button], layout=gmm_layout)
 
             classifier_box_layout = Layout(display="flex", flex_flow="column", max_width=f"25%", align_items="stretch", border="solid")
-            classifier_box = Box(children=[HTML(value="<b>Classifier training</b>", layout=Layout(align_self="center")), matched_filter_box, gmm_box], layout=classifier_box_layout)
+            classifier_box = Box(children=[HTML(value="<b>Classifier training</b>", layout=Layout(align_self="center")), matched_filter_box], layout=classifier_box_layout)
 
             # Settings for fits
             self.circle_settings = []
@@ -408,9 +412,9 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         t1 = clock_monotonic_ns()
         traces_all = self.data_traces.reshape(completed_iterations*self.num_clusters, samples_per_trace, 2)
         for idx_p in range(self.num_clusters):
-            trace_indices = np.array(self.cluster_trace_indices[idx_p], dtype=np.uint64)
-            if len(trace_indices) > 0:
-                np.mean(traces_all[trace_indices, :, :], axis=0, out=self.average_traces[idx_p, :, :])
+            if len(self.cluster_trace_indices[idx_p]) > 0:
+                trace_indices = np.array(self.cluster_trace_indices[idx_p], dtype=np.uint64)
+                self.average_traces[idx_p, :, :] = np.mean(traces_all[trace_indices, :, :], axis=0)
         t2 = clock_monotonic_ns()
         trace_average_time += t2 - t1        
 
@@ -446,7 +450,12 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
             # Create the histogram view
             if self.histogram_plot is not None:
+                previous_xlim = self.ax_histogram.get_xlim()
+                previous_ylim = self.ax_histogram.get_ylim()
                 self.histogram_plot.remove()
+            else:
+                previous_xlim = None
+                previous_ylim = None
 
             # Given all the points we collected, compute bin edges so that the histogram view 
             # will contain all the points regardless of which sequence we choose to view
@@ -475,8 +484,13 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                 histogram.T,
                 cmap=self.histogram_colormap,
                 norm=norm)
-            self.ax_histogram.set_xlim(histogram_I_edges[0], histogram_I_edges[-1])
-            self.ax_histogram.set_ylim(histogram_Q_edges[0], histogram_Q_edges[-1])
+
+            if self.rescale_axes_checkbox.value:
+                self.ax_histogram.set_xlim(histogram_I_edges[0], histogram_I_edges[-1])
+                self.ax_histogram.set_ylim(histogram_Q_edges[0], histogram_Q_edges[-1])
+            elif previous_xlim is not None:
+                self.ax_histogram.set_xlim(previous_xlim)
+                self.ax_histogram.set_ylim(previous_ylim)
 
             # Add circles for the GMM clusters
             for e in self.cluster_circles:
@@ -527,9 +541,9 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
             traces_all = self.data_traces.reshape(-1, samples_per_trace, 2)
             for idx_p in range(self.num_clusters):
-                trace_indices = np.array(self.cluster_trace_indices[idx_p], dtype=np.uint64)
-                self.circle_settings[idx_p]["label"].value = f"<b>Cluster {idx_p}</b> (n = {len(trace_indices)}/{self.data_iq_points.shape[0]*self.num_clusters})"
-                if len(trace_indices) > 0:
+                num_traces = len(self.cluster_trace_indices[idx_p])
+                self.circle_settings[idx_p]["label"].value = f"<b>Cluster {idx_p}</b> (n = {num_traces}/{self.data_iq_points.shape[0]*self.num_clusters})"
+                if num_traces > 0:
                     self.lines_re[idx_p].update(self.time_axis, self.average_traces[idx_p, :, 0], rescale_axis=False)
                     self.lines_im[idx_p].update(self.time_axis, self.average_traces[idx_p, :, 1], rescale_axis=False)
                     self.ax_traces[idx_p].relim()
@@ -543,6 +557,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
     def save_matched_filter(self, 
                             idx_trace1: int = None, 
                             idx_trace2: int = None, 
+                            scale: float = None,
                             name: str = None,
                             lock: bool = True):
         """
@@ -558,6 +573,9 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         if idx_trace2 is None:
             idx_trace2 = self.matched_filter_trace2_dropdown.value
 
+        if scale is None:
+            scale = self.matched_filter_scale_input.value
+
         if name is None:
             name = self.matched_filter_name_input.value
 
@@ -569,13 +587,13 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
         # TODO: take into account the scale of the boxcar used to collect the data
         #       for now we can ignore this because this will be a very small error compared to the noise
         kernel_trace = np.conjugate(traces_complex[idx_trace1, :] - traces_complex[idx_trace2, :])
-        kernel_trace *= 0.9999 / np.max(np.abs(kernel_trace), keepdims=False)
+        kernel_trace *= scale*0.9999 / np.max(np.abs(kernel_trace), keepdims=False)
         
         # Find the offset after transforming
-        transformed_iq1 = np.dot(kernel_trace, traces_complex[idx_trace1, :])
-        transformed_iq2 = np.dot(kernel_trace, traces_complex[idx_trace2, :])
-        center = (transformed_iq1 + transformed_iq2) / 2.0
-        offset = (-int(round(center.real)), -int(round(center.imag)))
+        self.transformed_iq1 = np.dot(kernel_trace, traces_complex[idx_trace1, :])
+        self.transformed_iq2 = np.dot(kernel_trace, traces_complex[idx_trace2, :])
+        center = (self.transformed_iq1 + self.transformed_iq2) / 2.0
+        offset = (int(round(center.real)), int(round(center.imag)))
 
         # Save into a numpy file and update the configuration
         filename = f"{name}_{os.path.basename(self.local_directory)}.npy"

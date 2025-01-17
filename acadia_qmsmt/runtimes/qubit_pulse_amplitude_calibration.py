@@ -1,0 +1,197 @@
+from typing import Union
+
+import numpy as np
+from numpy.typing import NDArray
+from scipy.optimize import curve_fit
+
+from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
+
+class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
+    """
+    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.
+    """
+    qubit_stimulus: IOConfig
+    readout_stimulus: IOConfig
+    readout_capture: IOConfig
+
+    qubit_amplitudes: Union[list, np.ndarray]
+    iterations: int
+
+    qubit_pulse_name: str = None
+    readout_window_name: str = None
+    readout_stimulus_waveform_name: str = None
+    plot: bool = True
+    figsize: tuple[int] = None
+
+    def main(self):
+        import logging
+        logger = logging.getLogger("acadia")
+
+        qubit_stimulus_io = self.io("qubit_stimulus")
+        readout_stimulus_io = self.io("readout_stimulus")
+        readout_capture_io = self.io("readout_capture")
+
+        readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
+        qubit = Qubit(qubit_stimulus_io)
+
+        self.data.add_group(f"points", uniform=True)
+
+        def sequence(a: Acadia):
+            readout_resonator.prepare_cmacc(self.readout_window_name)
+
+            with a.channel_synchronizer():
+                a.schedule_waveform(saturation_waveform)
+                a.barrier()
+                readout_resonator.measure("readout", "readout_accumulated")
+
+        self.acadia.compile(sequence)
+        self.acadia.attach()
+        self.configure_channels()
+        self.acadia.assemble()
+        self.acadia.load()
+
+        readout_resonator.load_windows()
+        readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
+        pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)
+
+        for i in range(self.iterations):
+            for amplitude in self.qubit_amplitudes:
+                qubit_stimulus_io.load_waveform()
+
+                # capture data and put in the corresponding group
+                self.acadia.run()
+
+                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
+                self.data[f"iq_pts"].write(wf.array)
+
+            if self.data.serve() == DataManager.serve_hangup():
+                self.data.disconnect()
+                return
+
+        self.final_serve()
+
+    def initialize(self):
+        
+        if self.plot:
+            from acadia.processing import DynamicLine
+            import matplotlib.pyplot as plt
+            from IPython.display import display
+            from ipywidgets import FloatText, HBox, Button
+
+            self.figsize = (4, 3) if self.figsize is None else self.figsize
+            self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
+            self.fig.tight_layout()
+            self.fig.subplots_adjust(left=0.25, bottom=0.25)
+
+            self.line_mag = DynamicLine(ax, ".-", label="Mag", color="blue")
+            ax.set_xlabel("Qubit Frequency [Hz]")
+            ax.set_ylabel("Magnitude [arb.]", color="blue")
+            ax.tick_params(axis='y', labelcolor="blue")
+            ax.grid()
+
+            ax_phase = ax.twinx()
+            self.line_phase = DynamicLine(ax_phase, ".-", label="Phase", color="red")
+            ax_phase.set_ylabel("Phase [rad.]", color="red")
+            ax_phase.tick_params(axis='y', labelcolor="red")
+
+            from tqdm.notebook import tqdm
+
+        else:
+            from tqdm import tqdm
+
+        self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
+        self.iterations_previous = 0
+        self.frequencies_progress_bar = tqdm(desc="Frequency Sweep Points", dynamic_ncols=True, total=len(self.qubit_frequencies)*self.iterations)
+        self.frequencies_previous = 0
+
+        self.data_summed = None
+        self.data_complex = None
+        self.data_mags = None
+        self.data_phases =  None
+
+    def update(self):
+        # First make sure that we actually have new data to process
+        if "iq_pts" not in self.data or len(self.data["iq_pts"]) < len(self.qubit_frequencies):
+            return
+
+        # Update the progress bar based on the number of iterations
+        completed_iterations = len(self.data["iq_pts"]) // len(self.qubit_frequencies)
+        self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
+
+        completed_frequencies = len(self.data["iq_pts"])
+        self.frequencies_progress_bar.update(completed_frequencies - self.frequencies_previous)
+
+        # Only continue processing data if we have at least one complete iteration
+        if completed_iterations != 0:
+            self.process_data(completed_iterations)
+            self.update_plot()               
+            self.data.save(self.local_directory)
+
+        self.iterations_previous = completed_iterations
+        self.frequencies_previous = completed_frequencies
+
+    def finalize(self):
+        super().finalize()
+        self.iterations_progress_bar.close()
+        self.frequencies_progress_bar.close()
+        if self.plot:
+            self.savefig(self.fig)
+        self.fit_lorentzian()
+
+    def process_data(self, completed_iterations):
+        valid_traces = completed_iterations*len(self.qubit_frequencies)
+        data = self.data["iq_pts"].records()[:valid_traces, ...]
+
+        # Get the collection of data and reshape it so that the axes index as: 
+        # (iteration, frequency, sample time, sample quadrature)
+        samples_per_trace = data.shape[-2]
+        data_reshaped = data.reshape(-1, len(self.qubit_frequencies), samples_per_trace, 2)
+        
+        # Slice the data so that we have an array containing only the traces
+        # we didn't have the last time update() was called
+        self.new_data = data_reshaped[self.iterations_previous:, :, :, :]
+
+        # Sum the new data and then add it to the aggregated array of trace data
+        new_data_summed = np.sum(self.new_data, axis=(0,2), keepdims=False)
+        if self.data_summed is None:
+            self.data_summed = new_data_summed
+        else:
+            self.data_summed += new_data_summed
+
+        # Convert the summed sample data to a complex number and choose 
+        # the scale so that we turn the sum into a mean
+        self.data_complex = WaveformMemory.sample_to_complex(self.data_summed, scale=float(completed_iterations))
+        self.data_mags = np.abs(self.data_complex)
+        self.data_phases = np.angle(self.data_complex)
+
+    def update_plot(self):
+        if self.plot:
+            display_phases = np.unwrap(self.data_phases)
+            self.line_mag.update(self.qubit_frequencies, self.data_mags)
+            self.line_phase.update(self.qubit_frequencies, display_phases)
+            self.fig.canvas.draw_idle() 
+
+    def fit_lorentzian(self) -> float:
+        from acadia_qmsmt.analysis import population_in_quadrant
+        from acadia_qmsmt.analysis.fitting import rotate_iq
+        from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
+        from acadia_qmsmt.helpers.plot_utils import add_button
+        from acadia_qmsmt.helpers.yaml_editor import update_yaml
+
+        fit = Lorentzian(self.qubit_frequencies, np.abs(self.data_complex))
+        f0 = fit.ufloat_results["x0"]
+
+        if self.plot:
+            fit_fig, fit_ax = fit.plot()
+            fit_ax.set_xlabel("Qubit Frequency [Hz]")
+            fit_ax.set_ylabel(data_type)
+
+            def _update_freq(event):
+                self.update_ioconfig("stimulus", "channel_config.nco_frequency", np.round(f0.n))
+
+            # add a button for updating the qubit freq in the yaml file
+            self._update_button = add_button(fit_fig, _update_freq, label="Update Frequency")
+
+        return f0
+
