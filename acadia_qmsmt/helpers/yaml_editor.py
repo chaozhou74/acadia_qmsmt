@@ -4,8 +4,13 @@ import re
 from functools import reduce
 from typing import Union, Dict, List, Any
 
-import ruamel.yaml as yaml
 import numpy as np
+import ruamel.yaml as yaml
+from ruamel.yaml.scalarstring import PlainScalarString
+from ruamel.yaml.comments import CommentedMap
+
+FLOAT_PRECISION = 10 # The maximum number of significant digits for float numbers
+
 
 def parse(input: Any) -> Any:
     """
@@ -110,14 +115,14 @@ def to_yaml_friendly(value):
             return value
 
 
-def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=False):
+def update_yaml(yaml_path: str, new_param_dict: dict, keep_dtype=True, verbose=False):
     """
     update a yaml config file with updated parameters, and keep the original format. 
 
     :param yaml_path: path to the yaml file to be updated
     :param new_param_dict: dictionary that contains the updated parameters. For nested parameters, the key needs be the
         key of each layer jointed with '.'
-   :param keep_format: When True, format the new parameters with the dtype of the original ones
+   :param keep_dtype: When True, format the new parameters with the dtype of the original ones
    :param verbose: When True, print details of the update
 
     :Example:
@@ -128,29 +133,42 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
     """
 
     def get_by_path(root, items):
-        """Access a nested object in root by item sequence."""
+        """Access a nested object in root by item sequence"""
         return reduce(operator.getitem, items, root)
 
-    def set_by_path(root, items, value, keep_format):
-        """Set a value in a nested object in root by item sequence."""
-        if keep_format:
-            try:
-                data_type = type(get_by_path(root, items)).__base__
-                new_data = data_type(value)
-            except Exception as e:
-                new_data = value
-        else:
-            new_data = value
-        get_by_path(root, items[:-1])[items[-1]] = new_data
+    def set_by_path(root, items, value):
+        """Set a value in a nested object in root by item sequence"""
+        target = get_by_path(root, items[:-1])
+        original_value = target.get(items[-1]) if keep_dtype and items[-1] in target else None
+        target[items[-1]] = type(original_value)(value) if original_value is not None else value
+
+
+    def float_representer(dumper, data):
+        """Use scientific notation for large and small numbers """
+        if abs(data) > 1e5 or (0 < abs(data) < 1e-4):
+            formatted_float = f"{data:.{FLOAT_PRECISION-1}g}"  
+            # remove leading 0 in exponent
+            formatted_float = re.sub(r"e([+-])0(\d+)", r"e\1\2", formatted_float) 
+        else: 
+            formatted_float = f"{data}"  
+        return dumper.represent_scalar("tag:yaml.org,2002:float", formatted_float)
+
+    def inline_list_representer(dumper, data):
+        """ Keep all lists to be in inline format """
+        return dumper.represent_sequence("tag:yaml.org,2002:seq", data, flow_style=True)
+
 
     config, ind, bsi = yaml.util.load_yaml_guess_indent(open(yaml_path))
 
     for s, val in new_param_dict.items():
-        set_by_path(config, s.split("."), to_yaml_friendly(val), keep_format)
+        set_by_path(config, s.split("."), to_yaml_friendly(val))
 
     new_yaml = yaml.YAML()
-    new_yaml.default_flow_style = None
+    new_yaml.default_flow_style = False
     new_yaml.indent(mapping=ind, sequence=ind, offset=bsi)
+    new_yaml.representer.add_representer(float, float_representer)
+    new_yaml.representer.add_representer(list, inline_list_representer)
+    
 
     with open(yaml_path, 'w') as fp:
         new_yaml.dump(config, fp)
@@ -164,4 +182,4 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_format=True, verbose=
 if __name__ == "__main__":
     temp_yaml = "../measurements/temp_config.yaml"
     new_param_dict = {"q_stimulus.nco_config.nco_frequency": f"{3e9:6e}"}
-    update_yaml(temp_yaml, new_param_dict, keep_format=True)
+    update_yaml(temp_yaml, new_param_dict, keep_dtype=True)

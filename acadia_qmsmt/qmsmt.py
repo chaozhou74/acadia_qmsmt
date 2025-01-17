@@ -19,12 +19,33 @@ class InputOutput:
     out with full knowledge of the configuration as provided by a dictionary.
     """
 
-    def __init__(self, acadia: Acadia, config: Dict[str,Any]):
+    def __init__(self, name: str, acadia: Acadia, config: Dict[str,Any]):
+        self._name = name
         self._config: Dict[str,Any] = config
         self._acadia: Acadia = acadia
-        self._channel: Channel = acadia.channel(config["channel"])
+        self._channel: Channel = acadia.channel(self.get_config("channel"))
         self._allocated_memories: Dict[str,ChannelWaveformMemory] = {}
 
+    def get_config(self, *cfg_path: str):
+        """
+        Retrieve a configuration value from the nested config dict of this IO channel.
+        
+        This function does the same thing as directly getting values using `self._config[][]...`,
+        but with detailed error messages to identify the missing key and its location 
+        when the path is invalid.
+
+        :param cfg_path: Strings representing the path to the  desired configuration 
+            value (e.g., ("stimulus", "memories", "readout", "length") ).
+
+        """
+        current_level = self._config
+        for i, k in enumerate(cfg_path):
+            if not k in current_level:
+                raise KeyError(f"Missing key '{k}' in config dict under "
+                               f"'{'.'.join([self._name] + list(cfg_path[:i]))}'")
+            current_level = current_level[k]
+        
+        return current_level
 
     def get_waveform_memory(self, waveform_memory_name: str = None) -> ChannelWaveformMemory:
         """
@@ -42,11 +63,11 @@ class InputOutput:
         :return: Allocated WaveformMemory object
         """
         if waveform_memory_name is None:
-            waveform_memory_name = list(self._config["memories"].keys())[0]
+            waveform_memory_name = list(self.get_config("memories").keys())[0]
 
         # If we haven't yet allocated memory for the waveform, do so
         if waveform_memory_name not in self._allocated_memories:
-            wf_cgf = self._config["memories"][waveform_memory_name]
+            wf_cgf = self.get_config("memories", waveform_memory_name)
             self._allocated_memories[waveform_memory_name] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
 
         return self._allocated_memories[waveform_memory_name]
@@ -71,7 +92,7 @@ class InputOutput:
         if not self._channel.is_dac:
             if reference_waveform is None:
                 # check if all the waveform mem configuration in the channel has the same settings
-                for i, wf_cfg in enumerate(self._config["memories"].values()):
+                for i, wf_cfg in enumerate(self.get_config("memories").values()):
                     d, r = wf_cfg.get("decimation", None), wf_cfg.get("region", None)
                     if i == 0:
                         decimation, region = d, r
@@ -79,7 +100,7 @@ class InputOutput:
                         raise ValueError(
                             f"for blank waveform in an ADC channel, a reference waveform name must be provided")
             else:
-                ref_wf_cfg = self._config["memories"][reference_waveform]
+                ref_wf_cfg = self.get_config("memories", reference_waveform)
                 decimation = ref_wf_cfg.get("decimation", None)
                 region = ref_wf_cfg.get("region", None)
 
@@ -126,7 +147,7 @@ class InputOutput:
                                 "loaded but was never allocated.")
 
         if waveform is None:
-            if "waveforms" not in self._config or len(self._config["waveforms"]) == 0:
+            if "waveforms" not in self._config or len(self.get_config("waveforms")) == 0:
                 raise ValueError("Passing a waveform name for an IO requires a"
                                 f" populated ``waveforms`` section in the corresponding"
                                 f" configuration.")
@@ -137,7 +158,7 @@ class InputOutput:
                 raise ValueError("Passing a waveform name for an IO requires a"
                                 f" populated ``waveforms`` section in the corresponding"
                                 f" configuration section.")
-            set_value = self._config["waveforms"][waveform]
+            set_value = self.get_config("waveforms", waveform)
         else:
             set_value = signal
 
@@ -218,7 +239,7 @@ class QMsmtRuntime(Runtime):
                     raise TypeError(f"Unable to interpret value of type"
                                     f" {type(value)} as an IO configuration")
 
-                self._ios[name] = InputOutput(self.acadia, config_dict)
+                self._ios[name] = InputOutput(name, self.acadia, config_dict)
         
     def _dump_fields(self, fields: dict = None):
         
@@ -277,7 +298,7 @@ class QMsmtRuntime(Runtime):
             self.acadia.align_tile_latencies()
         for name,io in self._ios.items():
             # Configure analog parameters for each channel
-            io.channel.set(nco_update_event_source=nco_update_event_source, **io._config["channel_config"])
+            io.channel.set(nco_update_event_source=nco_update_event_source, **io.get_config("channel_config"))
             if reset_phases:
                 self.acadia.reset_nco_phase(io.channel)
                 self.acadia.update_nco_phase(io.channel, 0)
@@ -388,7 +409,7 @@ class MeasurableResonator:
         # Here we'll cache allocated windows. If we previously used a window, 
         # we'll retrieve its memory, otherwise we'll allocate it fresh
         if window_name is None:
-            window_name = list(self._capture._config["windows"].keys())[0]
+            window_name = list(self._capture.get_config("windows").keys())[0]
             
         if window_name in self._windows:
             # Regardless of what the window is, if we have it already,
@@ -407,7 +428,7 @@ class MeasurableResonator:
             # to configure_cmacc interpreting a float argument as the length in seconds
             # that the window should be. The behavior here will be different as this is a
             # much more likely use case and will be much more intuitive in the config file
-            window_config = self._capture._config["windows"][window_name]["data"]
+            window_config = self._capture.get_config("windows", window_name, "data")
             kernel_arg = None if isinstance(window_config, float) else window_config
             window_cache_key = window_name
             cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
@@ -468,7 +489,7 @@ class MeasurableResonator:
         """
 
         for window_name, window_memory in self._windows.items():
-            window_memory.set(self._capture._config["windows"][window_name]["data"])
+            window_memory.set(self._capture.get_config("windows", window_name, "data"))
 
 
     def set_frequency(self, frequency: float, sync: bool = True):
@@ -553,7 +574,7 @@ class Qubit:
         """
 
         a = self._stimulus._acadia
-        target_quadrant = measurement_resonator._capture._config["state_quadrants"][state_target_name]
+        target_quadrant = measurement_resonator._capture.get_config("state_quadrants", state_target_name)
         quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{g_quadrant}")
         reg = a.sequencer().Register()
         
