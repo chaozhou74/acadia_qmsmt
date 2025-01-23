@@ -8,6 +8,9 @@ from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia.utils import sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
+def decay(t, A, tau, B):
+    return A*np.exp(-t/tau) + B
+
 class QubitRelaxationRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for measuring the relaxation time (T1) of a qubit.
@@ -98,19 +101,23 @@ class QubitRelaxationRuntime(QMsmtRuntime):
             from acadia.processing import DynamicLine
             import matplotlib.pyplot as plt
             from IPython.display import display
-            from ipywidgets import FloatText, HBox, Button
+            from ipywidgets import Label
 
             self.figsize = (4, 3) if self.figsize is None else self.figsize
             self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
-            self.line_pop = DynamicLine(ax, ".-", color="red")
+            self.line_pop = DynamicLine(ax, ".", color="red")
+            self.line_fit = DynamicLine(ax, "--", color="red")
             ax.set_xlabel("Delay Time [s]")
             ax.set_ylabel("Population [FS]")
             ax.set_xlim(self.delay_times[0], self.delay_times[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()
+
+            self.decay_label = Label(style={"description_width": "initial"})
+            display(self.decay_label)
 
             from tqdm.notebook import tqdm
 
@@ -144,8 +151,14 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
         avg = np.mean(shots, axis=0)
+
+        # Give the fit a reasonable initial guess
+        p0 = (abs(np.max(avg)) - abs(np.min(avg)), self.delay_times[len(self.delay_times) // 2], avg[-1])
+        self.fit, pcov = curve_fit(decay, self.delay_times, avg, p0=p0)
+        self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us"
         
         self.line_pop.update(self.delay_times, avg, rescale_axis=False)
+        self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
         self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)
