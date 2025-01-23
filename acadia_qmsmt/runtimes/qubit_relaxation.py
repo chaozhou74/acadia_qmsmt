@@ -8,18 +8,17 @@ from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia.utils import sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
-class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
+class QubitRelaxationRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.
+    A :class:`Runtime` subclass for measuring the relaxation time (T1) of a qubit.
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig
     readout_capture: IOConfig
 
-    # Note that these amplitudes override the ``scale`` parameter in the configuration
-    qubit_amplitudes: Union[list, np.ndarray]
-    iterations: int
+    delay_times: Union[list, np.ndarray]
 
+    iterations: int
     qubit_pulse_name: str = None
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
@@ -39,12 +38,28 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
         self.data.add_group(f"points", uniform=True)
 
+        # Create an array in the cache that we can use to pass the 
+        # delay value to the sequencer so that we don't have to reassemble every time
+        cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
+
         def sequence(a: Acadia):
+            # Initialize a DSP to act as a counter
+            counter = a.sequencer().DSP()
+
+            # Load the counter with the value we put into the cache
+            counter.load(cache[0])
+
             readout_resonator.prepare_cmacc(self.readout_window_name)
 
+            with a.channel_synchronizer(block=False):
+                qubit.pulse(self.qubit_pulse_name)
+                
+            # Start the counter and wait until it reaches zero
+            counter.start_count(inc=int(np.int32(-1).astype(np.uint32)))
+            with a.sequencer().repeat_until(counter == 0):
+                pass
+
             with a.channel_synchronizer():
-                qubit.pulse()
-                a.barrier()
                 readout_resonator.measure("readout", "readout_accumulated")
 
         self.acadia.compile(sequence)
@@ -55,12 +70,17 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
+        qubit_stimulus_io.load_waveform(self.qubit_pulse_name)
+
+        # Determine how many cycles each delay interval should be
+        first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)
+        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times, first_pulse_memory)
 
         for i in range(self.iterations):
-            for amplitude in self.qubit_amplitudes:
-                qubit_stimulus_io.load_waveform(self.qubit_pulse_name, scale=amplitude)
+            for delay in dsp_count_values:
+                cache[0] = delay
 
-                
+                # capture data and put in the corresponding group
                 self.acadia.run()
                 sys_nanosleep(1000000)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
@@ -86,9 +106,9 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
             self.line_pop = DynamicLine(ax, ".-", color="red")
-            ax.set_xlabel("Pulse Amplitude [arb.]")
+            ax.set_xlabel("Delay Time [s]")
             ax.set_ylabel("Population [FS]")
-            ax.set_xlim(self.qubit_amplitudes[0]-0.1, self.qubit_amplitudes[-1]+0.1)
+            ax.set_xlim(self.delay_times[0], self.delay_times[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()
 
@@ -107,25 +127,25 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
     def update(self):
         # First make sure that we actually have new data to process
-        if "points" not in self.data or len(self.data["points"]) < len(self.qubit_amplitudes):
+        if "points" not in self.data or len(self.data["points"]) < len(self.delay_times):
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["points"]) // len(self.qubit_amplitudes)
+        completed_iterations = len(self.data["points"]) // len(self.delay_times)
         if completed_iterations == 0:
             return
 
         self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
 
-        valid_points = completed_iterations*len(self.qubit_amplitudes)
+        valid_points = completed_iterations*len(self.delay_times)
         data = self.data["points"].records()[:valid_points, ...]
-        data = data.reshape(completed_iterations, len(self.qubit_amplitudes), 2)
+        data = data.reshape(completed_iterations, len(self.delay_times), 2)
 
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
         avg = np.mean(shots, axis=0)
         
-        self.line_pop.update(self.qubit_amplitudes, avg, rescale_axis=False)
+        self.line_pop.update(self.delay_times, avg, rescale_axis=False)
         self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)

@@ -133,8 +133,8 @@ class InputOutput:
             self.load_waveform(memory_name, waveform)
 
     def load_waveform(self, 
-                        memory_name: str, 
-                        waveform: Union[str,NDArray,float,complex], 
+                        memory_name: str = None, 
+                        waveform: Union[str,NDArray,float,complex] = None, 
                         **kwargs):
         """
         Populate a waveform memory, optionally
@@ -142,25 +142,34 @@ class InputOutput:
         If ``signal`` is ``None``, the first signal in the configuration is
         used. If none are found, an error is thrown.
         """
-        if memory_name not in self._allocated_memories:
-            raise ValueError(f"WaveformMemory {memory_name} requested to be "
-                                "loaded but was never allocated.")
+        if memory_name is None:
+            if len(self._allocated_memories) > 1:
+                raise ValueError(f"Memory name must be specified when multiple "
+                                "are allocated.")
+            if len(self._allocated_memories) == 0:
+                raise ValueError(f"Attempted to infer waveform memory name when"
+                                " loading, but none are allocated.")
+            return self.load_waveform(list(self._config["memories"].keys())[0], waveform, **kwargs)
 
         if waveform is None:
             if "waveforms" not in self._config or len(self.get_config("waveforms")) == 0:
                 raise ValueError("Passing a waveform name for an IO requires a"
                                 f" populated ``waveforms`` section in the corresponding"
                                 f" configuration.")
-            set_value = list(self._config["waveforms"].values())[0]
+            return self.load_waveform(memory_name, list(self._config["waveforms"].values())[0], **kwargs)
 
-        elif isinstance(waveform, str):
+        if memory_name not in self._allocated_memories:
+            raise ValueError(f"WaveformMemory {memory_name} requested to be "
+                                "loaded but was never allocated.")
+
+        if isinstance(waveform, str):
             if "waveforms" not in self._config:
                 raise ValueError("Passing a waveform name for an IO requires a"
                                 f" populated ``waveforms`` section in the corresponding"
                                 f" configuration section.")
             set_value = self.get_config("waveforms", waveform)
         else:
-            set_value = signal
+            set_value = waveform
 
         set_kwargs = copy(set_value) if isinstance(set_value, dict) else {"data": set_value}
         set_kwargs.update(kwargs)
