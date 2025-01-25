@@ -8,22 +8,24 @@ from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia.utils import sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
-def sine_decay(t, A, tau, B, f):
-    return np.cos(2*np.pi*f*t) * A * np.exp(-t/tau) + B
+def sinc(f, amp, f0, width, offset):
+    return amp*np.sinc((f - f0)/width) + offset
 
-class QubitCoherenceRuntime(QMsmtRuntime):
-    """
-    A :class:`Runtime` subclass for measuring the relaxation time (T1) of a qubit.
-    """
+class CavitySpectroscopyRuntime(QMsmtRuntime):
+
+    cavity_stimulus: IOConfig
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig
     readout_capture: IOConfig
 
-    delay_times: Union[list, np.ndarray]
+    cavity_frequencies: Union[list, np.ndarray]
 
     iterations: int
+    cavity_pulse_fixed_length: float = 1e-6
+    cavity_pulse_amplitude: float = 0.1
     qubit_pulse_name: str = None
     qubit_pulse_waveform_name: str = None
+    qubit_saturation_pulse: dict[str,float] = None
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
     plot: bool = True
@@ -33,6 +35,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         import logging
         logger = logging.getLogger("acadia")
 
+        cavity_stimulus_io = self.io("cavity_stimulus")
         qubit_stimulus_io = self.io("qubit_stimulus")
         readout_stimulus_io = self.io("readout_stimulus")
         readout_capture_io = self.io("readout_capture")
@@ -40,31 +43,29 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
         qubit = Qubit(qubit_stimulus_io)
 
+        cavity_waveform = self.acadia.create_waveform_memory(
+            cavity_stimulus_io.channel, 
+            length=100e-9,
+            fixed_length=self.cavity_pulse_fixed_length)
+
+        if self.qubit_saturation_pulse is not None:
+            qubit_pulse = self.acadia.create_waveform_memory(
+                qubit_stimulus_io.channel,
+                length=self.qubit_saturation_pulse.get("length", 0.0),
+                fixed_length=self.qubit_saturation_pulse.get("fixed_length", 0.0)
+            )
+        else:
+            qubit_pulse = self.qubit_pulse_name
+
         self.data.add_group(f"points", uniform=True)
 
-        # Create an array in the cache that we can use to pass the 
-        # delay value to the sequencer so that we don't have to reassemble every time
-        cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
-
         def sequence(a: Acadia):
-            # Initialize a DSP to act as a counter
-            counter = a.sequencer().DSP()
-
-            # Load the counter with the value we put into the cache
-            counter.load(cache[0])
-
             readout_resonator.prepare_cmacc(self.readout_window_name)
 
-            with a.channel_synchronizer(block=False):
-                qubit.pulse(self.qubit_pulse_name)
-                
-            # Start the counter and wait until it reaches zero
-            counter.start_count(inc=int(np.int32(-1).astype(np.uint32)))
-            with a.sequencer().repeat_until(counter == 0):
-                pass
-
             with a.channel_synchronizer():
-                qubit.pulse(self.qubit_pulse_name)
+                a.schedule_waveform(cavity_waveform)
+                a.barrier()
+                qubit.pulse(qubit_pulse)
                 a.barrier()
                 readout_resonator.measure("readout", "readout_accumulated")
 
@@ -76,21 +77,21 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
-
-        # Determine how many cycles each delay interval should be
-        first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)
-        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times, first_pulse_memory)
+        if self.qubit_saturation_pulse is None:
+            qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
+        else:
+            qubit_pulse.set("hann", scale=self.qubit_saturation_pulse.get("scale", 1.0))
+        cavity_waveform.set("hann", scale=self.cavity_pulse_amplitude)
 
         for i in range(self.iterations):
-            for delay in dsp_count_values:
-                cache[0] = delay
+            for frequency in self.cavity_frequencies:
+                cavity_stimulus_io.set_nco_frequency(frequency)
+                self.acadia.update_ncos_synchronized()
 
-                # capture data and put in the corresponding group
                 self.acadia.run()
-                sys_nanosleep(1000000)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"points"].write(wf.array)
+                sys_nanosleep(5000000)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -111,19 +112,18 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
-            self.line_pop = DynamicLine(ax, ".", color="red")
-            self.line_fit = DynamicLine(ax, "--", color="red")
-            ax.set_xlabel("Delay Time [s]")
-            ax.set_ylabel("Population [FS]")
-            ax.set_xlim(self.delay_times[0], self.delay_times[-1])
+            self.line_pop = DynamicLine(ax, ".", label="Mag", color="red")
+            self.line_fit = DynamicLine(ax, "--", label="Mag", color="red")
+            ax.set_xlabel("Cavity Frequency [Hz]")
+            ax.set_ylabel("Qubit Population [FS]", color="red")
+            ax.tick_params(axis='y', labelcolor="blue")
+            ax.set_xlim(self.cavity_frequencies[0], self.cavity_frequencies[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()
 
-            self.decay_label = Label(style={"description_width": "initial"})
-            self.freq_label = Label(style={"description_width": "initial"})
-
+            self.frequency_label = Label(style={"description_width": "initial"})
             label_layout = Layout(display="flex", flex_flow="column", align_items="stretch")
-            label_box = Box(children=[self.decay_label, self.freq_label], layout=label_layout)
+            label_box = Box(children=[self.frequency_label], layout=label_layout)
             display(label_box)
 
             from tqdm.notebook import tqdm
@@ -141,39 +141,41 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
     def update(self):
         # First make sure that we actually have new data to process
-        if "points" not in self.data or len(self.data["points"]) < len(self.delay_times):
+        if "points" not in self.data or len(self.data["points"]) < len(self.cavity_frequencies):
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["points"]) // len(self.delay_times)
+        completed_iterations = len(self.data["points"]) // len(self.cavity_frequencies)
+        self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
+
         if completed_iterations == 0:
             return
 
-        self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
-
-        valid_points = completed_iterations*len(self.delay_times)
+        valid_points = completed_iterations*len(self.cavity_frequencies)
         data = self.data["points"].records()[:valid_points, ...]
-        data = data.reshape(completed_iterations, len(self.delay_times), 2)
+        data = data.reshape(completed_iterations, len(self.cavity_frequencies), 2)
 
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
         avg = np.mean(shots, axis=0)
+        self.line_pop.update(self.cavity_frequencies, avg, rescale_axis=False)
 
-        # Give the fit a reasonable initial guess
         try:
             amax = np.argmax(avg)
-            amin = np.argmin(avg)
-            p0 = (-(abs(np.min(avg)) - 0.5), self.delay_times[len(self.delay_times) // 2], 0.5, 1/(self.delay_times[amax] - self.delay_times[amin]))
+            amin = np.argmax(avg)
 
-            self.fit, pcov = curve_fit(sine_decay, self.delay_times, avg, p0=p0)
-            self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us"
-            self.freq_label.value = f"Oscillation frequency: {round(self.fit[3]*1e-3, 4)} kHz"
-            self.line_fit.update(self.delay_times, sine_decay(self.delay_times, *self.fit), rescale_axis=False)
+            # Do the fitting in units of GHz to improve numerical stability
+            p0 = (abs(avg[amax] - avg[amin]),  # amp
+                1e-9*self.cavity_frequencies[amax], # f0
+                1e-9/self.cavity_pulse_fixed_length, # width
+                (avg[0] + avg[-1])/2) # offset
+            params, pcov, info, mesg, ier = curve_fit(sinc, self.cavity_frequencies*1e-9, avg, p0=p0, full_output=True)
+            self.fit = {"params": params, "pcov": pcov, "info": info, "mesg": mesg, "ier": ier}
+            self.line_fit.update(self.cavity_frequencies, sinc(self.cavity_frequencies*1e-9, *params), rescale_axis=False)
+            self.frequency_label.value = f"Cavity frequency: {round(params[1], 8):2.8f} GHz"
         except:
             pass
 
-        self.line_pop.update(self.delay_times, avg, rescale_axis=False)
-        
         self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)
@@ -185,4 +187,3 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         self.iterations_progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
-

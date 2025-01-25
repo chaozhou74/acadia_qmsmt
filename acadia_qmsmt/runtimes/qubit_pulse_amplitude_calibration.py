@@ -24,6 +24,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     iterations: int
 
     qubit_pulse_name: str = None
+    qubit_pulse_waveform_name: str = None
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
     plot: bool = True
@@ -46,7 +47,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
             readout_resonator.prepare_cmacc(self.readout_window_name)
 
             with a.channel_synchronizer():
-                qubit.pulse()
+                qubit.pulse(self.qubit_pulse_name)
                 a.barrier()
                 readout_resonator.measure("readout", "readout_accumulated")
 
@@ -61,9 +62,8 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
         for i in range(self.iterations):
             for amplitude in self.qubit_amplitudes:
-                qubit_stimulus_io.load_waveform(self.qubit_pulse_name, scale=amplitude)
+                qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name, scale=amplitude)
 
-                
                 self.acadia.run()
                 sys_nanosleep(1000000)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
@@ -92,7 +92,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
             self.line_fit = DynamicLine(ax, "--", color="red")
             ax.set_xlabel("Pulse Amplitude [arb.]")
             ax.set_ylabel("Population [FS]")
-            ax.set_xlim(self.qubit_amplitudes[0]-0.1, self.qubit_amplitudes[-1]+0.1)
+            ax.set_xlim(self.qubit_amplitudes[0], self.qubit_amplitudes[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()
 
@@ -131,13 +131,21 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
         avg = np.mean(shots, axis=0)
+        self.line_pop.update(self.qubit_amplitudes, avg, rescale_axis=False)
 
         # Fit the data to a sine
-        self.fit, pcov = curve_fit(flopping, self.qubit_amplitudes, avg)
-        self.amplitude_label.value = f"Pi pulse amplitude: {round(0.5/self.fit[1], 6)}"
-
-        self.line_pop.update(self.qubit_amplitudes, avg, rescale_axis=False)
-        self.line_fit.update(self.qubit_amplitudes, flopping(self.qubit_amplitudes, *self.fit), rescale_axis=False)
+        try:
+            amin = np.argmin(avg)
+            amax = np.argmax(avg)
+            osc_period = 2*abs(self.qubit_amplitudes[amin]-self.qubit_amplitudes[amax])
+            p0 = (abs(amin-amax)/2, 1/osc_period)
+            self.fit, pcov = curve_fit(flopping, self.qubit_amplitudes, avg, p0=p0)
+            self.amplitude_label.value = f"Pi pulse amplitude: {round(0.5/self.fit[1], 6)}"
+            self.line_fit.update(self.qubit_amplitudes, flopping(self.qubit_amplitudes, *self.fit), rescale_axis=False)
+        except:
+            pass
+        
+        
         self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)

@@ -47,30 +47,44 @@ class InputOutput:
         
         return current_level
 
-    def get_waveform_memory(self, waveform_memory_name: str = None) -> ChannelWaveformMemory:
+    def get_waveform_memory(self, waveform_memory: Union[str, WaveformMemory] = None) -> ChannelWaveformMemory:
         """
         A shortcut function for allocating waveform memory for a specified 
         channel and waveform using pre-defined configurations.
 
         Serves as a shortcut for creating waveform memory objects based on the 
-        parameters defined in ``config["memories"][waveform_memory_name]``.
+        parameters defined in ``config["memories"][waveform_memory]``.
 
         If no name is provided, the first memory in the list of available
         memories is used.
 
-        :param waveform_memory_name: Name of the waveform memory defined under the 
+        :param waveform_memory: Name of the waveform memory defined under the 
             "memories" sub-dictionary for the given channel
         :return: Allocated WaveformMemory object
         """
-        if waveform_memory_name is None:
-            waveform_memory_name = list(self.get_config("memories").keys())[0]
+
+        # Just return the input if we were directly given a memory
+        # This is useful behavior for writing objects later that, when calling this
+        # function to retrieve a waveform, can be directly passed either a name or
+        # an actual memory
+        if isinstance(waveform_memory, WaveformMemory):
+            return waveform_memory
+
+        if waveform_memory is None:
+            waveform_memory = list(self.get_config("memories").keys())[0]
+
+        if not isinstance(waveform_memory, str):
+            raise TypeError(f"Waveform memories must be specified by string"
+                            f" when not dirfectly provided or inferred;"
+                            f" received memory specified of type"
+                            f" {type(waveform_memory)}")
 
         # If we haven't yet allocated memory for the waveform, do so
-        if waveform_memory_name not in self._allocated_memories:
-            wf_cgf = self.get_config("memories", waveform_memory_name)
-            self._allocated_memories[waveform_memory_name] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
+        if waveform_memory not in self._allocated_memories:
+            wf_cgf = self.get_config("memories", waveform_memory)
+            self._allocated_memories[waveform_memory] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
 
-        return self._allocated_memories[waveform_memory_name]
+        return self._allocated_memories[waveform_memory]
 
 
     def blank_waveform_generator(self, reference_waveform: str = None) -> Callable:
@@ -467,15 +481,15 @@ class MeasurableResonator:
         self._capture._acadia.cmacc_load(stream, offset_converted)
 
     def measure(self, 
-                stimulus_waveform_memory_name: str = None, 
-                capture_waveform_memory_name: str = None):
+                stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
+                capture_waveform_memory: Union[str, WaveformMemory] = None):
         """
         Schedules the measurement. This function should be called inside of a 
         channel synchronizer, and prepare_cmacc must have been called before 
         this. 
         """
-        self._capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory_name)
-        self._stimulus_waveform = self._stimulus.get_waveform_memory(stimulus_waveform_memory_name)
+        self._capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory)
+        self._stimulus_waveform = self._stimulus.get_waveform_memory(stimulus_waveform_memory)
         self._stimulus._acadia.schedule_waveform(self._stimulus_waveform)
         self._capture._acadia.stream(self._stream, self._capture_waveform)
 
@@ -537,22 +551,21 @@ class Qubit:
         if sync:
             self._stimulus._acadia.update_ncos_synchronized()
 
-    def pulse(self, waveform_memory_name: str = None) -> None:
+    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None) -> None:
         """
-        Apply a pulse to the qubit. The waveform memory name is passed directly to 
+        Apply a pulse to the qubit. The waveform memory parameter is passed directly to 
         :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
         argument behavior.
         """
 
-        waveform_memory = self._stimulus.get_waveform_memory(waveform_memory_name)
-        self._stimulus._acadia.schedule_waveform(waveform_memory)
+        self._stimulus._acadia.schedule_waveform(self._stimulus.get_waveform_memory(waveform_memory))
 
     def prepare(self, 
                 state_target_name: str,
                 measurement_resonator: MeasurableResonator,
-                pulse_waveform_memory_name: str = None,
-                measurement_stimulus_waveform_memory_name: str = None,
-                measurement_capture_waveform_memory_name: str = None,
+                pulse_waveform_memory: str = None,
+                measurement_stimulus_waveform_memory: str = None,
+                measurement_capture_waveform_memory: str = None,
                 measurement_cmacc_window: str = None) -> None:
         """
         A subsequence that prepares the qubit in a given state by measuring and
