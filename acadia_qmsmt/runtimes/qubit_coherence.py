@@ -134,11 +134,6 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.iterations_previous = 0
 
-        self.data_summed = None
-        self.data_complex = None
-        self.data_mags = None
-        self.data_phases =  None
-
     def update(self):
         # First make sure that we actually have new data to process
         if "points" not in self.data or len(self.data["points"]) < len(self.delay_times):
