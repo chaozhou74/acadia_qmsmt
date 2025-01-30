@@ -22,8 +22,11 @@ class QubitCoherenceRuntime(QMsmtRuntime):
     delay_times: Union[list, np.ndarray]
 
     iterations: int
-    qubit_pulse_name: str = None
-    qubit_pulse_waveform_name: str = None
+    qubit_first_pulse_name: str = None
+    qubit_first_pulse_waveform_name: str = None
+    qubit_second_pulse_name: str = None
+    qubit_second_pulse_waveform_name: str = None
+    virtual_detuning: float = 0
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
     plot: bool = True
@@ -56,7 +59,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             readout_resonator.prepare_cmacc(self.readout_window_name)
 
             with a.channel_synchronizer(block=False):
-                qubit.pulse(self.qubit_pulse_name)
+                qubit.pulse(self.qubit_first_pulse_name)
                 
             # Start the counter and wait until it reaches zero
             counter.start_count(inc=int(np.int32(-1).astype(np.uint32)))
@@ -64,7 +67,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
                 pass
 
             with a.channel_synchronizer():
-                qubit.pulse(self.qubit_pulse_name)
+                qubit.pulse(self.qubit_second_pulse_name)
                 a.barrier()
                 readout_resonator.measure("readout", "readout_accumulated")
 
@@ -76,17 +79,23 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
-
+        qubit_stimulus_io.load_waveform(self.qubit_first_pulse_name, self.qubit_first_pulse_waveform_name)
+        second_pulse_scale = qubit_stimulus_io.get_config("waveforms", self.qubit_second_pulse_waveform_name, "scale")
+        
         # Determine how many cycles each delay interval should be
-        first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)
+        first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_first_pulse_name)
         dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times, first_pulse_memory)
 
         for i in range(self.iterations):
-            for delay in dsp_count_values:
+            for idx_delay,delay in enumerate(dsp_count_values):
+                # Update the delay amount in the cache
                 cache[0] = delay
 
-                # capture data and put in the corresponding group
+                # Shift the phase of the second pulse according to the virtual detuning
+                scale = second_pulse_scale * np.exp(2 * np.pi * 1j * self.virtual_detuning * self.delay_times[idx_delay])
+                qubit_stimulus_io.load_waveform(self.qubit_second_pulse_name, self.qubit_second_pulse_waveform_name, scale=scale)
+
+                # Capture data and put in the corresponding group
                 self.acadia.run()
                 sys_nanosleep(1000000)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
@@ -158,7 +167,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         try:
             amax = np.argmax(avg)
             amin = np.argmin(avg)
-            p0 = (-(abs(np.min(avg)) - 0.5), self.delay_times[len(self.delay_times) // 2], 0.5, 1/(self.delay_times[amax] - self.delay_times[amin]))
+            p0 = (-(abs(np.min(avg)) - 0.5), self.delay_times[len(self.delay_times) // 3], 0, 0.5/(self.delay_times[amax] - self.delay_times[amin]))
 
             self.fit, pcov = curve_fit(sine_decay, self.delay_times, avg, p0=p0)
             self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us"

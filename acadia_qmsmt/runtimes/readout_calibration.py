@@ -584,16 +584,16 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
 
         # Subtract the average traces and normalize the kernel
         # We want to normalize it by its maximum magnitude
-        # TODO: take into account the scale of the boxcar used to collect the data
-        #       for now we can ignore this because this will be a very small error compared to the noise
         kernel_trace = np.conjugate(traces_complex[idx_trace1, :] - traces_complex[idx_trace2, :])
         kernel_trace *= scale*0.9999 / np.max(np.abs(kernel_trace), keepdims=False)
-        
+        self.kernel_trace = kernel_trace
+        self.traces_complex = traces_complex
+
         # Find the offset after transforming
         self.transformed_iq1 = np.dot(kernel_trace, traces_complex[idx_trace1, :])
         self.transformed_iq2 = np.dot(kernel_trace, traces_complex[idx_trace2, :])
         center = (self.transformed_iq1 + self.transformed_iq2) / 2.0
-        offset = (int(round(center.real)), int(round(center.imag)))
+        offset = (-int(round(center.real)), -int(round(center.imag)))
 
         # Save into a numpy file and update the configuration
         filename = f"{name}_{os.path.basename(self.local_directory)}.npy"

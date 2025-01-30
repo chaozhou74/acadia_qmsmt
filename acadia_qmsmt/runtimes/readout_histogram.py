@@ -21,6 +21,7 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
 
     iterations: int
     num_clusters: int = 2
+    hardware_accumulator: bool = True
     saturation_pulse_fixed_length: float = 1e-3 - 100e-9
     saturation_pulse_ramp_time: float = 100e-9
     saturation_pulse_amplitude: float = 0.1
@@ -32,11 +33,6 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
     histogram_bins_I: int = 50
     histogram_bins_Q: int = 50
     histogram_colormap: str = "hot"
-    histogram_circle_alpha: float = 1.0
-    histogram_circle_facecolor: str = "white"
-    histogram_circle_fill: bool = False
-    histogram_circle_edgecolor: str = "white"
-    histogram_circle_linewidth: float = 1.0
 
     def main(self):
         import logging
@@ -57,15 +53,19 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
             length=self.saturation_pulse_ramp_time, 
             fixed_length=self.saturation_pulse_fixed_length)
 
-        self.data.add_group(f"pts", uniform=True)
+        self.data.add_group(f"points", uniform=True)
+        readout_name = f"readout_{'accumulated' if self.hardware_accumulator else 'trace'}"
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_window_name)
+            readout_resonator.prepare_cmacc(
+                self.readout_window_name, 
+                output_type=("upper" if self.hardware_accumulator else "input"), 
+                output_last_only=self.hardware_accumulator)
 
             with a.channel_synchronizer():
                 a.schedule_waveform(saturation_waveform)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", readout_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()
@@ -80,8 +80,8 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
         for i in range(self.iterations):
             sys_nanosleep(1000000)
             self.acadia.run()
-            wf = readout_capture_io.get_waveform_memory("readout_accumulated")
-            self.data[f"pts"].write(wf.array)
+            wf = readout_capture_io.get_waveform_memory(readout_name)
+            self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -117,13 +117,13 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
 
     def update(self):
         # First make sure that we actually have new data to process
-        if "pts" not in self.data or len(self.data["pts"]) < 2:
+        if "points" not in self.data or len(self.data["points"]) < 2:
             return
 
         # Update the progress bar based on the number of iterations
-        self.iterations_progress_bar.update(len(self.data["pts"]) - self.iterations_previous)
+        self.iterations_progress_bar.update(len(self.data["points"]) - self.iterations_previous)
         self.update_plot(lock=False) # The lock is already acquired by the event loop         
-        self.iterations_previous = len(self.data["pts"])
+        self.iterations_previous = len(self.data["points"])
 
     def finalize(self):
         super().finalize()
@@ -147,8 +147,11 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
             if self.histogram_plot is not None:
                 self.histogram_plot.remove()
 
+            # Sum over the second dimension
+            # For IQ points this will work fine since they're arrays with a single entry, and it
+            # allows us to interchangeably process full traces or just IQ points
             # Use index 0 for the second dimension, since iq points are arrays with a single entry
-            points = self.data["pts"].records()[:, 0, :]
+            points = np.sum(self.data["points"].records(), axis=1, keepdims=False)
 
             # Given all the points we collected, compute bin edges so that the histogram view 
             # will contain all the points regardless of which sequence we choose to view
