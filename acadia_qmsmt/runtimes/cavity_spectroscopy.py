@@ -5,7 +5,6 @@ from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
-from acadia.utils import sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 def sinc(f, amp, f0, width, offset):
@@ -21,6 +20,8 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
     cavity_frequencies: Union[list, np.ndarray]
 
     iterations: int
+    run_delay: int
+
     cavity_pulse_fixed_length: float = 1e-6
     cavity_pulse_amplitude: float = 0.1
     qubit_pulse_name: str = None
@@ -88,11 +89,9 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
                 cavity_stimulus_io.set_nco_frequency(frequency)
                 self.acadia.update_ncos_synchronized()
 
-                self.acadia.run()
+                self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"points"].write(wf.array)
-                sys_nanosleep(5000000)
-
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
                 return
@@ -131,6 +130,7 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
         else:
             from tqdm import tqdm
 
+        self.fit = None
         self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.iterations_previous = 0
 
@@ -152,26 +152,29 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
 
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
-        avg = np.mean(shots, axis=0)
-        self.line_pop.update(self.cavity_frequencies, avg, rescale_axis=False)
+        self.avg = np.mean(shots, axis=0)
+        
 
         try:
-            amax = np.argmax(avg)
-            amin = np.argmax(avg)
+            amax = np.argmax(self.avg)
+            amin = np.argmax(self.avg)
 
             # Do the fitting in units of GHz to improve numerical stability
-            p0 = (abs(avg[amax] - avg[amin]),  # amp
+            p0 = (abs(self.avg[amax] - self.avg[amin]),  # amp
                 1e-9*self.cavity_frequencies[amax], # f0
                 1e-9/self.cavity_pulse_fixed_length, # width
-                (avg[0] + avg[-1])/2) # offset
-            params, pcov, info, mesg, ier = curve_fit(sinc, self.cavity_frequencies*1e-9, avg, p0=p0, full_output=True)
+                (self.avg[0] + self.avg[-1])/2) # offset
+            params, pcov, info, mesg, ier = curve_fit(sinc, self.cavity_frequencies*1e-9, self.avg, p0=p0, full_output=True)
             self.fit = {"params": params, "pcov": pcov, "info": info, "mesg": mesg, "ier": ier}
-            self.line_fit.update(self.cavity_frequencies, sinc(self.cavity_frequencies*1e-9, *params), rescale_axis=False)
-            self.frequency_label.value = f"Cavity frequency: {round(params[1], 8):2.8f} GHz"
         except:
             pass
 
-        self.fig.canvas.draw_idle() 
+        if self.plot:
+            self.line_pop.update(self.cavity_frequencies, self.avg, rescale_axis=False)
+            if self.fit is not None:
+                self.frequency_label.value = f"Cavity frequency: {round(self.fit['params'][1], 8):2.8f} GHz"
+                self.line_fit.update(self.cavity_frequencies, sinc(self.cavity_frequencies*1e-9, *self.fit['params']), rescale_axis=False)
+            self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)
 

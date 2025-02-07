@@ -5,7 +5,6 @@ from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
-from acadia.utils import sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 def decay(t, A, tau, B):
@@ -22,6 +21,8 @@ class QubitRelaxationRuntime(QMsmtRuntime):
     delay_times: Union[list, np.ndarray]
 
     iterations: int
+    run_delay: int
+
     qubit_pulse_name: str = None
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
@@ -84,8 +85,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
                 cache[0] = delay
 
                 # capture data and put in the corresponding group
-                self.acadia.run()
-                sys_nanosleep(1000000)
+                self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"points"].write(wf.array)
 
@@ -111,7 +111,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
             self.line_pop = DynamicLine(ax, ".", color="red")
             self.line_fit = DynamicLine(ax, "--", color="red")
             ax.set_xlabel("Delay Time [s]")
-            ax.set_ylabel("Population [FS]")
+            ax.set_ylabel("Measurement Polarization")
             ax.set_xlim(self.delay_times[0], self.delay_times[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()
@@ -124,6 +124,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         else:
             from tqdm import tqdm
 
+        self.fit = None
         self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.iterations_previous = 0
 
@@ -145,19 +146,20 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
-        avg = np.mean(shots, axis=0)
+        self.avg = np.mean(shots, axis=0)
 
         # Give the fit a reasonable initial guess
-        p0 = (abs(np.max(avg)) - abs(np.min(avg)), self.delay_times[len(self.delay_times) // 2], avg[-1])
-        self.fit, pcov = curve_fit(decay, self.delay_times, avg, p0=p0)
-        self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us"
-        
-        self.line_pop.update(self.delay_times, avg, rescale_axis=False)
-        self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
-        self.fig.canvas.draw_idle() 
+        p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
+        self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0)
+
+        if self.plot:
+            self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
+            if self.fit is not None:
+                self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
+                self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
+            self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)
-
         self.iterations_previous = completed_iterations
 
     def finalize(self):

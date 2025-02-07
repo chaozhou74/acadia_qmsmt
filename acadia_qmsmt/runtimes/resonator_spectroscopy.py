@@ -18,12 +18,13 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     frequencies: Union[list, np.ndarray]
 
     iterations: int
-    plot: bool = True
-    figsize: tuple[int] = None
+    run_delay: int
 
     capture_window_name: str = None
     stimulus_waveform_name: str = None
     electrical_delay: float = 0
+    plot: bool = True
+    figsize: tuple[int] = None
 
     def main(self):
         import logging
@@ -35,7 +36,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         resonator = MeasurableResonator(stimulus_io, capture_io)
 
         # Create the record group for saving captured data
-        self.data.add_group(f"iq_pts", uniform=True)
+        self.data.add_group(f"points", uniform=True)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
@@ -66,10 +67,10 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
                 resonator.set_frequency(frequency)
 
                 # capture data and put in the corresponding group
-                self.acadia.run()
+                self.acadia.run(minimum_delay=self.run_delay)
 
                 wf = capture_io.get_waveform_memory("readout_accumulated")
-                self.data[f"iq_pts"].write(wf.array)
+                self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -121,8 +122,6 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.iterations_previous = 0
-        self.frequencies_progress_bar = tqdm(desc="Frequency Sweep Points", dynamic_ncols=True, total=len(self.frequencies)*self.iterations)
-        self.frequencies_previous = 0
 
         self.electrical_delay_phases = 2*np.pi*self.frequencies*self.electrical_delay
         self.data_summed = None
@@ -132,36 +131,33 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
     def update(self):
         # First make sure that we actually have new data to process
-        if "iq_pts" not in self.data or len(self.data["iq_pts"]) < len(self.frequencies):
+        if "points" not in self.data or len(self.data["points"]) < len(self.frequencies):
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["iq_pts"]) // len(self.frequencies)
+        completed_iterations = len(self.data["points"]) // len(self.frequencies)
+        if completed_iterations == 0:
+            return
+
         self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
 
-        completed_frequencies = len(self.data["iq_pts"])
-        self.frequencies_progress_bar.update(completed_frequencies - self.frequencies_previous)
-
-        # Only continue processing data if we have at least one complete iteration
-        if completed_iterations != 0:
-            self.process_data(completed_iterations)
-            self.update_plot()               
-            self.data.save(self.local_directory)
+        self.process_data()
+        self.update_plot()               
+        self.data.save(self.local_directory)
 
         self.iterations_previous = completed_iterations
-        self.frequencies_previous = completed_frequencies
 
     def finalize(self):
         super().finalize()
         self.iterations_progress_bar.close()
-        self.frequencies_progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
         self.fit_lorentzian()
 
-    def process_data(self, completed_iterations):
+    def process_data(self):
+        completed_iterations = len(self.data["points"]) // len(self.frequencies)
         valid_traces = completed_iterations*len(self.frequencies)
-        data = self.data["iq_pts"].records()[:valid_traces, ...]
+        data = self.data["points"].records()[:valid_traces, ...]
 
         # Get the collection of data and reshape it so that the axes index as: 
         # (iteration, frequency, sample time, sample quadrature)

@@ -8,7 +8,6 @@ from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
-from acadia.utils import clock_monotonic_ns, sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 class ReadoutHistogramRuntime(QMsmtRuntime):
@@ -20,7 +19,8 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
     readout_capture: IOConfig
 
     iterations: int
-    num_clusters: int = 2
+    run_delay: int
+
     hardware_accumulator: bool = True
     saturation_pulse_fixed_length: float = 1e-3 - 100e-9
     saturation_pulse_ramp_time: float = 100e-9
@@ -78,8 +78,7 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
         saturation_waveform.set("hann", self.saturation_pulse_amplitude)
 
         for i in range(self.iterations):
-            sys_nanosleep(1000000)
-            self.acadia.run()
+            self.acadia.run(minimum_delay=self.run_delay)
             wf = readout_capture_io.get_waveform_memory(readout_name)
             self.data[f"points"].write(wf.array)
 
@@ -122,6 +121,27 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
 
         # Update the progress bar based on the number of iterations
         self.iterations_progress_bar.update(len(self.data["points"]) - self.iterations_previous)
+
+        # Sum over the second dimension
+        # For IQ points this will work fine since they're arrays with a single entry, and it
+        # allows us to interchangeably process full traces or just IQ points
+        # Use index 0 for the second dimension, since iq points are arrays with a single entry
+        points = np.sum(self.data["points"].records(), axis=1, keepdims=False)
+
+        # Given all the points we collected, compute bin edges so that the histogram view 
+        # will contain all the points regardless of which sequence we choose to view
+        
+        all_I_values = np.reshape(points[:, 0], -1)
+        self.histogram_I_edges = np.histogram_bin_edges(all_I_values, bins=self.histogram_bins_I)
+        all_Q_values = np.reshape(points[:, 1], -1)
+        self.histogram_Q_edges = np.histogram_bin_edges(all_Q_values, bins=self.histogram_bins_Q)
+        
+        self.histogram, _, _ = np.histogram2d(
+            points[:, 0], 
+            points[:, 1], 
+            bins=[self.histogram_I_edges, self.histogram_Q_edges],
+            density=True)
+
         self.update_plot(lock=False) # The lock is already acquired by the event loop         
         self.iterations_previous = len(self.data["points"])
 
@@ -146,43 +166,23 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
             # Create the histogram view
             if self.histogram_plot is not None:
                 self.histogram_plot.remove()
-
-            # Sum over the second dimension
-            # For IQ points this will work fine since they're arrays with a single entry, and it
-            # allows us to interchangeably process full traces or just IQ points
-            # Use index 0 for the second dimension, since iq points are arrays with a single entry
-            points = np.sum(self.data["points"].records(), axis=1, keepdims=False)
-
-            # Given all the points we collected, compute bin edges so that the histogram view 
-            # will contain all the points regardless of which sequence we choose to view
-            
-            all_I_values = np.reshape(points[:, 0], -1)
-            histogram_I_edges = np.histogram_bin_edges(all_I_values, bins=self.histogram_bins_I)
-            all_Q_values = np.reshape(points[:, 1], -1)
-            histogram_Q_edges = np.histogram_bin_edges(all_Q_values, bins=self.histogram_bins_Q)
-            
-            histogram, _, _ = np.histogram2d(
-                points[:, 0], 
-                points[:, 1], 
-                bins=[histogram_I_edges, histogram_Q_edges],
-                density=True)
             
             if self.histogram_scale == "log":
-                histogram_flat = histogram.reshape(-1)
+                histogram_flat = self.histogram.reshape(-1)
                 nonzero_indices = np.nonzero(histogram_flat)
                 vmin = np.min(histogram_flat[nonzero_indices])
-                norm = LogNorm(vmin=vmin, vmax=np.max(histogram), clip=True)
+                norm = LogNorm(vmin=vmin, vmax=np.max(self.histogram), clip=True)
             else:
-                norm = Normalize(vmin=np.min(histogram), vmax=np.max(histogram), clip=True)
-            
+                norm = Normalize(vmin=np.min(self.histogram), vmax=np.max(self.histogram), clip=True)
+                
             self.histogram_plot = self.ax_histogram.pcolormesh(
-                histogram_I_edges, 
-                histogram_Q_edges, 
-                histogram.T,
+                self.histogram_I_edges, 
+                self.histogram_Q_edges, 
+                self.histogram.T,
                 cmap=self.histogram_colormap,
                 norm=norm)
-            self.ax_histogram.set_xlim(histogram_I_edges[0], histogram_I_edges[-1])
-            self.ax_histogram.set_ylim(histogram_Q_edges[0], histogram_Q_edges[-1])
+            self.ax_histogram.set_xlim(self.histogram_I_edges[0], self.histogram_I_edges[-1])
+            self.ax_histogram.set_ylim(self.histogram_Q_edges[0], self.histogram_Q_edges[-1])
 
             self.fig.canvas.draw_idle() 
 

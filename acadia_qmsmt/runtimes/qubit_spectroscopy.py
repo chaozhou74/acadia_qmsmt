@@ -18,6 +18,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
     qubit_frequencies: Union[list, np.ndarray]
 
     iterations: int
+    run_delay: int
+
     saturation_pulse_fixed_length: float = 1e-3 - 100e-9
     saturation_pulse_ramp_time: float = 100e-9
     saturation_pulse_amplitude: float = 0.1
@@ -45,7 +47,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             length=self.saturation_pulse_ramp_time, 
             fixed_length=self.saturation_pulse_fixed_length)
 
-        self.data.add_group(f"iq_pts", uniform=True)
+        self.data.add_group(f"points", uniform=True)
 
         def sequence(a: Acadia):
             readout_resonator.prepare_cmacc(self.readout_window_name)
@@ -70,10 +72,10 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
                 qubit.set_frequency(frequency)
 
                 # capture data and put in the corresponding group
-                self.acadia.run()
+                self.acadia.run(minimum_delay=self.run_delay)
 
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
-                self.data[f"iq_pts"].write(wf.array)
+                self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -112,8 +114,6 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
         self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.iterations_previous = 0
-        self.frequencies_progress_bar = tqdm(desc="Frequency Sweep Points", dynamic_ncols=True, total=len(self.qubit_frequencies)*self.iterations)
-        self.frequencies_previous = 0
 
         self.data_summed = None
         self.data_complex = None
@@ -122,36 +122,33 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
     def update(self):
         # First make sure that we actually have new data to process
-        if "iq_pts" not in self.data or len(self.data["iq_pts"]) < len(self.qubit_frequencies):
+        if "points" not in self.data or len(self.data["points"]) < len(self.qubit_frequencies):
             return
 
         # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["iq_pts"]) // len(self.qubit_frequencies)
+        completed_iterations = len(self.data["points"]) // len(self.qubit_frequencies)
+        if completed_iterations == 0:
+            return
+
         self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
 
-        completed_frequencies = len(self.data["iq_pts"])
-        self.frequencies_progress_bar.update(completed_frequencies - self.frequencies_previous)
-
-        # Only continue processing data if we have at least one complete iteration
-        if completed_iterations != 0:
-            self.process_data(completed_iterations)
-            self.update_plot()               
-            self.data.save(self.local_directory)
+        self.process_data()
+        self.update_plot()               
+        self.data.save(self.local_directory)
 
         self.iterations_previous = completed_iterations
-        self.frequencies_previous = completed_frequencies
 
     def finalize(self):
         super().finalize()
         self.iterations_progress_bar.close()
-        self.frequencies_progress_bar.close()
         if self.plot:
             self.savefig(self.fig)
         self.fit_lorentzian()
 
-    def process_data(self, completed_iterations):
+    def process_data(self):
+        completed_iterations = len(self.data["points"]) // len(self.qubit_frequencies)
         valid_traces = completed_iterations*len(self.qubit_frequencies)
-        data = self.data["iq_pts"].records()[:valid_traces, ...]
+        data = self.data["points"].records()[:valid_traces, ...]
 
         # Get the collection of data and reshape it so that the axes index as: 
         # (iteration, frequency, sample time, sample quadrature)
@@ -177,9 +174,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
     def update_plot(self):
         if self.plot:
-            display_phases = np.unwrap(self.data_phases)
             self.line_mag.update(self.qubit_frequencies, self.data_mags)
-            self.line_phase.update(self.qubit_frequencies, display_phases)
+            self.line_phase.update(self.qubit_frequencies, self.data_phases)
             self.fig.canvas.draw_idle() 
 
     def fit_lorentzian(self) -> float:

@@ -1,15 +1,15 @@
 from typing import Union
+from functools import partial
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
-from acadia.utils import sys_nanosleep
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
-def sine_decay(t, A, tau, B, f):
-    return np.cos(2*np.pi*f*t) * A * np.exp(-t/tau) + B
+def dual_sine_decay(t, A, tau, B, f1, f2):
+    return A * np.exp(-t/tau) * np.cos(2*np.pi*f1*t) * np.cos(2*np.pi*f2*t)  + B
 
 class QubitCoherenceRuntime(QMsmtRuntime):
     """
@@ -22,6 +22,8 @@ class QubitCoherenceRuntime(QMsmtRuntime):
     delay_times: Union[list, np.ndarray]
 
     iterations: int
+    run_delay: int
+
     qubit_first_pulse_name: str = None
     qubit_first_pulse_waveform_name: str = None
     qubit_second_pulse_name: str = None
@@ -96,11 +98,9 @@ class QubitCoherenceRuntime(QMsmtRuntime):
                 qubit_stimulus_io.load_waveform(self.qubit_second_pulse_name, self.qubit_second_pulse_waveform_name, scale=scale)
 
                 # Capture data and put in the corresponding group
-                self.acadia.run()
-                sys_nanosleep(1000000)
+                self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"points"].write(wf.array)
-
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
                 return
@@ -113,7 +113,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             from acadia.processing import DynamicLine
             import matplotlib.pyplot as plt
             from IPython.display import display
-            from ipywidgets import Label, Layout, Box
+            from ipywidgets import Label, Layout, Box, Checkbox
 
             self.figsize = (4, 3) if self.figsize is None else self.figsize
             self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
@@ -123,16 +123,21 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             self.line_pop = DynamicLine(ax, ".", color="red")
             self.line_fit = DynamicLine(ax, "--", color="red")
             ax.set_xlabel("Delay Time [s]")
-            ax.set_ylabel("Population [FS]")
+            ax.set_ylabel("Measurement Polarization")
             ax.set_xlim(self.delay_times[0], self.delay_times[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()
+
+            self.dual_frequency_checkbox = Checkbox(value=False, description="Dual-frequency fit", style={"description_width": "initial"})
+            def update_dual_frequency_fit(x):
+                self.dual_frequency_fit = self.dual_frequency_checkbox.value
+            self.dual_frequency_checkbox.observe(update_dual_frequency_fit)
 
             self.decay_label = Label(style={"description_width": "initial"})
             self.freq_label = Label(style={"description_width": "initial"})
 
             label_layout = Layout(display="flex", flex_flow="column", align_items="stretch")
-            label_box = Box(children=[self.decay_label, self.freq_label], layout=label_layout)
+            label_box = Box(children=[self.dual_frequency_checkbox, self.decay_label, self.freq_label], layout=label_layout)
             display(label_box)
 
             from tqdm.notebook import tqdm
@@ -140,6 +145,8 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         else:
             from tqdm import tqdm
 
+        self.fit = None
+        self.dual_frequency_fit = False
         self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
         self.iterations_previous = 0
 
@@ -161,27 +168,40 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
         # Threshold the data according to the I quadrature
         shots = np.sign(data[:,:,0], dtype=np.int32)
-        avg = np.mean(shots, axis=0)
+        self.avg = np.mean(shots, axis=0)
 
-        # Give the fit a reasonable initial guess
         try:
-            amax = np.argmax(avg)
-            amin = np.argmin(avg)
-            p0 = (-(abs(np.min(avg)) - 0.5), self.delay_times[len(self.delay_times) // 3], 0, 0.5/(self.delay_times[amax] - self.delay_times[amin]))
+            amax = np.argmax(self.avg)
+            amin = np.argmin(self.avg)
+            p0 = (-(abs(np.min(self.avg)) - 0.5), 
+                    self.delay_times[len(self.delay_times) // 3], 
+                    0, 
+                    0.5/(self.delay_times[amax] - self.delay_times[amin]))
 
-            self.fit, pcov = curve_fit(sine_decay, self.delay_times, avg, p0=p0)
-            self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us"
-            self.freq_label.value = f"Oscillation frequency: {round(self.fit[3]*1e-3, 4)} kHz"
-            self.line_fit.update(self.delay_times, sine_decay(self.delay_times, *self.fit), rescale_axis=False)
+            if self.dual_frequency_fit:
+                fit_func = dual_sine_decay
+                p0 = (*p0, 0)
+            else:
+                fit_func = partial(dual_sine_decay, f2=0)
+
+            self.fit, pcov = curve_fit(fit_func, self.delay_times, self.avg, p0=p0)
         except:
             pass
 
-        self.line_pop.update(self.delay_times, avg, rescale_axis=False)
+        if self.plot:
+            if self.fit is not None:
+                self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us"
+                if self.dual_frequency_fit:
+                    self.freq_label.value = f"Oscillation frequencies: {round(self.fit[3]*1e-3, 4)} and {round(self.fit[4]*1e-3, 4)} kHz"
+                    self.line_fit.update(self.delay_times, dual_sine_decay(self.delay_times, *self.fit), rescale_axis=False)
+                else:
+                    self.freq_label.value = f"Oscillation frequency: {round(self.fit[3]*1e-3, 4)} kHz"
+                    self.line_fit.update(self.delay_times, dual_sine_decay(self.delay_times, *self.fit, f2=0), rescale_axis=False)
+            
+            self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
+            self.fig.canvas.draw_idle() 
         
-        self.fig.canvas.draw_idle() 
-
         self.data.save(self.local_directory)
-
         self.iterations_previous = completed_iterations
 
     def finalize(self):
