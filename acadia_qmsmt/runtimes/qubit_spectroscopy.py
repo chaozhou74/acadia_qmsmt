@@ -179,22 +179,24 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             self.fig.canvas.draw_idle() 
 
     def fit_lorentzian(self) -> float:
-        from acadia_qmsmt.analysis import population_in_quadrant
         from acadia_qmsmt.analysis.fitting import rotate_iq
         from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
         from acadia_qmsmt.helpers.plot_utils import add_button
-        from acadia_qmsmt.helpers.yaml_editor import update_yaml
 
-        fit = Lorentzian(self.qubit_frequencies, np.abs(self.data_complex))
+        # data_complex has a small absolute value that will case ill-conditioned covariance matrix
+        iq_pts = self.data_summed[:, 0] + 1j * self.data_summed[:, 1]
+        data_to_fit = rotate_iq(iq_pts).real
+
+        fit = Lorentzian(self.qubit_frequencies, data_to_fit)
         f0 = fit.ufloat_results["x0"]
 
         if self.plot:
             fit_fig, fit_ax = fit.plot()
             fit_ax.set_xlabel("Qubit Frequency [Hz]")
-            fit_ax.set_ylabel(data_type)
+            fit_ax.set_ylabel("rotated I component")
 
             def _update_freq(event):
-                self.update_ioconfig("stimulus", "channel_config.nco_frequency", np.round(f0.n))
+                self.update_ioconfig("qubit_stimulus", "channel_config.nco_frequency", np.round(f0.n))
 
             # add a button for updating the qubit freq in the yaml file
             self._update_button = add_button(fit_fig, _update_freq, label="Update Frequency")

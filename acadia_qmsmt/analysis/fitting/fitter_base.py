@@ -30,7 +30,8 @@ class FitterBase():
         # put fit result in a dict of ufloats for easy access
         self.ufloat_results = {}
         for k, v in self.result.params.items():
-            self.ufloat_results[k] = ufloat(v.value, v.stderr)
+            stderr = np.nan if v.stderr is None else v.stderr
+            self.ufloat_results[k] = ufloat(v.value, stderr)
 
     def pre_process(self):
         self.coordinates = np.array(self.coordinates)

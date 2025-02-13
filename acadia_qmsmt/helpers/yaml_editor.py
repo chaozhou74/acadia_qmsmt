@@ -115,14 +115,13 @@ def to_yaml_friendly(value):
             return value
 
 
-def update_yaml(yaml_path: str, new_param_dict: dict, keep_dtype=True, verbose=False):
+def update_yaml(yaml_path: str, new_param_dict: dict, verbose=False):
     """
     update a yaml config file with updated parameters, and keep the original format. 
 
     :param yaml_path: path to the yaml file to be updated
     :param new_param_dict: dictionary that contains the updated parameters. For nested parameters, the key needs be the
         key of each layer jointed with '.'
-   :param keep_dtype: When True, format the new parameters with the dtype of the original ones
    :param verbose: When True, print details of the update
 
     :Example:
@@ -139,8 +138,7 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_dtype=True, verbose=F
     def set_by_path(root, items, value):
         """Set a value in a nested object in root by item sequence"""
         target = get_by_path(root, items[:-1])
-        original_value = target.get(items[-1]) if keep_dtype and items[-1] in target else None
-        target[items[-1]] = type(original_value)(value) if original_value is not None else value
+        target[items[-1]] =  value
 
 
     def float_representer(dumper, data):
@@ -182,4 +180,4 @@ def update_yaml(yaml_path: str, new_param_dict: dict, keep_dtype=True, verbose=F
 if __name__ == "__main__":
     temp_yaml = "../measurements/temp_config.yaml"
     new_param_dict = {"q_stimulus.nco_config.nco_frequency": f"{3e9:6e}"}
-    update_yaml(temp_yaml, new_param_dict, keep_dtype=True)
+    update_yaml(temp_yaml, new_param_dict)

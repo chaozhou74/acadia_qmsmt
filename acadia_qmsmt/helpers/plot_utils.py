@@ -88,8 +88,8 @@ if __name__ == "__main__":
     fig.tight_layout()
 
     # Add a button at the bottom of the figure
-    button_ax, button = add_button(fig, label="Click Me", event=on_button_click) # todo: smarter button size
-    button_ax1, button1 = add_button(fig, label="Click Me 2", event=on_button_click) # todo: smarter button size
+    button_ax, button = add_button(fig, label="Click Me", event=on_button_click)
+    button_ax1, button1 = add_button(fig, label="Click Me 2", event=on_button_click)
     # button_ax2, button2 = add_button(fig, label="Click Me", event=func)
 
     plt.show()

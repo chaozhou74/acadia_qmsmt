@@ -40,9 +40,15 @@ class InputOutput:
         """
         current_level = self._config
         for i, k in enumerate(cfg_path):
+            # pick the only value if key is None and dict has only one value
+            if k is None and len(current_level) == 1:
+                current_level = next(iter(current_level.values()))
+                continue
+            # raise when key is missing
             if not k in current_level:
                 raise KeyError(f"Missing key '{k}' in config dict under "
                                f"'{'.'.join([self._name] + list(cfg_path[:i]))}'")
+            
             current_level = current_level[k]
         
         return current_level
@@ -123,7 +129,7 @@ class InputOutput:
             waveform_args.update({"decimation": decimation, "region": region})
 
         def blank_wf_gen(length: float) -> ChannelWaveformMemory:
-            blank_wf = self.acadia.create_waveform_memory(self._channel, length=length, **waveform_args)
+            blank_wf = self._acadia.create_waveform_memory(self._channel, length=length, **waveform_args)
             return blank_wf
 
         return blank_wf_gen

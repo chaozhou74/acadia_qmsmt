@@ -143,7 +143,7 @@ class KernelGeneratorBase:
             kernel_name = key_path + datetime.now().strftime("_%y%m%d_%H%M%S")
         kernel_path = self.save_kernel(kernel_dir, kernel_name)
         update_dict = {key_path: kernel_path}
-        update_yaml(yaml_file, update_dict, keep_dtype=False, verbose=True)
+        update_yaml(yaml_file, update_dict, verbose=True)
 
     def plot_kernel_generation(self, log_scale=False):
         """
@@ -177,7 +177,7 @@ class KernelGeneratorBase:
         hist, xedges, yedges, _ = axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag,
                                                 bins=101, cmap="hot", norm=norm)
         if hasattr(self, "cmacc_offset"):
-            x0, y0 = -self.cmacc_offset.real, -self.cmacc_offset.imag
+            x0, y0 = -self.cmacc_offset[0], -self.cmacc_offset[1]
             y0 = np.clip(y0, yedges[0], yedges[-1])
             axs[2].axvline(x=x0, color='w', linestyle='-', linewidth=0.5)
             axs[2].axhline(y=y0, color='w', linestyle='-', linewidth=0.5)
@@ -279,7 +279,8 @@ class KernelFromGETraces(KernelGeneratorBase):
         # Calculate default Q offset based on the 3-sigma radius of the g states
         if q_threshold is None:
             radius = np.std(self.new_iq_pts[self.g_mask] - g_center_pk) * 3
-            offset_Q = ((g_center_pk.imag > 0) * 2 - 1) * radius - g_center_pk.imag
+            # offset_Q = ((g_center_pk.imag > 0) * 2 - 1) * radius - g_center_pk.imag
+            offset_Q = radius - g_center_pk.imag
         else:
             offset_Q = -q_threshold
 
@@ -289,8 +290,7 @@ class KernelFromGETraces(KernelGeneratorBase):
             quadrant = find_quadrant(shifted_)
             return quadrant
 
-        # offset = int(offset_I) + 1j * int(offset_Q) # todo: `acadia.cmacc_load` needs to support complex input
-        offset = int(offset_I)
+        offset = (int(offset_I), int(offset_Q))
         q_g, q_e = _get_shifted_quadrant(g_center_pk), _get_shifted_quadrant(e_center_pk)
 
         self.cmacc_offset = offset
@@ -309,7 +309,7 @@ class KernelFromGETraces(KernelGeneratorBase):
         :return:
         """
         update_dict = {offset_key_path: self.cmacc_offset, quadrant_key_path: [*self.state_quadrants]}
-        update_yaml(yaml_file, update_dict, keep_dtype=False, verbose=True)
+        update_yaml(yaml_file, update_dict, verbose=True)
 
 
 def load_kernel(kernel_path):

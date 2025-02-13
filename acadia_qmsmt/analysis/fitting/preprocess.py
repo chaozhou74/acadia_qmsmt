@@ -8,6 +8,7 @@ TwoPi = 2 * np.pi
 
 def rotate_iq(iq_pts:ComplexDataPointsType, angle: float = None):
     """
+    Rotate the iq data points on the complex plane.
 
     :param iq_pts: Array of complex iq data points
     :param angle: rotation angle in radian. When not provided, will search for the angle that
