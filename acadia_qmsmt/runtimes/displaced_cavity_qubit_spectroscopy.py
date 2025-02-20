@@ -88,12 +88,13 @@ class DisplacedCavityQubitSpectroscopyRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_saturation_pulse.set(data=self.qubit_saturation_pulse.get("data", "hann"), 
-                                    scale=self.qubit_saturation_pulse.get("scale", 0.9999))
+        qubit_stimulus_io.load_waveform(qubit_saturation_pulse, 
+            waveform={"data": self.qubit_saturation_pulse.get("data", "hann")}, 
+            scale=self.qubit_saturation_pulse.get("scale", 0.9999))
         
         for i in range(self.iterations):
             for cavity_pulse_amplitude in self.cavity_pulse_amplitudes:
-                cavity_pulse.set("hann", scale=cavity_pulse_amplitude)
+                cavity_stimulus_io.load_waveform(cavity_pulse, {"data": "hann"}, scale=cavity_pulse_amplitude)
                 for qubit_frequency in self.qubit_frequencies:
                     qubit.set_frequency(qubit_frequency)
 

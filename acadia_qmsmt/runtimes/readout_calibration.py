@@ -121,7 +121,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
                     readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name, scale=readout_amplitude)
 
                     for factor in [0,1]:
-                        saturation_waveform.set("hann", factor*self.saturation_pulse_amplitude)
+                        qubit_stimulus_io.load_waveform(saturation_waveform, {"data": "hann"}, factor*self.saturation_pulse_amplitude)
 
                         self.acadia.run()
                         wf = readout_capture_io.get_waveform_memory("readout_trace")

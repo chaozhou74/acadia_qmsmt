@@ -6,10 +6,39 @@ from copy import copy
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.signal.windows import hann as scipy_hann
 
 from acadia import Acadia, Channel, Runtime, ChannelWaveformMemory, WaveformMemory, Operation
 
 __all__ = ["InputOutput", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
+
+class InputOutputWaveforms:
+    _FUNCTIONS = {}
+
+    @staticmethod
+    def register_function(name: str, func: Callable):
+        """
+        Register a function with the dictionary available to 
+        :func:`get_function`. The function should have the 
+        """
+        _FUNCTIONS[name] = func
+
+    @staticmethod
+    def get_function(name: str) -> Callable:
+        """
+        Retrieve a function for populating sample arrays from the local dictionary 
+        of functions. The returned function will have the call signature 
+        ``(output, scale, **kwargs)`` where ``output`` is the numpy array of 
+        integer sample data and ``scale`` is a complex scale factor for the sample
+        conversion. Other keyword arguments may be passed in and provided to the 
+        function. The function will populate the output array and return ``None``.
+        """
+        return _FUNCTIONS[name]
+
+    @staticmethod
+    def hann(output, **kwargs):
+        output[:] = scipy_hann(output.size)
+        
 
 class InputOutput:
     """
@@ -92,7 +121,6 @@ class InputOutput:
 
         return self._allocated_memories[waveform_memory]
 
-
     def blank_waveform_generator(self, reference_waveform: str = None) -> Callable:
         """
         Factory function for creating blank waveform functions for DAC or ADC channels.
@@ -141,7 +169,7 @@ class InputOutput:
         ``"memories"`` section of the configuration, and the values should be 
         either strings that correspond to waveform names in the ``"waveforms"`` 
         section of the configuration or a value to be directly passed to 
-        :meth:`WaveformMemory.set`. 
+        :meth:`WaveformMemory.load`. 
         
         This is a shortcut for calling :meth:`load_waveform` for all allocated
         memories and loading them with their specified configurations. To 
@@ -152,48 +180,153 @@ class InputOutput:
         for memory_name, waveform in kwargs.items():
             self.load_waveform(memory_name, waveform)
 
-    def load_waveform(self, 
-                        memory_name: str = None, 
-                        waveform: Union[str,NDArray,float,complex] = None, 
-                        **kwargs):
+    def load_waveform(self,
+                        memory: Union[str,WaveformMemory] = None,
+                        waveform: Union[str,NDArray,float,complex,None] = None,
+                        scale: complex = None,
+                        **kwargs) -> None:
         """
-        Populate a waveform memory, optionally
-        overriding parameters in the configuration when ``signal`` is a `str`.
-        If ``signal`` is ``None``, the first signal in the configuration is
-        used. If none are found, an error is thrown.
+        Load a wavefrom either from a configuration section or from sample data.
+
+        The waveform memory to populate can be specified either by a string, 
+        in which case it refers to a memory in this configuration's "memories" 
+        section, or the :class:`WaveformMemory` object to load can be provided 
+        directly. If ``None``, the first entry in the configuration's "memories"
+        section is inferred.
+
+        The data loaded into the memory is determined by the type of the 
+        ``waveform`` parameter:
+
+            - If ``waveform`` is a string, it must correspond to a section
+            in the "waveforms" configuration; this function is then a shorthand for
+            calling :meth:`compute_waveform` and passing the floating-point output 
+            back into this function. If ``scale`` is ``None``, it will attempt to be
+            retrieved from the configuration.
+
+            - If ``waveform`` is a dict, it will be passed directly into 
+            :meth:`compute_waveform` as the configuration.
+
+            - If ``None``, the first entry in the configuration's "waveforms" 
+            section is inferred.
+
+            - For any other type, it will be directly passed to 
+            :meth:`WaveformMemory.load` (along with the value of the 
+            ``scale`` parameter). Any additional keyword arguments will 
+            cause an exception to be raised.
         """
-        if memory_name is None:
-            if len(self._allocated_memories) > 1:
-                raise ValueError(f"Memory name must be specified when multiple "
-                                "are allocated.")
-            if len(self._allocated_memories) == 0:
-                raise ValueError(f"Attempted to infer waveform memory name when"
-                                " loading, but none are allocated.")
-            return self.load_waveform(list(self._config["memories"].keys())[0], waveform, **kwargs)
+        # Determine the memory to be loaded
+        if memory is None or isinstance(memory, str):
+            memory = self.get_waveform_memory(memory)
+        elif not isinstance(memory, WaveformMemory):
+            raise TypeError(f"`load_waveform` requires either a WaveformMemory"
+                            " object that can be loaded, or a string that"
+                            " specifies one from the configuration.")
 
-        if waveform is None:
-            if "waveforms" not in self._config or len(self.get_config("waveforms")) == 0:
-                raise ValueError("Passing a waveform name for an IO requires a"
-                                f" populated ``waveforms`` section in the corresponding"
-                                f" configuration.")
-            return self.load_waveform(memory_name, list(self._config["waveforms"].values())[0], **kwargs)
-
-        if memory_name not in self._allocated_memories:
-            raise ValueError(f"WaveformMemory {memory_name} requested to be "
-                                "loaded but was never allocated.")
-
-        if isinstance(waveform, str):
-            if "waveforms" not in self._config:
-                raise ValueError("Passing a waveform name for an IO requires a"
-                                f" populated ``waveforms`` section in the corresponding"
-                                f" configuration section.")
-            set_value = self.get_config("waveforms", waveform)
+        # Determine the samples to load into the waveform
+        if waveform is None or isinstance(waveform, (str, dict)):
+            samples = self.compute_waveform(memory.size, waveform, **kwargs)
         else:
-            set_value = waveform
+            if len(kwargs) != 0:
+                raise ValueError(f"Keyword arguments may not be provided when"
+                                 f" directly providing sample data.")
+            samples = waveform
 
-        set_kwargs = copy(set_value) if isinstance(set_value, dict) else {"data": set_value}
-        set_kwargs.update(kwargs)
-        self._allocated_memories[memory_name].set(**set_kwargs)
+        # Determine the scale
+        # If we've provided a scale, that should override anything else; 
+        # otherwise, if we specified the waveform by name, check to see if its
+        # configuration provides a scale
+        if scale is None:
+            if waveform is None:
+                scale = list(self._config["waveforms"].values())[0].get("scale", 1.0)
+            elif isinstance(waveform, str):
+                scale = self.get_config("waveforms", waveform).get("scale", 1.0)
+            elif isinstance(waveform, dict):
+                scale = waveform.get("scale", 1.0)
+            else:
+                scale = 1.0
+
+        memory.load(samples, scale)
+            
+    def compute_waveform(self, 
+                        size: Union[str,WaveformMemory,int] = None, 
+                        waveform: Union[str,dict,None] = None, 
+                        **kwargs) -> np.ndarray:
+        """
+        Compute the samples of a waveform from a configuration section.
+
+        The size of the waveform can be specified in a handful of ways, 
+        depending on the type of the ``size`` parameter:
+        
+            - If an int, this is the number of samples to compute.
+
+            - If a string, this refers to a memory in this configuration's 
+            "memories" section. 
+            
+            - If a :class:`WaveformMemory` object, its ``size`` property is used.
+            
+            - If ``None``, the first entry in the configuration's "memories" 
+            section is inferred.
+
+        The waveform is specified by a string that refers to a section in the 
+        configuration's "waveforms" section. If ``None``, the first entry in 
+        the "waveforms" section is used. The configuration may also be directly 
+        provided as a dict.
+
+        Within the specified waveform configuration, there must be a key "data", 
+        which specifies how the waveform is to be computed depending on the type:
+        
+            - If the value of the "data" key is a string, it must refer to a member 
+            function of :class:`InputOutputWaveforms` which will then be used to 
+            compute the samples. In this case, all other key-value pairs in the 
+            configuration section will be provided as keyword arguments to the 
+            function, which may be overridden by providing them as keyword arguments
+            to this function. 
+
+            - If the value of the "data" key is a scalar or numpy array, it will be
+            directly returned. If there are any other keyword arguments in the 
+            configuration or passed to this function (except for "scale"), then
+            an exception is raised.
+        """
+        # Determine the number of samples needed
+        if size is None:
+            size = self.get_waveform_memory(list(self._config["memories"].keys())[0]).size
+        elif isinstance(size, WaveformMemory):
+            size = size.size
+        elif isinstance(size, str):
+            if size not in self._allocated_memories:
+                raise ValueError(f"WaveformMemory {size} requested but was never allocated.")
+            size = self._allocated_memories[size].size
+        elif not isinstance(size, int):
+            raise TypeError(f"Unable to specify waveform size with object of "
+                            f"type {type(size)}")
+
+        # Determine the samples that will be loaded in
+        if waveform is None:
+            waveform_config = list(self._config["waveforms"].values())[0]
+        elif isinstance(waveform, dict):
+            waveform_config = waveform
+        elif isinstance(waveform, str):
+            waveform_config = self.get_config("waveforms", waveform)
+        else:
+            raise TypeError(f"Unable to specify waveform with object of type {type(waveform)}")
+       
+        
+        if "data" not in waveform_config:
+            raise KeyError(f"Waveform configuration missing required \"data\" key.")
+
+        if isinstance(waveform_config["data"], str):  
+            samples = np.empty(size, dtype=np.complex128)
+            func_kwargs = {k:v for k,v in waveform_config.items() if k != "data" and k != "scale"}
+            func_kwargs.update(kwargs)
+            getattr(InputOutputWaveforms, waveform_config["data"])(samples, **func_kwargs)
+            return samples
+        else:
+            if len(kwargs) != 0:
+                raise ValueError("Keyword arguments cannot be provided to "
+                                "`compute_waveform` when the configuration "
+                                "specifies sample data.")
+            return waveform_config["data"]
+
 
     @property
     def channel(self) -> Channel:
@@ -389,7 +522,8 @@ class MeasurableResonator:
     def prepare_cmacc(self, 
                 window_name: str = None,
                 output_type: Literal["upper", "lower", "input", None] = "upper",
-                output_last_only: bool = True):
+                output_last_only: bool = True,
+                reset_fifo: bool = True):
         """
         Perform a measurement of the resonator. 
 
@@ -471,7 +605,7 @@ class MeasurableResonator:
             kernel=kernel_arg,
             write_mode=output_type,
             last_only=output_last_only,
-            reset_fifo=True,
+            reset_fifo=reset_fifo,
             accumulator_done=False
         )
 
@@ -518,7 +652,7 @@ class MeasurableResonator:
         """
 
         for window_name, window_memory in self._windows.items():
-            window_memory.set(self._capture.get_config("windows", window_name, "data"))
+            window_memory.load(self._capture.get_config("windows", window_name, "data"))
 
 
     def set_frequency(self, frequency: float, sync: bool = True):

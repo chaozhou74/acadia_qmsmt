@@ -75,7 +75,7 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        saturation_waveform.set("hann", self.saturation_pulse_amplitude)
+        qubit_stimulus_io.load_waveform(saturation_waveform, {"data": "hann"}, self.saturation_pulse_amplitude)
 
         for i in range(self.iterations):
             self.acadia.run(minimum_delay=self.run_delay)

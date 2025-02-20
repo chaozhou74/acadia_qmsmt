@@ -4,7 +4,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia import Acadia, DataManager, Runtime
+from acadia.sample_arithmetic import sample_to_complex
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 class QubitSpectroscopyRuntime(QMsmtRuntime):
@@ -65,7 +66,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        saturation_waveform.set("hann", self.saturation_pulse_amplitude)
+        qubit_stimulus_io.load_waveform(saturation_waveform, {"data": "hann"}, self.saturation_pulse_amplitude)
 
         for i in range(self.iterations):
             for frequency in self.qubit_frequencies:
@@ -168,7 +169,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
         # Convert the summed sample data to a complex number and choose 
         # the scale so that we turn the sum into a mean
-        self.data_complex = WaveformMemory.sample_to_complex(self.data_summed, scale=float(completed_iterations))
+        self.data_complex = sample_to_complex(self.data_summed, scale=float(completed_iterations))
         self.data_mags = np.abs(self.data_complex)
         self.data_phases = np.angle(self.data_complex)
 

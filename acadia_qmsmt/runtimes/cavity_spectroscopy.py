@@ -4,7 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia import Acadia, DataManager, Runtime
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
 def sinc(f, amp, f0, width, offset):
@@ -81,8 +81,8 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
         if self.qubit_saturation_pulse is None:
             qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
         else:
-            qubit_pulse.set("hann", scale=self.qubit_saturation_pulse.get("scale", 1.0))
-        cavity_waveform.set("hann", scale=self.cavity_pulse_amplitude)
+            qubit_stimulus_io.load_waveform(qubit_pulse, {"data": "hann"}, scale=self.qubit_saturation_pulse.get("scale", 0.999))
+        cavity_stimulus_io.load_waveform(cavity_waveform, {"data": "hann"}, scale=self.cavity_pulse_amplitude)
 
         for i in range(self.iterations):
             for frequency in self.cavity_frequencies:
@@ -114,8 +114,8 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
             self.line_pop = DynamicLine(ax, ".", label="Mag", color="red")
             self.line_fit = DynamicLine(ax, "--", label="Mag", color="red")
             ax.set_xlabel("Cavity Frequency [Hz]")
-            ax.set_ylabel("Qubit Population [FS]", color="red")
-            ax.tick_params(axis='y', labelcolor="blue")
+            ax.set_ylabel("Qubit Population [FS]")
+            ax.tick_params(axis='y')
             ax.set_xlim(self.cavity_frequencies[0], self.cavity_frequencies[-1])
             ax.set_ylim(-1.1, 1.1)
             ax.grid()

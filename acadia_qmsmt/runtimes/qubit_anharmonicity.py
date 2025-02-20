@@ -68,13 +68,14 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
         qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
         
         from scipy.signal.windows import hann
-        envelope = self.ef_pulse_scale * hann(ef_pulse.size)
+        envelope = qubit_stimulus_io.compute_waveform(ef_pulse, {"data": "hann"})
         sample_times = np.arange(ef_pulse.size, dtype=np.float64) / qubit_stimulus_io.interface_sample_frequency
 
         for i in range(self.iterations):
             for frequency in self.frequencies:
                 # load the modulated pulse into the waveform
-                ef_pulse.set(envelope * np.exp(2 * np.pi * 1j * frequency * sample_times))
+                modulated_pulse = envelope * np.exp(2 * np.pi * 1j * frequency * sample_times)
+                ef_pulse.load(modulated_pulse, scale=self.ef_pulse_scale)
                 
                 self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")

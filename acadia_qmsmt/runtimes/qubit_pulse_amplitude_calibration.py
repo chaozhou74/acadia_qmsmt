@@ -61,9 +61,12 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
 
+        # Precompute the envelope so that we're not recalculating it every time, only scaling it
+        qubit_pulse_samples = qubit_stimulus_io.compute_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
+
         for i in range(self.iterations):
             for amplitude in self.qubit_amplitudes:
-                qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name, scale=amplitude)
+                qubit_stimulus_io.load_waveform(self.qubit_pulse_name, qubit_pulse_samples, scale=amplitude)
 
                 self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")

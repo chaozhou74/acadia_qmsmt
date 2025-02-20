@@ -4,7 +4,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia import Acadia, DataManager, Runtime
+from acadia.sample_arithmetic import sample_to_complex
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig
 
 class ResonatorSpectroscopyRuntime(QMsmtRuntime):
@@ -186,7 +187,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         
         waveform_scale = waveform_config["scale"] if "scale" in waveform_config else 1.0
         total_scale = completed_iterations / waveform_scale 
-        self.data_complex = WaveformMemory.sample_to_complex(self.data_summed, scale=total_scale)
+        self.data_complex = sample_to_complex(self.data_summed, scale=total_scale)
         self.data_mags = np.abs(self.data_complex)
         self.data_phases = np.angle(self.data_complex)
 
