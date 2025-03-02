@@ -22,7 +22,8 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    cavity_pulse_fixed_length: float = 1e-6
+    cavity_pulse_length: float = 1e-6
+    cavity_pulse_fixed_length: float = 0.0
     cavity_pulse_amplitude: float = 0.1
     qubit_pulse_name: str = None
     qubit_pulse_waveform_name: str = None
@@ -46,7 +47,7 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
 
         cavity_waveform = self.acadia.create_waveform_memory(
             cavity_stimulus_io.channel, 
-            length=100e-9,
+            length=self.cavity_pulse_length,
             fixed_length=self.cavity_pulse_fixed_length)
 
         if self.qubit_saturation_pulse is not None:
@@ -160,9 +161,9 @@ class CavitySpectroscopyRuntime(QMsmtRuntime):
             amin = np.argmax(self.avg)
 
             # Do the fitting in units of GHz to improve numerical stability
-            p0 = (abs(self.avg[amax] - self.avg[amin]),  # amp
-                1e-9*self.cavity_frequencies[amax], # f0
-                1e-9/self.cavity_pulse_fixed_length, # width
+            p0 = (-abs(self.avg[amax] - self.avg[amin]),  # amp
+                1e-9*self.cavity_frequencies[amin], # f0
+                1e-9/self.cavity_pulse_length, # width
                 (self.avg[0] + self.avg[-1])/2) # offset
             params, pcov, info, mesg, ier = curve_fit(sinc, self.cavity_frequencies*1e-9, self.avg, p0=p0, full_output=True)
             self.fit = {"params": params, "pcov": pcov, "info": info, "mesg": mesg, "ier": ier}

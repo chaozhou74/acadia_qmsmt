@@ -7,8 +7,11 @@ from scipy.optimize import curve_fit
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 
-def flopping(pulse_amp, oscillation_amp, oscillation_freq, offset):
+def sine(pulse_amp, oscillation_amp, oscillation_freq, offset):
     return oscillation_amp * np.cos(2 * np.pi * pulse_amp * oscillation_freq) + offset
+
+def quadratic(pulse_amp, a, amp_0, offset):
+    return a*(pulse_amp - amp_0)**2 + offset
 
 class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     """
@@ -28,6 +31,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     qubit_pulse_waveform_name: str = None
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
+    fit_quadratic: bool = False
     plot: bool = True
     figsize: tuple[int] = None
 
@@ -138,7 +142,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
             amax = np.argmax(self.avg)
             osc_period = 2*abs(self.qubit_amplitudes[amin]-self.qubit_amplitudes[amax])
             p0 = (abs(amin-amax)/2, 1/osc_period, (amin+amax)/2)
-            self.fit, pcov = curve_fit(flopping, self.qubit_amplitudes, self.avg, p0=p0)
+            self.fit, pcov = curve_fit(sine, self.qubit_amplitudes, self.avg, p0=p0)
             
         except:
             pass
@@ -147,7 +151,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
             self.line_pop.update(self.qubit_amplitudes, self.avg, rescale_axis=False)
             if self.fit is not None:
                 self.amplitude_label.value = f"Pi pulse amplitude: {round(0.5/self.fit[1], 6)}"
-                self.line_fit.update(self.qubit_amplitudes, flopping(self.qubit_amplitudes, *self.fit), rescale_axis=False)
+                self.line_fit.update(self.qubit_amplitudes, sine(self.qubit_amplitudes, *self.fit), rescale_axis=False)
             self.fig.canvas.draw_idle() 
 
         self.data.save(self.local_directory)

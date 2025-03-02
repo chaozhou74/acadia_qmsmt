@@ -10,34 +10,39 @@ from scipy.signal.windows import hann as scipy_hann
 
 from acadia import Acadia, Channel, Runtime, ChannelWaveformMemory, WaveformMemory, Operation
 
-__all__ = ["InputOutput", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
+__all__ = ["InputOutput", "InputOutputWaveforms", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
 
 class InputOutputWaveforms:
-    _FUNCTIONS = {}
+    """
+    A class containing methods for all of the waveform shapes that can be 
+    referenced by string in a configuration file.
+    """
 
     @staticmethod
-    def register_function(name: str, func: Callable):
+    def hann(output: NDArray) -> None:
         """
-        Register a function with the dictionary available to 
-        :func:`get_function`. The function should have the 
+        Calculate a Hann (or raised-cosine) function. The entire output is filled.
         """
-        _FUNCTIONS[name] = func
+        phase_per_sample = 2 * np.pi / output.size
+        output[:] = 0.5 * (1 - np.cos(phase_per_sample * np.arange(output.size)))
 
     @staticmethod
-    def get_function(name: str) -> Callable:
+    def hann_precise(output: NDArray, length: float = 1, offset: float = 0) -> None:
         """
-        Retrieve a function for populating sample arrays from the local dictionary 
-        of functions. The returned function will have the call signature 
-        ``(output, scale, **kwargs)`` where ``output`` is the numpy array of 
-        integer sample data and ``scale`` is a complex scale factor for the sample
-        conversion. Other keyword arguments may be passed in and provided to the 
-        function. The function will populate the output array and return ``None``.
-        """
-        return _FUNCTIONS[name]
+        Calculate a Hann (or raised-cosine) function. The length of the pulse 
+        is continuously variable, as is the starting time.
 
-    @staticmethod
-    def hann(output, **kwargs):
-        output[:] = scipy_hann(output.size)
+        :param length: The length of the pulse, expressed as a fraction of the 
+            total size of the output
+        :type length: float
+        :param offset: The starting time of the pulse, expressed as a fraction 
+            of the total size of the output.
+        :type offset: float
+        """
+
+        sample_times = np.arange(output.size) / output.size
+        output[:] = 0.5 - 0.5 * np.cos(2 * np.pi * (sample_times - offset) / length)
+        output[:] *= np.logical_and(sample_times >= offset, sample_times < offset+length)
         
 
 class InputOutput:
@@ -210,9 +215,20 @@ class InputOutput:
             section is inferred.
 
             - For any other type, it will be directly passed to 
-            :meth:`WaveformMemory.load` (along with the value of the 
-            ``scale`` parameter). Any additional keyword arguments will 
+            :meth:`WaveformMemory.load`. Any additional keyword arguments will 
             cause an exception to be raised.
+
+        The scale of the waveform being loaded depends on the type of the ``scale`` parameter:
+
+            - If a complex or a float, that value is used.
+
+            - If a string, the corresponding section of the configuration is used.
+
+            - If `None`, the scale is retrieved from the configuration (whether that 
+                is a section in the configuration file or a directly-provided dict).
+                If it cannot be found, an exception is raised.
+
+            
         """
         # Determine the memory to be loaded
         if memory is None or isinstance(memory, str):
@@ -237,13 +253,17 @@ class InputOutput:
         # configuration provides a scale
         if scale is None:
             if waveform is None:
-                scale = list(self._config["waveforms"].values())[0].get("scale", 1.0)
+                scale = list(self._config["waveforms"].values())[0]["scale"]
             elif isinstance(waveform, str):
-                scale = self.get_config("waveforms", waveform).get("scale", 1.0)
+                scale = self.get_config("waveforms", waveform)["scale"]
             elif isinstance(waveform, dict):
-                scale = waveform.get("scale", 1.0)
+                scale = waveform["scale"]
             else:
-                scale = 1.0
+                raise KeyError(f"Unable to infer scale for waveform of type {type(waveform)}")
+        elif isinstance(scale, str):
+            scale = self.get_config("waveforms", scale)["scale"]
+        elif not isinstance(scale, (int, float, complex)):
+            raise TypeError(f"Unable to derive scale from argument of type {scale}")
 
         memory.load(samples, scale)
             
