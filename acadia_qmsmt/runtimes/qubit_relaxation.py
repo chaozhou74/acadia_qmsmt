@@ -24,6 +24,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
     run_delay: int
 
     qubit_pulse_name: str = None
+    qubit_pulse_waveform_name: str = None
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
     plot: bool = True
@@ -74,7 +75,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_stimulus_io.load_waveform(self.qubit_pulse_name)
+        qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
 
         # Determine how many cycles each delay interval should be
         first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)

@@ -109,12 +109,12 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
         if any(rounded_delay_times - (self.flat_length_list + ramp_time)) != 0:
             logger.warning(f"The delay time between the qubit pulse and measurement has been rounded, "
                            f"resulting in max additional delay of {max(extra_delays)}.")
-        dsp_count_values = self.acadia.delay_times_to_counter_values(rounded_delay_times, qubit_long_waveform_mem)
+        dsp_count_values = self.acadia.delay_times_to_counter_values(rounded_delay_times)
 
         for i in range(self.iterations):
             for wf_idx, delay in enumerate(dsp_count_values):
                 cache[0] = delay
-                qubit_long_waveform_mem.set(wf_datas[wf_idx], scale=qubit_wf_cfg["scale"])
+                qubit_long_waveform_mem.load(wf_datas[wf_idx], scale=qubit_wf_cfg["scale"])
                 # capture data and put in the corresponding group
                 self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")

@@ -102,7 +102,7 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
 
             self.line_pop = DynamicLine(ax, ".", color="red")
             self.line_fit = DynamicLine(ax, "--", color="red")
-            ax.set_xlabel("Pulse Amplitude [arb.]")
+            ax.set_xlabel("Pulse Detuning [Hz]")
             ax.set_ylabel("Population [FS]")
             ax.set_xlim(self.frequencies[0], self.frequencies[-1])
             ax.set_ylim(-1.1, 1.1)
