@@ -1,7 +1,7 @@
 import sys
 import shutil
 import os
-from typing import Callable, Literal, Dict, List, Any, Union
+from typing import Callable, Literal, Dict, List, Any, Union, Literal
 from copy import copy
 
 import numpy as np
@@ -721,7 +721,7 @@ class Qubit:
         self._stimulus._acadia.schedule_waveform(self._stimulus.get_waveform_memory(waveform_memory))
 
     def prepare(self, 
-                state_target_name: str,
+                state_quadrant: Literal[1,2,3,4],
                 measurement_resonator: MeasurableResonator,
                 pulse_waveform_memory: str = None,
                 measurement_stimulus_waveform_memory: str = None,
@@ -733,48 +733,76 @@ class Qubit:
         directly to :meth:`InputOutput.get_waveform_memory`; see documentation therein 
         for argument behavior.
 
-        :param state_target_name: The name of the target state to prepare. This
-            should be a key in the `state_quadrants` section of the capture
-            configuration, whose value is the quadrant number for a measurement
-            result in the given state. For example, if a measurement of a system
-            in state "g" would result in a value in the 4th quadrant of the IQ
-            plane, the line `"g": 4` should be in the capture configuration,
-            and state_target_name should be set to `"g"` to prepare that state.
-        :type state_target_name: str 
+        :param state_quadrant: The quadrant (in [1,2,3,4]) where the target state blob fall in.
         :param measurement_resonator: The resonator to be used for measurement
             and conditional operations.
-        :type measurement_resonator: :class:`MeasurableResonator`
-        :param pulse_waveform_memory_name: The name of the waveform memory to be played when 
+        :param pulse_waveform_memory: The name of the waveform memory to be played when 
             the qubit is measured to be in any other state than the target. 
-        :type pulse_waveform_memory_name: str
-        :param measurement_stimulus_waveform_memory_name: The name of the measurement
+        :param measurement_stimulus_waveform_memory: The name of the measurement
             resonator stimulus waveform.
-        :type measurement_stimulus_waveform_memory_name: str
-        :param measurement_stimulus_waveform_memory_name: The name of the measurement
+        :param measurement_capture_waveform_memory: The name of the measurement
             resonator capture waveform.
-        :type measurement_capture_waveform_memory_name: str
+        :param measurement_cmacc_window: CMACC window for the measuremnt 
+
         """
 
         a = self._stimulus._acadia
-        target_quadrant = measurement_resonator._capture.get_config("state_quadrants", state_target_name)
-        quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{g_quadrant}")
+        quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{state_quadrant}")
         reg = a.sequencer().Register()
         
         ## Step 1: Do a first msmt and store the result in a register
         measurement_resonator.prepare_cmacc(measurement_cmacc_window)
         with a.channel_synchronizer():
-            measurement_resonator.measure()
+            self.pulse(pulse_waveform_memory)
+            a.barrier()
+            measurement_resonator.measure(measurement_stimulus_waveform_memory,
+                                          measurement_capture_waveform_memory)
 
         reg.load(measurement_resonator.get_measurement())
 
-        ## Step 2: Measure + conditional flip, until we get the ground state
+        ## Step 2: Measure + conditional flip, until we get the target state
         # todo: try getting the number of msmts in this loop using a counter register
         with a.sequencer().repeat_until(reg == quadrant_reg_value):
             measurement_resonator.prepare_cmacc(measurement_cmacc_window)
 
             with a.channel_synchronizer():
-                self.pulse(pulse_waveform_memory_name)
+                self.pulse(pulse_waveform_memory)
                 a.barrier()
-                measurement_resonator.measure()
+                measurement_resonator.measure(measurement_stimulus_waveform_memory,
+                                              measurement_capture_waveform_memory)
 
             reg.load(measurement_resonator.get_measurement())
+
+
+
+
+class DriveChannel:
+    """
+    A collection of functions that are useful for generic drive pulse
+    """
+
+    def __init__(self, stimulus: InputOutput):
+        """
+        Runtime class that contains experiment specific functions, including sub_sequence functions
+        """
+        self._stimulus = stimulus
+
+    def set_frequency(self, frequency: float, sync: bool = True):
+        """
+        The frequencies of both the stimulus and the capture are updated and 
+        optionally synchronized.
+        """
+
+        self._stimulus.set_nco_frequency(frequency)
+        self._stimulus.reset_nco_phase()
+        if sync:
+            self._stimulus._acadia.update_ncos_synchronized()
+
+    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None) -> None:
+        """
+        Apply a pulse to the qubit. The waveform memory parameter is passed directly to 
+        :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
+        argument behavior.
+        """
+
+        self._stimulus._acadia.schedule_waveform(self._stimulus.get_waveform_memory(waveform_memory))
