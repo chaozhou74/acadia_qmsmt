@@ -384,11 +384,12 @@ class QMsmtRuntime(Runtime):
         - If the value of the field is a dict, this dict is provided to the
         InputOutput object for configuring the channel.
 
-        - If the value of the field is a string, it is expected that the execution
-        directory of the script contains a file called "config.yaml", and that this
-        file contains a top-level section with a name matching the field value. The
-        configuration for the channel is then retrieved by loading the file and
-        accessing the corresponding section.
+        - If the value of the field is a string, it is interpreted as the name
+        of a top-level section in a YAML file. By default, this file is assumed to 
+        be "config.yaml" in the current working directory. This default can be 
+        overridden by specifying  `yaml_path` as a keyword argument when initializing
+        the child Runtime. The configuration for the channel is then retrieved by 
+        loading the file and accessing the corresponding section.
 
         - If the value of the field is a tuple, it is expected that the first
         element is the name of a top-level section in a yaml file whose path 
@@ -412,8 +413,11 @@ class QMsmtRuntime(Runtime):
                     config_dict["yaml_path"] = value[1]
                 elif isinstance(value, str):
                     from acadia_qmsmt.helpers.yaml_editor import load_yaml
-                    config_dict = load_yaml("config.yaml")[value]
-                    config_dict["yaml_path"] = "config.yaml"
+                    yaml_path = kwargs.get("yaml_path") 
+                    # Allow child classes to pass `yaml_path=None` and still get the default "config.yaml"
+                    yaml_path = "config.yaml" if yaml_path is None else yaml_path 
+                    config_dict = load_yaml(yaml_path)[value]
+                    config_dict["yaml_path"] = yaml_path
                 elif isinstance(value, dict):
                     config_dict = value
                     config_dict["yaml_path"] = None
@@ -424,15 +428,23 @@ class QMsmtRuntime(Runtime):
                 self._ios[name] = InputOutput(name, self.acadia, config_dict)
         
     def _dump_fields(self, fields: dict = None):
-        
-        # Dump all the arguments to a JSON file as in the parent class, but replace
-        # IOConfig arguments with their config dicts
+        """
+        Dump all the arguments to a JSON file as in the parent class, but replace
+        IOConfig arguments with their config dicts, and also save the yaml file(s) 
+        to the data folder.
+        """ 
         fields = {}
         for name,type_hint in self._get_fields().items():
             if type_hint is IOConfig:
                 fields[name] = self._ios[name]._config
             else:
                 fields[name] = getattr(self, name)
+
+        # copy over yaml file(s)
+        for name, io in self._ios.items():
+            yaml_path = io._config["yaml_path"]
+            if yaml_path is not None:
+                shutil.copy2(yaml_path, self.local_directory)
 
         super()._dump_fields(fields)
 
