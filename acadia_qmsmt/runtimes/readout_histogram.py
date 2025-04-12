@@ -29,6 +29,7 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
     readout_stimulus_waveform_name: str = None
     plot: bool = True
     figsize: tuple[int] = (4,4)
+    yaml_path: str = None
     histogram_scale: Literal["log","linear"] = "linear"
     histogram_bins_I: int = 50
     histogram_bins_Q: int = 50

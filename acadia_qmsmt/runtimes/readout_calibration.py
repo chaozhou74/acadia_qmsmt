@@ -67,6 +67,7 @@ class ReadoutCalibrationRuntime(QMsmtRuntime):
     readout_stimulus_waveform_name: str = None
     plot: bool = True
     figsize: tuple[int] = (11,4)
+    yaml_path: str = None
     histogram_bins_I: int = 50
     histogram_bins_Q: int = 50
     histogram_colormap: str = "hot"

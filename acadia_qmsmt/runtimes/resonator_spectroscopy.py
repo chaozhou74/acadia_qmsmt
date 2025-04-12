@@ -26,6 +26,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     electrical_delay: float = 0
     plot: bool = True
     figsize: tuple[int] = None
+    yaml_path: str = None
 
     def main(self):
         import logging

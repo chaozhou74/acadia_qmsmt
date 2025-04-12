@@ -34,6 +34,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     fit_quadratic: bool = False
     plot: bool = True
     figsize: tuple[int] = None
+    yaml_path: str = None
 
     def main(self):
         import logging

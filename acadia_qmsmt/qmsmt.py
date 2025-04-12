@@ -388,12 +388,13 @@ class QMsmtRuntime(Runtime):
         of a top-level section in a YAML file. By default, this file is assumed to 
         be "config.yaml" in the current working directory. This default can be 
         overridden by specifying  `yaml_path` as a keyword argument when initializing
-        the child Runtime. The configuration for the channel is then retrieved by 
+        the child runtime. The configuration for the channel is then retrieved by 
         loading the file and accessing the corresponding section.
 
         - If the value of the field is a tuple, it is expected that the first
         element is the name of a top-level section in a yaml file whose path 
-        is provided in the second element. 
+        is provided in the second element. In this case, the `yaml_path` provided
+        in the child runtime will be ignored for this io.
 
     """
 

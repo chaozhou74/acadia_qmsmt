@@ -43,6 +43,7 @@ class DisplacedCavityQubitSpectroscopyRuntime(QMsmtRuntime):
     readout_stimulus_waveform_name: str = None
     plot: bool = True
     figsize: tuple[int] = None
+    yaml_path: str = None
 
     def main(self):
         import logging
