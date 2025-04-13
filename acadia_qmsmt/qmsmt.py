@@ -2,7 +2,7 @@ import sys
 import shutil
 import os
 from typing import Callable, Literal, Dict, List, Any, Union, Literal
-from copy import copy
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
@@ -405,6 +405,7 @@ class QMsmtRuntime(Runtime):
         # Store the names and config dicts for all the 
         # members identified as channel configurations
         self._ios: Dict[str,InputOutput] = {}
+        self._yaml_paths = {}
         for name,type_hint in self._get_fields().items():
             if type_hint is IOConfig:
                 value = getattr(self, name)
@@ -427,6 +428,7 @@ class QMsmtRuntime(Runtime):
                                     f" {type(value)} as an IO configuration")
 
                 self._ios[name] = InputOutput(name, self.acadia, config_dict)
+                self._yaml_paths[name] = config_dict["yaml_path"]
         
     def _dump_fields(self, fields: dict = None):
         """
@@ -441,13 +443,45 @@ class QMsmtRuntime(Runtime):
             else:
                 fields[name] = getattr(self, name)
 
-        # copy over yaml file(s)
-        for name, io in self._ios.items():
-            yaml_path = io._config["yaml_path"]
-            if yaml_path is not None:
-                shutil.copy2(yaml_path, self.local_directory)
+        self._copy_yamls()
 
         super()._dump_fields(fields)
+
+    def _copy_yamls(self):
+        """
+        Copy over YAML files to the local data directory.
+
+        We need to be careful in cases where different IOs use YAML files from different paths BUT with the
+        same filename. To avoid overwriting, we add the IO name as a prefix when copying such files.
+
+        Browsing rule for the local data directory:
+            For each IO, first look for {io_name}_{Path(io._config['yaml_path']).name}.
+            If it doesn't exist, then fall back to {Path(io._config['yaml_path']).name}.
+        """
+
+        copied_files = {}  # {`local_yaml_name` : `original_yaml_path`}
+        for io_name, yaml_path in self._yaml_paths.items():
+            if yaml_path is None:
+                continue
+
+            local_yaml_name = Path(yaml_path).name
+            dest_dir = Path(self.local_directory)
+
+            if local_yaml_name not in copied_files:
+                # New filename, safe to copy
+                copied_files[local_yaml_name] = yaml_path
+                shutil.copy2(yaml_path, dest_dir / local_yaml_name)
+
+            elif yaml_path != copied_files[local_yaml_name]:
+                # Filename already used for a different original file — use IO-specific prefix
+                prefixed_name = f"{io_name}_{local_yaml_name}"
+                # This may result in redundant copies if multiple IOs use a file with the same name but from a
+                # different path than a previous group of IOs. It’s harmless, but could be optimized later if needed.
+                shutil.copy2(yaml_path, dest_dir / prefixed_name)
+                copied_files[prefixed_name] = yaml_path
+
+            # else:
+            # The file has already been copied from the same path — no action needed
 
     def _prepare_files(self, files, runtime_module, log_level, finalization_time):
         """
