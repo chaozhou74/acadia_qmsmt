@@ -3,6 +3,7 @@ import shutil
 import os
 from typing import Callable, Literal, Dict, List, Any, Union, Literal
 from pathlib import Path
+import json
 
 import numpy as np
 from numpy.typing import NDArray
@@ -413,6 +414,7 @@ class QMsmtRuntime(Runtime):
                     from acadia_qmsmt.helpers.yaml_editor import load_yaml
                     config_dict = load_yaml(value[1])[value[0]]
                     config_dict["yaml_path"] = value[1]
+                    self._yaml_paths[name] = (config_dict["yaml_path"], value[0])
                 elif isinstance(value, str):
                     from acadia_qmsmt.helpers.yaml_editor import load_yaml
                     yaml_path = kwargs.get("yaml_path") 
@@ -420,6 +422,7 @@ class QMsmtRuntime(Runtime):
                     yaml_path = "config.yaml" if yaml_path is None else yaml_path 
                     config_dict = load_yaml(yaml_path)[value]
                     config_dict["yaml_path"] = yaml_path
+                    self._yaml_paths[name] = (config_dict["yaml_path"], value)
                 elif isinstance(value, dict):
                     config_dict = value
                     config_dict["yaml_path"] = None
@@ -428,7 +431,7 @@ class QMsmtRuntime(Runtime):
                                     f" {type(value)} as an IO configuration")
 
                 self._ios[name] = InputOutput(name, self.acadia, config_dict)
-                self._yaml_paths[name] = config_dict["yaml_path"]
+
         
     def _dump_fields(self, fields: dict = None):
         """
@@ -447,41 +450,48 @@ class QMsmtRuntime(Runtime):
 
         super()._dump_fields(fields)
 
+
     def _copy_yamls(self):
         """
         Copy over YAML files to the local data directory.
 
         We need to be careful in cases where different IOs use YAML files from different paths BUT with the
-        same filename. To avoid overwriting, we add the IO name as a prefix when copying such files.
+        same filename. To avoid overwriting, we add subfix when copying such files.
 
-        Browsing rule for the local data directory:
-            For each IO, first look for {io_name}_{Path(io._config['yaml_path']).name}.
-            If it doesn't exist, then fall back to {Path(io._config['yaml_path']).name}.
+        Since information like `io._config['yaml_path']` will be gone when loading back a finished experiment from
+        the data folder, an extra `yaml_key_index.json` file is created in the local directory to look up for yaml
+        files and keys used for initializing each IO.
         """
 
-        copied_files = {}  # {`local_yaml_name` : `original_yaml_path`}
-        for io_name, yaml_path in self._yaml_paths.items():
+        copied_files = {}  # {`original_yaml_path` : `local_yaml_name`}
+        io_yaml_index = {}  # {`io_name`: (`local_yaml_name`, `key_in_yaml`)}
+        dest_dir = Path(self.local_directory)
+
+        for io_name, (yaml_path, yaml_key) in self._yaml_paths.items():
             if yaml_path is None:
                 continue
 
-            local_yaml_name = Path(yaml_path).name
-            dest_dir = Path(self.local_directory)
+            base_name = Path(yaml_path).name
+            local_yaml_name = base_name
 
+            # Check for filename conflict and resolve with suffix
+            counter = 1
+            while (local_yaml_name in copied_files) and (yaml_path != copied_files[local_yaml_name]):
+                stem = Path(base_name).stem
+                suffix = Path(base_name).suffix
+                local_yaml_name = f"{stem}_{counter}{suffix}"
+                counter += 1
+
+            # Copy if not already copied
             if local_yaml_name not in copied_files:
-                # New filename, safe to copy
-                copied_files[local_yaml_name] = yaml_path
                 shutil.copy2(yaml_path, dest_dir / local_yaml_name)
+                copied_files[local_yaml_name] = yaml_path
 
-            elif yaml_path != copied_files[local_yaml_name]:
-                # Filename already used for a different original file — use IO-specific prefix
-                prefixed_name = f"{io_name}_{local_yaml_name}"
-                # This may result in redundant copies if multiple IOs use a file with the same name but from a
-                # different path than a previous group of IOs. It’s harmless, but could be optimized later if needed.
-                shutil.copy2(yaml_path, dest_dir / prefixed_name)
-                copied_files[prefixed_name] = yaml_path
+            io_yaml_index[io_name] = (local_yaml_name, yaml_key)
 
-            # else:
-            # The file has already been copied from the same path — no action needed
+        with open(dest_dir / "yaml_key_index.json", "w") as f:
+            json.dump(io_yaml_index, f, indent=4)
+
 
     def _prepare_files(self, files, runtime_module, log_level, finalization_time):
         """
