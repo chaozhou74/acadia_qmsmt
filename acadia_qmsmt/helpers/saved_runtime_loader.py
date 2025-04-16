@@ -34,8 +34,10 @@ def _get_classes_in_module(module_path: str):
     if not module_path.exists() or module_path.suffix != '.py':
         raise ValueError(f"Invalid Python module path: {module_path}")
 
-    # Create a unique module name to avoid clashes
-    module_name = module_path.stem + "_loaded"
+    # Use a consistent module name for loading the runtime to avoid buildup
+    module_name = "loaded_runtime_module"
+    if module_name in sys.modules:
+        del sys.modules[module_name]
 
     # Load the module from the given path
     spec = importlib.util.spec_from_file_location(module_name, str(module_path))
@@ -56,7 +58,7 @@ def get_saved_runtime_class(data_directory: str):
     """
     Get the runtime class in `DEFAULT_RUNTIME_MODULE`(runtime.py) in the local data folder.
 
-    Currently the runtime class is identified by assuming there is only one class defination in the local
+    Currently the runtime class is identified by assuming there is only one class definition in the local
     runtime module, but this can be improved later if we have more complicated cases.
 
     :param data_directory: data directory
@@ -84,6 +86,9 @@ def import_saved_acadia_qmsmt(module_path: str):
 
     :param module_path: Path the acadia_qmsmt.py file in the local data folder
     """
+    # delete the old module (if there is any) to avoid leakage
+    if QMSMT_MODULE_NAME in sys.modules:
+        del sys.modules[QMSMT_MODULE_NAME]
     spec = importlib.util.spec_from_file_location(QMSMT_MODULE_NAME, module_path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[QMSMT_MODULE_NAME] = module
@@ -109,6 +114,17 @@ def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt:bool = True)
             import_saved_acadia_qmsmt(local_qmsmt)
         else:
             logger.warning("Warning: No local copy of acadia_qmsmt found. Using global version.")
+    else:
+        # Reset sys.modules to ensure global version is used, in case we have loaded the saved one
+        # in the same console earlier
+        if QMSMT_MODULE_NAME in sys.modules:
+            del sys.modules[QMSMT_MODULE_NAME]
+        # Re-import the global module
+        try:
+            import acadia_qmsmt  # ensures it's loaded into sys.modules
+            logger.info("Using global acadia_qmsmt module.")
+        except Exception as e: # the following runtime doesn't necessarily needs it
+            logger.warning(f"Failed to load global acadia_qmsmt module: {e}")
 
     # Get the saved runtime class
     runtime_cls = get_saved_runtime_class(data_directory)
@@ -120,6 +136,6 @@ def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt:bool = True)
 
 if __name__ == "__main__":
     # example usage:
-    path = "/home/chao/Data/test_gui/AmpSweep_250413_172312"
-    rt = load_runtime_from_data_dir(path, True)
-    print(rt)
+    path = "/home/chao/Data/test_gui/AmpSweep/250414_183827"
+    rt = load_runtime_from_data_dir(path)
+    print(rt.data)
