@@ -611,6 +611,8 @@ class MeasurableResonator:
         the decimation factor will automatically be chosen so that the 
         entire captured trace is decimated into a single point.
 
+        Note that cmacc = "Capture, Multiply, Accumulate"
+
         
         :param window_name: The name of the window to be used (and newly 
             allocated, if necessary). The name should be a key in the 
@@ -745,6 +747,15 @@ class MeasurableResonator:
         if sync:
             self._stimulus._acadia.update_ncos_synchronized()
 
+    def wait_until_measurement_done(self):
+        """
+        block the sequencer until the measurement is complete.
+        :return:
+        """
+        a = self._capture._acadia
+        with a.sequencer().repeat_until(a.cmacc_done(self._stream)):
+            pass
+
 
 class Qubit:
     """
@@ -806,18 +817,11 @@ class Qubit:
         a = self._stimulus._acadia
         quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{state_quadrant}")
         reg = a.sequencer().Register()
-        
-        ## Step 1: Do a first msmt and store the result in a register
-        measurement_resonator.prepare_cmacc(measurement_cmacc_window)
-        with a.channel_synchronizer():
-            self.pulse(pulse_waveform_memory)
-            a.barrier()
-            measurement_resonator.measure(measurement_stimulus_waveform_memory,
-                                          measurement_capture_waveform_memory)
 
-        reg.load(measurement_resonator.get_measurement())
+        # make sure the initial register value is definitely not the target value
+        reg.load(getattr(a, f"CMACC_QUADRANT_{(state_quadrant +1 ) % 4}"))
 
-        ## Step 2: Measure + conditional flip, until we get the target state
+        ## Measure + conditional flip, until we get the target state
         # todo: try getting the number of msmts in this loop using a counter register
         with a.sequencer().repeat_until(reg == quadrant_reg_value):
             measurement_resonator.prepare_cmacc(measurement_cmacc_window)
@@ -829,9 +833,6 @@ class Qubit:
                                               measurement_capture_waveform_memory)
 
             reg.load(measurement_resonator.get_measurement())
-
-
-
 
 class DriveChannel:
     """
