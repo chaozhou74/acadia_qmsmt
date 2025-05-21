@@ -1,7 +1,7 @@
 import sys
 import shutil
 import os
-from typing import Callable, Literal, Dict, List, Any, Union, Literal
+from typing import Callable, Literal, Dict, List, Any, Union, Literal, Tuple
 from pathlib import Path
 import json
 
@@ -190,6 +190,7 @@ class InputOutput:
                         memory: Union[str,WaveformMemory] = None,
                         waveform: Union[str,NDArray,float,complex,None] = None,
                         scale: complex = None,
+                        detune: float = None,
                         **kwargs) -> None:
         """
         Load a wavefrom either from a configuration section or from sample data.
@@ -229,7 +230,7 @@ class InputOutput:
                 is a section in the configuration file or a directly-provided dict).
                 If it cannot be found, an exception is raised.
 
-            
+        If ``detune`` is not none, then waveform will be multiplied by  np.exp(2 * np.pi * 1j * detune * t) for each point
         """
         # Determine the memory to be loaded
         if memory is None or isinstance(memory, str):
@@ -266,6 +267,9 @@ class InputOutput:
         elif not isinstance(scale, (int, float, complex)):
             raise TypeError(f"Unable to derive scale from argument of type {scale}")
 
+        if detune is not None:
+            times = np.arange(memory.size, dtype=np.float64) / self.interface_sample_frequency
+            samples = np.multiply(samples,np.exp(2 * np.pi * 1j * detune * times))
         memory.load(samples, scale)
             
     def compute_waveform(self, 
@@ -347,6 +351,37 @@ class InputOutput:
                                 "`compute_waveform` when the configuration "
                                 "specifies sample data.")
             return waveform_config["data"]
+
+
+    def generate_full_waveform_from_windowed(self, memory_name:str, waveform_name:str) \
+            -> Tuple[ChannelWaveformMemory, np.ndarray]:
+        """
+        Generate a full waveform memory and its corresponding envelope based on a windowed waveform specification.
+
+        This method reconstructs a full-length waveform by expanding a windowed (`fixed_length` + `length`) description.
+        It creates a new waveform memory object sized to the combined flat and ramp lengths, and generates
+        the waveform envelope using the specified shaping function.
+
+        :param memory_name: Name of the windowed constant memory to read `fixed_length` and `length` from.
+        :param waveform_name: Name of the waveform config to read the waveform shape ("data") from.
+
+        :return:
+        A tuple containing:
+        - ChannelWaveformMemory: The created full waveform memory object.
+        - np.ndarray: The generated waveform envelope array.
+
+        """
+        from acadia.pulse_shaping import flattop_function_generator
+        # declare a new memory block that has total length of `fixed_length + length`,  as specified in the yaml
+        flat_len = self.get_config("memories", memory_name, "fixed_length")
+        ramp_len = self.get_config("memories", memory_name, 'length')
+        full_mem = self._acadia.create_waveform_memory(self.channel, length=flat_len+ramp_len)
+        # generate the flat-top waveform data
+        waveform_shape =  self.get_config("waveforms", waveform_name, "data") # hann
+        waveform_func = flattop_function_generator(waveform_shape, ramp_time=ramp_len, flat_time=flat_len)
+        sample_times = np.arange(full_mem.size, dtype=np.float64) / self.interface_sample_frequency
+        waveform_envelop = waveform_func(sample_times)
+        return full_mem, waveform_envelop
 
 
     @property
@@ -864,3 +899,51 @@ class DriveChannel:
         """
 
         self._stimulus._acadia.schedule_waveform(self._stimulus.get_waveform_memory(waveform_memory))
+
+
+
+class QubitQmCooler:
+    """
+    A collection of functions that are useful for cooling a qubit and QM(s)
+    # todo: expand to multi-QM cooling
+    """
+
+    def __init__(self, qubit: Qubit, readout: MeasurableResonator, beamsplitting: DriveChannel):
+        self.qubit = qubit
+        self.readout = readout
+        self.beamsplitter = beamsplitting
+
+    def setup(self):
+        pass
+
+    def cool(self,
+                state_quadrant: Literal[1,2,3,4] = 1,
+                qubit_pulse_mem: str = None,
+                ro_stimulus_mem: str = None,
+                ro_capture_mem: str = None,
+                ro_cmacc_window: str = None,
+                bs_pulse_mem: str = None,
+                qm_cooling_rounds=1) -> None:
+        """
+
+        :param state_quadrant:
+        :param qubit_pulse_mem:
+        :param ro_stimulus_mem:
+        :param ro_capture_mem:
+        :param ro_cmacc_window:
+        :param bs_pulse_mem:
+        :param qm_cooling_rounds:
+        :return:
+        """
+        a = self.qubit._stimulus._acadia
+
+        ## Step 1: cool qubit
+        self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_mem,
+                           ro_stimulus_mem, ro_capture_mem, ro_cmacc_window)
+
+        ## Step 2: swap Qm photon to qubit and cool qubit again
+        for i in range(qm_cooling_rounds): # in case the first swap failed.
+            with a.channel_synchronizer():
+                self.beamsplitter.pulse(bs_pulse_mem)
+            self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_mem,
+                               ro_stimulus_mem, ro_capture_mem, ro_cmacc_window)

@@ -94,17 +94,19 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             from ipywidgets import FloatText, HBox, Button
 
             self.figsize = (4, 3) if self.figsize is None else self.figsize
-            self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
+            self.fig, axs = plt.subplots(2, 1, figsize=self.figsize)
             self.fig.tight_layout()
             self.fig.subplots_adjust(left=0.25, bottom=0.25)
 
+            ax = axs[0]
             self.line_mag = DynamicLine(ax, ".-", label="Mag", color="blue")
             ax.set_xlabel("Qubit Frequency [Hz]")
             ax.set_ylabel("Magnitude [arb.]", color="blue")
             ax.tick_params(axis='y', labelcolor="blue")
             ax.grid()
 
-            ax_phase = ax.twinx()
+            ax_phase = axs[1]
+            # ax_phase = ax.twinx()
             self.line_phase = DynamicLine(ax_phase, ".-", label="Phase", color="red")
             ax_phase.set_ylabel("Phase [rad.]", color="red")
             ax_phase.tick_params(axis='y', labelcolor="red")

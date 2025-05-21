@@ -151,15 +151,28 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         self.avg = np.mean(shots, axis=0)
 
         # Give the fit a reasonable initial guess
-        p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
-        self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0)
+        # p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
+        # self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0,bounds=[(-2.,0.1,-1.),(0.,1e6,1.)])
+
+        # if self.plot:
+        #     self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
+        #     if self.fit is not None:
+        #         self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
+        #         self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
+        #     self.fig.canvas.draw_idle() 
+
+
+        from acadia_qmsmt.analysis.fitting.exponential import Exponential
+        self.fit = Exponential(self.delay_times, self.avg)
 
         if self.plot:
             self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
             if self.fit is not None:
-                self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
-                self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
+                self.decay_label.value = f"Decay time: {round(self.fit.ufloat_results['tau'].n*1e6, 3)} +- " +\
+                                         f"{round(self.fit.ufloat_results['tau'].s*1e6, 3)} us" 
+                self.line_fit.update(self.delay_times, self.fit.result.eval(coordinates=self.delay_times), rescale_axis=False)
             self.fig.canvas.draw_idle() 
+
 
         self.data.save(self.local_directory)
         self.iterations_previous = completed_iterations
