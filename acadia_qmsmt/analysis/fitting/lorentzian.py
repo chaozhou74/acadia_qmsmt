@@ -1,8 +1,7 @@
-import matplotlib.pyplot as plt
 import numpy as np
 
 from acadia_qmsmt.analysis.fitting.fitter_base import FitterBase
-from acadia_qmsmt.analysis.fitting.preprocess import cut_peak
+from acadia_qmsmt.analysis.preprocess import cut_peak
 
 
 class Lorentzian(FitterBase):

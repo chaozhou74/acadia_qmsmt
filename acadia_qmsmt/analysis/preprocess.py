@@ -1,3 +1,5 @@
+from typing import Union
+import math
 import numpy as np
 from scipy.optimize import minimize_scalar
 from matplotlib import pyplot as plt
@@ -5,6 +7,32 @@ from matplotlib import pyplot as plt
 from acadia_qmsmt.analysis import ComplexDataPointsType
 
 TwoPi = 2 * np.pi
+
+def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
+    """
+    Reshape IQ data (data with last axis of shape 2)  to match the shape defined by the sweep axes.
+    Truncates the data to exclude any incomplete iterations.
+
+    :param raw_data: np.ndarray, assumed to have shape (..., 2).
+    :param axes: sweep axes, provided from outermost to innermost. Each axis should be a list or np.ndarray.
+
+    :return : np.ndarray of shape (completed_iterations, *len(axes), 2), or None if not enough data.
+    """
+
+    ax_shapes = []
+    for ax in axes:
+        ax_shapes.append(len(ax))
+
+    points_per_iter = math.prod(ax_shapes)
+    completed_iterations = len(raw_data) // points_per_iter
+    if completed_iterations == 0:
+        return None
+
+    valid_points = completed_iterations * points_per_iter
+    data = raw_data[:valid_points, ...]
+    data = data.reshape(completed_iterations, *ax_shapes, 2)
+
+    return data
 
 def rotate_iq(iq_pts:ComplexDataPointsType, angle: float = None):
     """
