@@ -4,6 +4,7 @@ import os
 from typing import Callable, Literal, Dict, List, Any, Union, Literal, Tuple
 from pathlib import Path
 import json
+import logging
 
 import numpy as np
 from numpy.typing import NDArray
@@ -13,6 +14,7 @@ from acadia import Acadia, Channel, Runtime, ChannelWaveformMemory, WaveformMemo
 
 __all__ = ["InputOutput", "InputOutputWaveforms", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
 
+logger = logging.getLogger("acadia_qmsmt")
 class InputOutputWaveforms:
     """
     A class containing methods for all of the waveform shapes that can be 
@@ -441,26 +443,35 @@ class QMsmtRuntime(Runtime):
         # Store the names and config dicts for all the 
         # members identified as channel configurations
         self._ios: Dict[str,InputOutput] = {}
-        self._yaml_paths = {}
+        self._yaml_paths = {} # collect yaml files for copying to local data directory 
         for name,type_hint in self._get_fields().items():
             if type_hint is IOConfig:
                 value = getattr(self, name)
-                if isinstance(value, tuple):
+                
+                # --- IOConfig is specified via a YAML key ---
+                if isinstance(value, (tuple, str)): 
                     from acadia_qmsmt.helpers.yaml_editor import load_yaml
-                    config_dict = load_yaml(value[1])[value[0]]
-                    config_dict["yaml_path"] = value[1]
-                    self._yaml_paths[name] = (config_dict["yaml_path"], value[0])
-                elif isinstance(value, str):
-                    from acadia_qmsmt.helpers.yaml_editor import load_yaml
-                    yaml_path = kwargs.get("yaml_path") 
-                    # Allow child classes to pass `yaml_path=None` and still get the default "config.yaml"
-                    yaml_path = "config.yaml" if yaml_path is None else yaml_path 
-                    config_dict = load_yaml(yaml_path)[value]
-                    config_dict["yaml_path"] = yaml_path
-                    self._yaml_paths[name] = (config_dict["yaml_path"], value)
+                    if isinstance(value, tuple):
+                        yaml_key, yaml_path  = value
+                    else:
+                        yaml_key = value
+                        # Allow child classes to pass `yaml_path=None` and still get the default "config.yaml"
+                        yaml_path = kwargs.get("yaml_path")  or "config.yaml"
+
+                    config_dict = load_yaml(yaml_path)[yaml_key]
+
+                    # record the yaml file’s *absolute* path and original channel key so yaml update functions 
+                    # can still work for reloaded runtimes (because these will be saved in kwargs.json)
+                    config_dict["__yaml_path__"] = str(Path(yaml_path).absolute())
+                    config_dict["__yaml_key__"] = yaml_key
+
+                    # collect yaml files for copying to local data directory 
+                    self._yaml_paths[name] = (config_dict["__yaml_path__"], yaml_key)                    
+
+                # ---  IOConfig is provided as a dict directly ---
                 elif isinstance(value, dict):
                     config_dict = value
-                    config_dict["yaml_path"] = None
+
                 else:
                     raise TypeError(f"Unable to interpret value of type"
                                     f" {type(value)} as an IO configuration")
@@ -611,11 +622,25 @@ class QMsmtRuntime(Runtime):
             cfg[index_paths[0]] = value
         elif isinstance(ioconfig, str):
             # Update the yaml
-            from acadia_qmsmt.helpers.yaml_editor import update_yaml
-            yaml_path = self._ios[ioconfig_name]._config["yaml_path"]
-            update_yaml(yaml_path, {f"{ioconfig}.{config_field}": value})
+            self.update_io_yaml_field(ioconfig_name, config_field, value)
         else:
             raise TypeError(f"Unable to update IO config when provided as type {type(ioconfig)}")
+
+    def update_io_yaml_field(self, ioconfig_name: str, config_field: str, value: Any, verbose=False):
+        """
+        Update the value of a field in the yaml config file for the specified IOConfig.
+        """
+        from acadia_qmsmt.helpers.yaml_editor import update_yaml
+        yaml_path = self._ios[ioconfig_name]._config["__yaml_path__"]
+        
+        ioconfig = getattr(self, ioconfig_name)
+        if type(ioconfig) == str:
+            yaml_key = ioconfig
+        elif type(ioconfig) == dict:
+            yaml_key = ioconfig["__yaml_key__"]
+        new_cfg = update_yaml(yaml_path, {f"{yaml_key}.{config_field}": value}, verbose=verbose)
+        logger.info(f"!! updated yaml file `{yaml_path}`: {yaml_key}.{config_field}: {value}")
+        return new_cfg
 
 
 class MeasurableResonator:
