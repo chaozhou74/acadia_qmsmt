@@ -1,92 +1,255 @@
-from typing import Tuple, Any, Optional, Union, Dict, List
-
 import numpy as np
 import matplotlib.pyplot as plt
-import lmfit
-from lmfit import Parameter
+from scipy.optimize import curve_fit
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 from uncertainties import ufloat
+import inspect
 
 
-class FitterBase():
-    def __init__(self, coordinates: Union[Tuple[np.ndarray, ...], np.ndarray], data: np.ndarray,
-                 params:Dict[str, Union[float, Parameter]]=None, dry=False, **fit_kwargs):
+class FitterBase:
+    """
+    Base class for fitting data using scipy.optimize.curve_fit with named parameter support,
+    optional fixed parameters, uncertainty tracking, and plotting utilities.
+
+    Subclasses must implement:
+    - `model(coordinates, **params)`: the model function to be fitted
+    - `guess(coordinates, data)`: initial parameter guesses as a dict
+    """
+
+    def __init__(self, coordinates: np.ndarray, data: np.ndarray,
+                 params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None, sigma: Optional[np.ndarray] = None,
+                 dry: bool = False, absolute_sigma: bool = True, **fit_kwargs):
         """
-        Base class for fitting data with lmfit.
 
-        :param coordinates: The independent variable(s) for the fitting process.
-        :param data: The dependent variable to be fitted.
-        :param params: Dictionary of initial guess parameters. Each parameter can be:
-            - A float: Represents the initial guess for the parameter.
-            - An lmfit.Parameter: Specifies more detailed properties, such as bounds or whether
-              the parameter is fixed.
-        :param dry: When True, runs with the input parameters without performing the actual fit.
-        :param fit_kwargs: Additional keyword arguments to be passed to the `lmfit.Model.fit`.
+        :param coordinates: Independent variable(s), passed to the model.
+        :param data: Measured dependent data.
+        :param params: Dict of parameter definitions. Each value can be:
+                    - float (initial guess)
+                    - dict with keys:
+                        - 'value': initial guess
+                        - 'bounds': (lower, upper)
+                        - 'fixed': True if parameter should not be varied
+        :param sigma: Optional standard deviations of data for weighted fit.
+        :param dry: If True, do not perform the fit; just use initial guesses.
+        :param absolute_sigma: If True, errors are treated as absolute in uncertainty calc.
+        :param fit_kwargs: Additional keyword arguments for `curve_fit`.
         """
-        self.coordinates = coordinates
-        self.data = data
-        self.pre_process()
-        self.result = self.run(params, dry, **fit_kwargs)
+        self.coordinates = np.array(coordinates)
+        self.data = np.array(data)
+        self.sigma = sigma
+        self.absolute_sigma = absolute_sigma
 
-        # put fit result in a dict of ufloats for easy access
-        self.ufloat_results = {}
-        for k, v in self.result.params.items():
-            stderr = np.nan if v.stderr is None else v.stderr
-            self.ufloat_results[k] = ufloat(v.value, stderr)
-
-    def pre_process(self):
-        self.coordinates = np.array(self.coordinates)
-        self.data = np.array(self.data)
-
-    @staticmethod
-    def model(*arg, **kwarg) -> np.ndarray:
-        raise NotImplementedError
-
-    @staticmethod
-    def guess(coordinates, data) -> Dict[str, Any]:
-        raise NotImplementedError
-
-    def run(self, params=None, dry=False, **fit_kwargs) -> lmfit.model.ModelResult:
-        """
-        Run the fit with lmfit.
-        :param params:
-        :param dry:
-        :param fit_kwargs:
-        :return:
-        """
+        self.param_order = self._extract_param_order()
         params = {} if params is None else params
-        
-        model = lmfit.model.Model(self.model)
+        self.params_def = self.guess(self.coordinates, self.data)
+        self.params_def.update(params)
 
-        lmfit_params = lmfit.Parameters()
-        coordinates, data = self.coordinates, self.data
-        guess_params = self.guess(coordinates, data)
-        guess_params.update(params)
+        # Validate provided param keys match expected
+        provided_keys = set(self.params_def.keys())
+        expected_keys = set(self.param_order)
+        missing = expected_keys - provided_keys
+        extra = provided_keys - expected_keys
+        if missing:
+            raise ValueError(f"Missing parameters for model: {missing}")
+        if extra:
+            raise ValueError(f"Unexpected parameters not used by model: {extra}")
 
-        for pn, pv in guess_params.items():
-            if isinstance(pv, lmfit.Parameter):
-                lmfit_params.add(pv)
-            else:
-                lmfit_params.add(pn, value=pv)
+        self._parse_params()
+
+        self.popt = None
+        self.pcov = None
+        self.perr = None
+        self.ufloat_results = {}
 
         if dry:
-            lmfit_result = lmfit.model.ModelResult(model, params=lmfit_params,
-                                                   data=data,
-                                                   fcn_kws=dict(coordinates=coordinates))
+            self.popt = self.initial_full
+            self.pcov = np.full((len(self.popt), len(self.popt)), np.nan)
         else:
-            lmfit_result = model.fit(data, params=lmfit_params,
-                                     coordinates=coordinates, **fit_kwargs)
+            fit_popt, fit_pcov = curve_fit(
+                self._fit_model,
+                self.coordinates,
+                self.data,
+                p0=self.initial,
+                bounds=self.bounds,
+                sigma=self.sigma,
+                absolute_sigma=self.absolute_sigma,
+                **fit_kwargs
+            )
+            self.popt = self._reinsert_fixed(fit_popt)
+            self.pcov = self._reconstruct_cov(fit_pcov)
 
-        return lmfit_result
+        self._process_results()
 
-    def plot(self, ax=None):
+    @staticmethod
+    def model(coordinates: np.ndarray, **params) -> np.ndarray:
+        """The model function to fit. Must be overridden by subclass."""
+        raise NotImplementedError
+
+    @staticmethod
+    def guess(coordinates, data) -> Dict[str, Union[float, Dict[str, Any]]]:
+        """Provide initial parameter guesses. Must be overridden by subclass."""
+        raise NotImplementedError
+
+    def _extract_param_order(self):
+        """Extract parameter names from model signature."""
+        sig = inspect.signature(self.model)
+        names = list(sig.parameters.keys())
+        return names[1:] if names and names[0] in {"x", "coordinates"} else names
+
+    def _parse_params(self):
+        """Parse parameter dictionary into internal fit structures."""
+        self.initial = []
+        self.bounds_lower = []
+        self.bounds_upper = []
+        self.fixed_mask = []
+        self.fit_order = []
+        self.initial_full = []
+
+        for name in self.param_order:
+            raw = self.params_def[name]
+            if isinstance(raw, dict):
+                val = raw.get("value", 0.0)
+                fixed = raw.get("fixed", False)
+                bounds = raw.get("bounds", (-np.inf, np.inf))
+            else:
+                val = raw
+                fixed = False
+                bounds = (-np.inf, np.inf)
+
+            self.initial_full.append(val)
+
+            if fixed:
+                self.fixed_mask.append(True)
+            else:
+                self.fixed_mask.append(False)
+                self.initial.append(val)
+                self.bounds_lower.append(bounds[0])
+                self.bounds_upper.append(bounds[1])
+                self.fit_order.append(name)
+
+        self.bounds = (np.array(self.bounds_lower), np.array(self.bounds_upper))
+
+    def _fit_model(self, coordinates, *fit_params):
+        """Internal callable passed to curve_fit."""
+        full_params = self._reinsert_fixed(fit_params)
+        return self.model(coordinates, **dict(zip(self.param_order, full_params)))
+
+    def _reinsert_fixed(self, fit_params):
+        """Reinsert fixed parameters into the full parameter list."""
+        full = []
+        idx = 0
+        for is_fixed, val in zip(self.fixed_mask, self.initial_full):
+            if is_fixed:
+                full.append(val)
+            else:
+                full.append(fit_params[idx])
+                idx += 1
+        return np.array(full)
+
+    def _reconstruct_cov(self, fit_pcov):
+        """Reconstruct full covariance matrix including fixed parameters."""
+        full_size = len(self.param_order)
+        full_pcov = np.full((full_size, full_size), np.nan)
+        idxs = [i for i, fixed in enumerate(self.fixed_mask) if not fixed]
+        for i_full, i_fit in zip(idxs, range(len(idxs))):
+            for j_full, j_fit in zip(idxs, range(len(idxs))):
+                full_pcov[i_full, j_full] = fit_pcov[i_fit, j_fit]
+        return full_pcov
+
+    def _process_results(self):
+        """Process fit results into ufloat dictionary and compute residuals."""
+        errs = (
+            [np.nan] * len(self.popt)
+            if self.pcov is None
+            else np.sqrt(np.diag(self.pcov))
+        )
+        self.perr = errs
+        for name, val, err in zip(self.param_order, self.popt, errs):
+            self.ufloat_results[name] = ufloat(val, err)
+
+        self.residuals = self.data - self.eval(self.coordinates)
+        self.r_squared = 1 - np.sum(self.residuals ** 2) / np.sum((self.data - np.mean(self.data)) ** 2)
+        self.chi_squared = (
+            np.sum(self.residuals ** 2 / self.sigma ** 2)
+            if self.sigma is not None
+            else np.sum(self.residuals ** 2)
+        )
+
+        self.result_string = ""
+        for k, v in self.ufloat_results.items():
+            self.result_string += f"{k}: {v:.4g}\n"
+        self.result_string = self.result_string[:-1]
+
+    def eval(self, coordinates: np.ndarray) -> np.ndarray:
+        """Evaluate the fitted model at given coordinates."""
+        return self.model(coordinates, **dict(zip(self.param_order, self.popt)))
+
+    def print(self):
+        """
+        print fitted result
+        """
+        print(f"Fit result:")
+        print(self.result_string)
+
+    def plot(self, ax=None, oversample=5, data_kwargs=None, fit_kwargs=None):
+        """
+        Plot the fitted model over a finer grid.
+
+        :param ax: Optional matplotlib axis. If None, creates a new figure.
+        :param oversample: Oversampling factor for fine plotting.
+        :param kwargs: Additional plot keyword args.
+        """
         if ax is None:
-            fig, ax = plt.subplots(1,1)
+            fig, ax = plt.subplots(1, 1)
         else:
-            fig = None
-        ax.plot(self.coordinates, self.data, ".", label="data")
-        fine_coords = np.linspace(self.coordinates[0], self.coordinates[-1], len(self.coordinates)*10)
-        ax.plot(fine_coords, self.result.eval(coordinates=fine_coords), label="fit")
+            fig = ax.get_figure()
+
+        data_kwargs = {"marker": ".", "label": "data", "linestyle": ""}
+        fit_kwargs = {"label": f'fit: {self.result_string}'}
+
+        data_kwargs.update(data_kwargs or {})
+        fit_kwargs.update(fit_kwargs or {})
+
+        ax.plot(self.coordinates, self.data, **data_kwargs)
+        self.plot_fitted(ax=ax, oversample=oversample, **fit_kwargs)
+        ax.legend()
         ax.grid()
         fig.tight_layout()
-        ax.legend()
         return fig, ax
+
+    def plot_fitted(self, ax=None, oversample=5, **kwargs):
+        """
+        Plot the fitted model over a finer grid.
+
+        :param ax: Optional matplotlib axis. If None, creates a new figure.
+        :param oversample: Oversampling factor for fine plotting.
+        :param kwargs: Additional plot keyword args.
+        """
+        if ax is None:
+            fig, ax = plt.subplots(1, 1)
+        else:
+            fig = ax.get_figure()
+
+        fine_x = np.linspace(self.coordinates[0], self.coordinates[-1], len(self.coordinates) * oversample)
+        ax.plot(fine_x, self.eval(fine_x), **kwargs)
+        ax.grid()
+        ax.legend()
+        fig.tight_layout()
+        return fig, ax
+
+
+if __name__ == "__main__":
+    from acadia_qmsmt.analysis.fitting import Cosine
+
+    # generate fake data
+    x = np.linspace(-0, 1, 100)
+    y_true = 1.5 * np.cos(20 * x + 5)
+    y_data = y_true + 0.1 * np.random.randn(len(x))
+
+    # do fit
+    # fit = Cosine(x, y_data)
+    # if want to adjust guess parameter
+    fit = Cosine(x, y_data, params={"f": {"value":5, "fixed": True}, "A": {"value": 2, "bounds":(1, np.inf)}})
+    fit.print()
+    fit.plot()
+    plt.show()
