@@ -1,10 +1,12 @@
+from typing import Any, Callable, Dict, Optional, Tuple, Union
+import inspect
+import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
-from typing import Any, Callable, Dict, Optional, Tuple, Union
 from uncertainties import ufloat
-import inspect
 
+logger = logging.getLogger(__name__)
 
 class FitterBase:
     """
@@ -61,22 +63,23 @@ class FitterBase:
         self.perr = None
         self.ufloat_results = {}
 
+        # default settings
+        use_fit_kwargs = {"maxfev": 10000, "method": "trf"}  # or 'dogbox' for more robust fitting but slower
+        use_fit_kwargs.update(fit_kwargs)
+
         if dry:
             self.popt = self.initial_full
             self.pcov = np.full((len(self.popt), len(self.popt)), np.nan)
         else:
-            fit_popt, fit_pcov = curve_fit(
-                self._fit_model,
-                self.coordinates,
-                self.data,
-                p0=self.initial,
-                bounds=self.bounds,
-                sigma=self.sigma,
-                absolute_sigma=self.absolute_sigma,
-                **fit_kwargs
-            )
-            self.popt = self._reinsert_fixed(fit_popt)
-            self.pcov = self._reconstruct_cov(fit_pcov)
+            try:
+                fit_popt, fit_pcov = curve_fit(self._fit_model, self.coordinates, self.data,
+                                                p0=self.initial, bounds=self.bounds, sigma=self.sigma,
+                                                absolute_sigma=self.absolute_sigma, **use_fit_kwargs)
+                self.popt = self._reinsert_fixed(fit_popt)
+                self.pcov = self._reconstruct_cov(fit_pcov)
+            except Exception as e:
+                self.popt = [np.nan] * len(expected_keys)
+                logger.error(e)
 
         self._process_results()
 
@@ -180,8 +183,10 @@ class FitterBase:
             self.result_string += f"{k}: {v:.4g}\n"
         self.result_string = self.result_string[:-1]
 
-    def eval(self, coordinates: np.ndarray) -> np.ndarray:
+    def eval(self, coordinates: np.ndarray=None) -> np.ndarray:
         """Evaluate the fitted model at given coordinates."""
+        if coordinates is None:
+            coordinates = self.coordinates
         return self.model(coordinates, **dict(zip(self.param_order, self.popt)))
 
     def print(self):
@@ -191,7 +196,7 @@ class FitterBase:
         print(f"Fit result:")
         print(self.result_string)
 
-    def plot(self, ax=None, oversample=5, data_kwargs=None, fit_kwargs=None):
+    def plot(self, ax=None, oversample=5, data_kwargs=None, result_kwargs=None):
         """
         Plot the fitted model over a finer grid.
 
@@ -205,13 +210,13 @@ class FitterBase:
             fig = ax.get_figure()
 
         data_kwargs = {"marker": ".", "label": "data", "linestyle": ""}
-        fit_kwargs = {"label": f'fit: {self.result_string}'}
+        result_kwargs = {"label": f'fit: {self.result_string}'}
 
         data_kwargs.update(data_kwargs or {})
-        fit_kwargs.update(fit_kwargs or {})
+        result_kwargs.update(result_kwargs or {})
 
         ax.plot(self.coordinates, self.data, **data_kwargs)
-        self.plot_fitted(ax=ax, oversample=oversample, **fit_kwargs)
+        self.plot_fitted(ax=ax, oversample=oversample, **result_kwargs)
         ax.legend()
         ax.grid()
         fig.tight_layout()
