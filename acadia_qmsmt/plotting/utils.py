@@ -1,9 +1,12 @@
-from typing import Callable, Tuple
+from typing import Callable, Tuple, Union, Optional
 import os
 import pickle
 import logging
+import warnings
+
 import numpy as np
 from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 from matplotlib.widgets import Button
 import matplotlib.pyplot as plt
 
@@ -13,28 +16,44 @@ from acadia_qmsmt.helpers import get_registered_plot_methods, get_data_process_m
 logger = logging.getLogger(__name__)
 
 
-def prepare_plot_axes(axs, axs_shape=(1, 1), **subplot_kwargs):
+def prepare_plot_axes(fig_or_axs: Union[None, Figure, Axes, np.ndarray[Axes]],
+                      axs_shape: Optional[Tuple[int, int]] = None,
+                      **subplot_kwargs) -> Tuple[Figure, Union[Axes, np.ndarray]]:
     """
-    Prepare the figure and axes for plotting. This is just a simple shortcut function that does
-    the things we would usually do in a plot method that takes optional plot axs.
+    Prepares figure and axes for plotting.
 
-    If `axs` is None, create a new subplot grid using `axs_shape`.
-    If `axs` is provided, attempt to extract the corresponding figure.
+    - If fig_axs is None: create a new figure and subplots with the given shape.
+    - If fig_axs is a Figure: return the figure and its existing axes;
+        if empty and axs_shape is provided, create subplots.
+    - If fig_axs is an Axes or array of Axes: return the associated figure and the axes.
 
-    :param axs:
-    :param axs_shape: unfortunately, we still have to provide this even though we might
-        have already provided it in the decorator
-    :return:
+    :param fig_or_axs: None, a matplotlib Figure, an Axes, or array of Axes
+    :param axs_shape: Shape for new subplots if needed (default: (1, 1))
+    :param subplot_kwargs: Additional kwargs passed to plt.subplots()
+    :return: (Figure, Axes or array of Axes)
     """
-    if axs is None:
+    if fig_or_axs is None:
+        axs_shape = axs_shape or (1, 1)
         fig, axs = plt.subplots(*axs_shape, **subplot_kwargs)
         return fig, axs
 
-    try:
-        fig = np.asarray(axs).flat[0].figure
-    except Exception:
-        fig = axs.figure
-    return fig, axs
+    # provided Figure object
+    if isinstance(fig_or_axs, Figure):
+        axs = fig_or_axs.get_axes()
+        if len(axs) == 0:
+            if axs_shape is not None:
+                axs = fig_or_axs.subplots(*axs_shape)
+            else:
+                warnings.warn("Provided Figure has no axes and axs_shape is None; returning empty axes list.")
+        return fig_or_axs, axs
+
+    # provided plot Axes
+    ax = np.atleast_1d(fig_or_axs).flat[0]
+    if isinstance(ax, Axes):
+        fig = ax.figure
+        return fig, fig_or_axs
+    else:
+        raise TypeError(f"Invalid input type: {type(fig_or_axs)}. Expected None, Figure, or (array if) Axes.")
 
 
 def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, transparent=True) -> None:

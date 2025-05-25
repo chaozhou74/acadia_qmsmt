@@ -1,15 +1,19 @@
 from datetime import datetime
 from typing import Union, List, Tuple, Literal
 import os
+import logging
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib.axes import Axes
 import numpy as np
 from scipy.interpolate import interp1d
 
 from acadia_qmsmt.helpers.yaml_editor import update_yaml
 from acadia_qmsmt.analysis import StateCircleType, ComplexDataTracesType, QubitStateLabels, find_quadrant, quadrant_signs
 from acadia_qmsmt.analysis.state_discrimination import find_state_circles, mask_state_with_circle
+
+logger = logging.getLogger(__name__)
 
 class KernelGeneratorBase:
     def __init__(self, traces: Union[List, np.ndarray], g_circle: StateCircleType, e_circle: StateCircleType,
@@ -97,18 +101,25 @@ class KernelGeneratorBase:
 
         return self.kernel_upload
 
-    def plot_kernel(self, plot_uploaded=True):
+    def plot_kernel(self, plot_ax:Axes=None, plot_uploaded=True):
         if plot_uploaded:
             kernel = self.kernel_upload
         else:
             kernel = self.kernel_trace
-        plt.figure()
-        plt.title("calculated kernel")
-        plt.plot(kernel.real, label="re")
-        plt.plot(kernel.imag, label="im")
-        plt.xlabel("pts")
-        plt.tight_layout()
-        plt.legend()
+
+        if plot_ax is None:
+            fig, ax = plt.subplots(1,1)
+        else:
+            fig, ax = plot_ax.get_figure(), plot_ax
+
+        ax.set_title("calculated kernel")
+        ax.plot(kernel.real, label="re")
+        ax.plot(kernel.imag, label="im")
+        ax.set_xlabel("pts")
+        fig.tight_layout()
+        ax.legend()
+
+        return fig, ax
 
     def save_kernel(self, directory, filename=None):
         """
@@ -145,20 +156,25 @@ class KernelGeneratorBase:
         update_dict = {key_path: kernel_path}
         update_yaml(yaml_file, update_dict, verbose=True)
 
-    def plot_kernel_generation(self, log_scale=False):
+    def plot_kernel_generation(self, plot_axs:List[Axes]=None, log_scale=False, bins:int = 101):
         """
         Plot the selection of g/e circles for kernel generation, the average of the selected g/e traces, and the
         expected IQ points after applying kernel.
 
+        :param plot_axs:
         :param log_scale:
         :return:
         """
         from matplotlib.colors import LogNorm
         norm = LogNorm() if log_scale else None
 
-        fig, axs = plt.subplots(3, 1, figsize=(5, 8))
+        if plot_axs is None:
+            fig, axs = plt.subplots(3, 1, figsize=(5, 8))
+        else:
+            fig, axs = plot_axs[0].get_figure(), plot_axs
+
         axs[0].set_title("raw IQ points and g/e selection")
-        axs[0].hist2d(self.all_pts.real, self.all_pts.imag, bins=101, cmap="hot", norm=norm)
+        axs[0].hist2d(self.all_pts.real, self.all_pts.imag, bins=bins, cmap="hot", norm=norm)
         for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
             circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
             axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor="w", facecolor="none"))
@@ -175,7 +191,7 @@ class KernelGeneratorBase:
 
         axs[2].set_title("IQ points after applying kernel")
         hist, xedges, yedges, _ = axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag,
-                                                bins=101, cmap="hot", norm=norm)
+                                                bins=bins, cmap="hot", norm=norm)
         if hasattr(self, "cmacc_offset"):
             x0, y0 = -self.cmacc_offset[0], -self.cmacc_offset[1]
             y0 = np.clip(y0, yedges[0], yedges[-1])
@@ -221,8 +237,10 @@ class KernelFromGETraces(KernelGeneratorBase):
 
         :param g_traces: complex IQ traces from g state preparation, should have the shape of (iterations, time_points)
         :param e_traces: complex IQ traces from e state preparation, should have the shape of (iterations, time_points)
+
         :param g_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
         :param e_circle: (I_center + 1j * Q_center, circle_radius). When None, will perform automatic searching
+
         :param i_threshold: The I position of the separation line. Default to center of the g and e blobs.
         :param q_threshold: The Q position of the separation line. Default to 3-sigma away from the center of the g
             blob.
@@ -241,15 +259,27 @@ class KernelFromGETraces(KernelGeneratorBase):
         self.i_threshold = i_threshold
         self.q_threshold = q_threshold
         self.all_traces = np.concatenate([g_traces, e_traces])
-        if (g_circle and e_circle) is None:  # at least one of the circles is not provided
-            g_e_circles = find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
-                                             sigma_factor=sigma_factor, average_radius=average_radius, debug=debug)
+        self.bins = bins
+        # if at least one of the circle parameters is not provided, use search function
+        g_center, g_radius = (None, None) if g_circle is None else g_circle
+        e_center, e_radius = (None, None) if e_circle is None else e_circle
+        try: # incase anything fails in kernel calculation, we still have the averaged traces and data
+            if any(x is None for x in (g_center, g_radius, e_center, e_radius)):
+                g_e_circles = find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
+                                                 sigma_factor=sigma_factor, average_radius=average_radius, debug=debug)
 
-        g_circle = g_circle if g_circle is not None else g_e_circles[0]
-        e_circle = e_circle if e_circle is not None else g_e_circles[1]
+            g_circle = (g_center if g_center is not None else g_e_circles[0][0],
+                        g_radius if g_radius is not None else g_e_circles[0][1])
+            e_circle = (e_center if e_center is not None else g_e_circles[1][0],
+                        e_radius if e_radius is not None else g_e_circles[1][1])
 
-        super().__init__(self.all_traces, g_circle, e_circle, norm_factor, decimation_used, plot)
+            super().__init__(self.all_traces, g_circle, e_circle, norm_factor, decimation_used, plot)
+        except Exception as e:
+            logger.error(f"Kernel calculation error: {e}")
 
+    def plot_kernel_generation(self, plot_axs:List[Axes]=None, log_scale=False, bins:int = None):
+        bins = self.bins if bins is None else bins
+        super().plot_kernel_generation(plot_axs, log_scale, bins)
 
     def generate_cmacc_offset(self, i_threshold: int = None, q_threshold: int = None) \
             -> Tuple[complex, Tuple[int, int]]:
@@ -298,17 +328,19 @@ class KernelFromGETraces(KernelGeneratorBase):
 
         return offset, (q_g, q_e)
 
-    def update_cmacc_offset(self, yaml_file: str, offset_key_path: str, quadrant_key_path: str):
+    def update_cmacc_offset(self, yaml_file: str, offset_key_path: str, quadrant_key_path: str = None):
         """
         Update the cmacc_offset and g_e_quadrant in a yaml config file.
 
         :param yaml_file: Path to the yaml config file
         :param offset_key_path: Dot-separated string representing the hierarchical path to the "cmacc_offset" key in the
             nested dict structure of the YAML file (e.g., "ro_capture.cmacc_offset")
-        :param offset_key_path: key path to the "state_quadrants" key in the YAML file.
+        :param quadrant_key_path: key path to the "state_quadrants" key in the YAML file.
         :return:
         """
-        update_dict = {offset_key_path: self.cmacc_offset, quadrant_key_path: [*self.state_quadrants]}
+        update_dict = {offset_key_path: self.cmacc_offset}
+        if quadrant_key_path is not None:
+            update_dict.update({quadrant_key_path: [*self.state_quadrants]})
         update_yaml(yaml_file, update_dict, verbose=True)
 
 
@@ -319,13 +351,13 @@ def load_kernel(kernel_path):
 
 if __name__ == "__main__":
     from acadia.data import DataManager
-    import matplotlib
-    matplotlib.use('qt5agg')
+    # import matplotlib
+    # matplotlib.use('qtagg')
     import matplotlib.pyplot as plt
     plt.ion()
 
 
-    data_dir = "/tmp/241127_133001"
+    data_dir = "/home/rsl/Data/LINC_Cooldown_20250506/ChipA/RoTrace/250525_142611"
     dm = DataManager()
     dm.load(data_dir)
     g_traces = np.array(dm[f"traces_g"].records()).astype(float).view(complex).squeeze()
@@ -333,10 +365,6 @@ if __name__ == "__main__":
     all_data = np.concatenate([g_traces, e_traces])
 
     kgen = KernelFromGETraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
-    from acadia_qmsmt.helpers.plot_utils import add_button
-
-    save_kernel = lambda _: kgen.save_kernel(r"../_develop//")
-    button = add_button(kgen.fig, save_kernel, "save kernel")
 
 
     # kernel=load_kernel(r"../_develop//"+"readoutkernel_241105_113318.npy")
@@ -356,3 +384,5 @@ if __name__ == "__main__":
     plt.figure()
     plt.hist2d(kgen.new_iq_pts[kgen.g_mask].real, kgen.new_iq_pts[kgen.g_mask].imag, bins=51)
     plt.hist2d(kgen.all_pts[kgen.g_mask].real, kgen.all_pts[kgen.g_mask].imag, bins=51)
+
+    plt.show()

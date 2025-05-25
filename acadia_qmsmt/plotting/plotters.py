@@ -43,6 +43,38 @@ def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None) -
     return fig, ax
 
 
+def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: bool = False,
+                             figsize=None, **kwargs):
+    """
+    Plot 2D histograms of complex IQ points.
+
+    :param iq_pts: One or more arrays of complex IQ data.
+    :param plot_ax: Optional Matplotlib axes or figure.
+    :param bins: Number of bins for histograms.
+    :param log_scale: Use logarithmic color scale.
+    :param figsize: Figure size if creating new figure.
+    :param kwargs: Additional kwargs for hist2d.
+    :return: (fig, axs) tuple
+    """
+    from matplotlib.colors import LogNorm
+    norm = LogNorm() if log_scale else None
+
+    iq_pts = [np.asarray(pts).ravel() for pts in iq_pts]  # ensure 1D arrays
+    fig, axs = prepare_plot_axes(plot_ax, axs_shape=(1, len(iq_pts)), figsize=figsize)
+    axs = np.atleast_1d(axs)
+
+    all_pts = np.concatenate(iq_pts)
+    hist_range = ((all_pts.real.min(), all_pts.real.max()), (all_pts.imag.min(), all_pts.imag.max()))
+
+    for i, pts in enumerate(iq_pts):
+        axs[i].hist2d(pts.real, pts.imag, cmap="hot",
+                      bins=bins, range=hist_range, norm=norm, **kwargs)
+        axs[i].set_aspect('equal', adjustable='box')
+        axs[i].autoscale(enable=True, axis='both', tight=True)
+    return fig, axs
+
+
+
 def plot_pcolormesh_fft(x_vals, fft_freqs, fft_data, plot_ax=None, figsize=(8, 6),
                         quadratic_fit=True, fft_peak_threshold=0.4) -> [Figure, Axis]:
     """

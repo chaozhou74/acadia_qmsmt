@@ -156,19 +156,22 @@ def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
     real_bins = np.linspace(all_pts.real.min(), all_pts.real.max(), compare_hist_bin)
     imag_bins = np.linspace(all_pts.imag.min(), all_pts.imag.max(), compare_hist_bin)
 
+    if debug:
+        fig, axs = plt.subplots(len(state_pts), 2, figsize=(4, n_states * 3))
+        axs = [axs] if n_states == 1 else axs
+        fig.suptitle("find_state_circles debug")
+
     for i, pts in enumerate(state_pts):
         hist, _, _, bin_indices = _hist2d_with_indices(pts, bins=[real_bins, imag_bins])
         hist_list.append(hist / len(pts))
         bin_indices_list.append(bin_indices)
+        if debug:
+            axs[i, 0].hist2d(pts.real, pts.imag, bins=[real_bins, imag_bins], cmap="hot")
+            axs[i, 0].set_aspect(1)
 
     hist_all = np.sum(hist_list, axis=0)
 
     # find circle for each state
-    if debug:
-        fig, axs = plt.subplots(len(state_pts), 1, figsize=(4, n_states * 3))
-        axs = [axs] if n_states == 1 else axs
-        axs[0].set_title("find_state_circles debug")
-
     for i, pts in enumerate(state_pts):
         # make a hist of the current state
         hist, bin_indices = hist_list[i], bin_indices_list[i]
@@ -185,9 +188,9 @@ def find_state_circles(*state_pts: ComplexDataPointsType, bins: int = 50,
         r_list.append(radius)
 
         if debug:
-            axs[i].hist2d(pts_vld.real, pts_vld.imag, bins=bins, cmap="hot")
-            axs[i].add_patch(patches.Circle((center.real, center.imag), radius, edgecolor="w", facecolor="none"))
-            axs[i].set_aspect(1)
+            axs[i, 1].hist2d(pts_vld.real, pts_vld.imag, bins=bins, cmap="hot")
+            axs[i, 1].add_patch(patches.Circle((center.real, center.imag), radius, edgecolor="w", facecolor="none"))
+            axs[i, 1].set_aspect(1)
 
     if average_radius:
         r_list = [np.mean(r_list)] * n_states
