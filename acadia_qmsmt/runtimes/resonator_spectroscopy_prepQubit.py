@@ -5,19 +5,21 @@ from numpy.typing import NDArray
 from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime
-from acadia.runtime import annotate_method
 from acadia.sample_arithmetic import sample_to_complex
-from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig
+from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig, Qubit
+from acadia.runtime import annotate_method
 
-class ResonatorSpectroscopyRuntime(QMsmtRuntime):
+class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for readout spectroscopy
     """
     # The name of the sections in the yaml file for the required channels
     stimulus: IOConfig
     capture: IOConfig
+    qubit_stimulus: IOConfig
 
     frequencies: Union[list, np.ndarray]
+    qubit_prep_pulse_mem: str
 
     iterations: int
     run_delay: int
@@ -35,8 +37,10 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         stimulus_io = self.io("stimulus")
         capture_io = self.io("capture")
+        qubit_stimulus_io = self.io("qubit_stimulus")
 
         resonator = MeasurableResonator(stimulus_io, capture_io)
+        qubit = Qubit(qubit_stimulus_io)
 
         # Create the record group for saving captured data
         self.data.add_group(f"points", uniform=True)
@@ -46,6 +50,8 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
             resonator.prepare_cmacc(self.capture_window_name)
 
             with a.channel_synchronizer():
+                qubit.pulse("rotation")
+                a.barrier()
                 # Measure the resonator by driving the "readout" waveform on the stimulus IO
                 # and capture into the "readout_accumulated" waveform on the capture IO
                 resonator.measure("readout", "readout_accumulated")
@@ -64,6 +70,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         resonator.load_windows()
         # Load the stimulus waveform named "readout" with the specified signal
         stimulus_io.load_waveform("readout", self.stimulus_waveform_name)
+        qubit_stimulus_io.load_waveform("rotation", self.qubit_prep_pulse_mem)
 
         for i in range(self.iterations):
             for frequency in self.frequencies:
@@ -80,6 +87,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
                 return
 
         self.final_serve()
+
 
     def initialize(self):
         pass
@@ -112,9 +120,6 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
             e_delay = -k / np.pi / 2
         self.avg_iq_corrected = self.avg_iq * np.exp(1j * self.frequencies * e_delay * np.pi * 2)
 
-        from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
-        self.fit = Lorentzian(self.frequencies, np.abs(self.avg_iq))
-        self.fitted_f0 = self.fit.ufloat_results["x0"]
         self.e_delay_applied = e_delay
 
         return completed_iterations
@@ -127,9 +132,6 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         data = self.avg_iq_corrected if apply_e_delay else self.avg_iq
         axs[0].plot(self.frequencies, np.abs(data), "o")
-        
-        # axs[0].plot(self.frequencies, self.fit.eval(), "-", label=f"{self.fitted_f0}")
-        self.fit.plot_fitted(axs[0], oversample=1, label=f"{self.fitted_f0}")
 
         phases = np.angle(data, deg=True)
         if unwrap_phase:
@@ -140,6 +142,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         axs[1].set_xlabel("Frequency [Hz]")
         axs[1].set_ylabel("Phase (deg)")
         axs[0].set_ylabel("Mag (a.u.)")
+
         for ax in axs:
             ax.legend()
             ax.grid(True)
@@ -147,17 +150,13 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         fig.tight_layout()
         return fig, axs
 
-    @annotate_method(button_name="update frequency")
-    def update_freq(self):
-        self.update_io_yaml_field("stimulus", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
-        self.update_io_yaml_field("capture", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
 
 
 
 
 
 
-    # --------------- live plot in jpynb ---------------------
+    # # --------------- live plot in jpynb ---------------------
     # def initialize(self):
         
     #     if self.plot:
@@ -318,7 +317,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
     # def fit_lorentzian(self) -> float:
     #     from acadia_qmsmt.analysis import population_in_quadrant
-    #     from acadia_qmsmt.analysis import rotate_iq
+    #     from acadia_qmsmt.analysis.fitting import rotate_iq
     #     from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
     #     from acadia_qmsmt.helpers.plot_utils import add_button
     #     from acadia_qmsmt.helpers.yaml_editor import update_yaml

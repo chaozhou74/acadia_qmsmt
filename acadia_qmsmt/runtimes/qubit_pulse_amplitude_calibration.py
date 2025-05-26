@@ -130,7 +130,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.qubit_amplitudes, self.data_to_fit, ".")
+        axs.plot(self.qubit_amplitudes, self.data_to_fit, "o")
         self.fit.plot_fitted(axs, oversample=5, label=f"pi_amp: {self.fitted_pi_amp:.5g}")
 
         axs.set_xlabel("Drive Amplitude [DAC]")

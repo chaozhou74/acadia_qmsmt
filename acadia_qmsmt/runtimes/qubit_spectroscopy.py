@@ -104,7 +104,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
     @annotate_method(is_data_processor=True)
     def process_current_data(self, thresholded:bool=False):
-        from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+        from acadia_qmsmt.analysis import reshape_iq_data_by_axes, find_iq_rotation, rotate_iq
         data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_frequencies)
         if data_spec is None:
             return
@@ -112,12 +112,20 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             completed_iterations = len(data_spec)
         self.data_iq = data_spec.astype(float).view(complex).squeeze()
         self.avg_iq = np.mean(self.data_iq, axis=0)
+        self.shots = (1-np.sign(self.data_iq.real))/2
+        self.avg_shots = np.mean(self.shots, axis=0)
+
+        # for non thresholded data, find the best rotation angle that
+        # puts all the information on the I quadrature 
+        rot_angle = find_iq_rotation(self.avg_iq)
+        self.data_iq_rot = rotate_iq(self.data_iq, rot_angle)
+        self.avg_iq_rot = rotate_iq(self.avg_iq, rot_angle)
 
         if thresholded:
-            self.data_to_fit = np.mean((1-np.sign(self.data_iq.real))/2, axis=0)
+            self.data_to_fit = self.avg_shots
         else:
             from acadia_qmsmt.analysis import rotate_iq
-            self.data_to_fit = rotate_iq(self.avg_iq).real
+            self.data_to_fit = self.avg_iq_rot.real
         self.thresholded = thresholded
 
         from acadia_qmsmt.analysis.fitting import Lorentzian
@@ -127,12 +135,12 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         return completed_iterations
     
 
-    @annotate_method(plot_name="qubit spectrocopy", axs_shape=(1,1))
+    @annotate_method(plot_name="1 qubit spectrocopy", axs_shape=(1,1))
     def plot_data(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.qubit_frequencies, self.data_to_fit, ".")
+        axs.plot(self.qubit_frequencies, self.data_to_fit, "o")
         self.fit.plot_fitted(axs, oversample=5, label=f"{self.fitted_f0:.5g}")
 
         axs.set_xlabel("Frequency [Hz]")
@@ -142,12 +150,28 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             axs.set_ylabel("re(data) after rotation")
 
         axs.legend()
+        axs.grid(True)
+        return fig, axs
+
+    @annotate_method(plot_name="2 bin averaged", axs_shape=(1,1))
+    def plot_bin_avg(self, axs=None, n_avg=1):
+        from acadia_qmsmt.plotting import prepare_plot_axes, plot_binaveraged
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+        if self.thresholded:
+            axs.set_ylabel("e pop")
+            fig, axs = plot_binaveraged(self.qubit_frequencies, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
+        else:
+            axs.set_ylabel("re(data) after rotation")
+            fig, axs = plot_binaveraged(self.qubit_frequencies, self.data_iq_rot.real, axs, n_avg=n_avg)
+        axs.set_ylabel("Probe freq [Hz]")
         return fig, axs
 
 
     @annotate_method(button_name="update frequency")
     def update_freq(self):
         self.update_io_yaml_field("qubit_stimulus", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
+
+
 
 
 

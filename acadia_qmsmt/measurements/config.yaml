@@ -1,0 +1,211 @@
+qb_stimulus:
+  channel: DAC0 # DAC1 # for scope check
+  channel_config:
+    vop: 30000
+    mix_reconstruction: true # flase # for scope check
+    nco_frequency: 8.094e+9    # 50e6 # for scope check
+  memories:
+    rotation:
+      fixed_length: 200e-9
+      length: 60e-9 # TIME FOR RAMPS!!!
+    rotation_2:
+      fixed_length: 200e-9
+      length: 60e-9 # TIME FOR RAMPS!!!
+    rotation_selective:
+      length: 4000e-9 # TIME FOR RAMPS!!!
+      fixed_length: 0.e+1
+    rotation_selective_2:
+      length: 4000e-9 # TIME FOR RAMPS!!!
+      fixed_length: 0e+0
+  waveforms:
+    R_x_180:
+      data: hann
+      scale: 0.44643
+    R_x_180_selective:
+      data: hann
+      scale: 0.0517
+    R_x_90:
+      data: hann
+      scale: 0.2205
+
+ro_stimulus:
+  channel: DAC2
+  channel_config:
+    vop: 25000
+    mix_reconstruction: true # true
+    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
+  memories:
+    readout:
+      fixed_length: 0.4e-6
+      length: 200e-9
+    readout_pulse_long_memory:
+      fixed_length: 160e-9
+      length: 100e-9
+    readout_pulse_long_memory_alt:
+      fixed_length: 160e-9
+      length: 100e-9
+  waveforms:
+    readout:
+      data: hann
+      scale: (0.35, 0deg)
+    readout_pulse_long_shape:
+      data: hann
+      scale: (0.8, 0deg)
+    readout_pulse_long_shape_alt:
+      data: hann
+      scale: (0.25, 90deg)
+
+ro_capture:
+  channel: ADC0
+  channel_config:
+    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
+  memories:
+    readout_trace:
+      length: 1.2e-6
+      decimation: 4
+      region: plddr
+    readout_accumulated:
+      length: 1.2e-6
+      decimation: 0
+      region: plddr
+    readout_accumulated_alt_1:
+      length: 2.5e-6
+      decimation: 0
+      region: plddr
+    readout_accumulated_alt_2:
+      length: 2.5e-6
+      decimation: 0
+      region: plddr
+    readout_trace_long:
+      length: 31e-6
+      decimation: 4
+      region: plddr
+  capture_delay: 320e-9
+  windows:
+    boxcar:
+      data: 0.1
+      offset: [0, 0]
+    matched:
+      data: 
+        /home/acadia_test/acadia_test/notebooks/readout_kernels/readout_capture_matched_250526_012106.npy
+      offset: [301, 2438]
+  state_quadrants: [1, 2]
+
+  
+qb_alice_bs_stimulus:
+  channel: DAC6 # DAC7 for scope check, DAC6 for normal operation
+  channel_config:
+    vop: 30000
+    mix_reconstruction: false
+    nco_frequency: 2.64131e9 # 20e6 # for scope check
+  memories:
+    swap_mem:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 240e-9
+    swap_mem_2:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 240e-9
+    dChi_pump_mem:
+      length: 300e-9 # TIME FOR RAMPS!!!
+      fixed_length: 5e-6
+    dChi_parity_map_mem:
+      length: 400e-9 # TIME FOR RAMPS!!!
+      fixed_length: 560e-9
+  waveforms:
+    swap_wf:
+      data: hann
+      scale: 0.0395
+    dChi_pump_wf:
+      data: hann
+      scale: 0.15
+    dChi_parity_map_wf:
+      data: hann
+      scale: 0.15
+
+
+qb_bob_bs_stimulus:
+  channel: DAC4 # DAC7 for scope check 
+  channel_config:
+    vop: 30000
+    mix_reconstruction: false
+    nco_frequency: 1.893915e9  # 20e6 # for scope check
+  memories:
+    swap_mem:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 1200e-9
+    swap_mem_2:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 1200e-9
+    dChi_pump_mem:
+      length: 600e-9 # TIME FOR RAMPS!!!
+      fixed_length: 5e-6
+  waveforms:
+    swap_wf:
+      data: hann
+      scale: 0.011
+    dChi_pump_wf:
+      data: hann
+      scale: 0.08
+
+
+
+alice_bob_bs_stimulus:
+  channel: DAC3
+  channel_config:
+    vop: 29000
+    mix_reconstruction: false
+    nco_frequency: 0.748e9
+  memories:
+    swap_mem:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 1150e-9
+    bs_50_50_mem:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 500e-9
+  waveforms:
+    swap_wf:
+      data: hann
+      scale: 0.406
+    bs_50_50_wf:
+      data: hann
+      scale: 0.4426
+
+
+qb_linc_bs_stimulus:
+  channel: DAC3
+  channel_config:
+    vop: 20000
+    mix_reconstruction: false
+    nco_frequency: 0.8585e9
+  memories:
+    swap_mem:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 60e-9
+    swap_mem_2:
+      length: 80e-9 # TIME FOR RAMPS!!!
+      fixed_length: 60e-9
+  waveforms:
+    swap_wf:
+      data: hann
+      scale: 0.4
+
+alice_stimulus:
+  channel: DAC5 # DAC??? for scope check, DAC5 for normal operation
+  channel_config:
+    vop: 30000
+    mix_reconstruction: true
+    nco_frequency: 5.452160e9 # 20e6 # for scope check
+  memories:
+    fast_disp_mem:
+      length: 400e-9 # TIME FOR RAMPS!!!
+      fixed_length: 400e-9
+    slow_disp_mem:
+      length: 10000e-9 # TIME FOR RAMPS!!!
+      fixed_length: 0.e+1
+  waveforms:
+    fast_disp_wf:
+      data: hann
+      scale: 0.0856
+    slow_disp_wf:
+      data: hann
+      scale: 0.0104

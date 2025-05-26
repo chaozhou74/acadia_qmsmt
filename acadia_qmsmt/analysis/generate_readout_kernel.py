@@ -118,6 +118,7 @@ class KernelGeneratorBase:
         ax.set_xlabel("pts")
         fig.tight_layout()
         ax.legend()
+        ax.grid()
 
         return fig, ax
 
@@ -188,6 +189,7 @@ class KernelGeneratorBase:
             axs[1].plot(trace.imag, ".-", color=trace_colors[2 * i + 1], label=f"{['g', 'e'][i]} trace, im")
             axs[1].set_xlabel("pts")
             axs[1].legend()
+            axs[1].grid(True)
 
         axs[2].set_title("IQ points after applying kernel")
         hist, xedges, yedges, _ = axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag,

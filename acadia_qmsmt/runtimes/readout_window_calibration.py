@@ -192,6 +192,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
             axs[i, 1].plot(self.t_data, np.mean(traces.real, axis=0), label=f"prep {prep}, re")
             axs[i, 1].plot(self.t_data, np.mean(traces.imag, axis=0), label=f"prep {prep}, im")
             axs[i, 1].legend()
+            axs[i, 1].grid(True)
             axs[i, 0].set_title(f"prep {prep}")
         return fig, axs
 

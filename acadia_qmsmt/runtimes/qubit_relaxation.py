@@ -117,12 +117,12 @@ class QubitRelaxationRuntime(QMsmtRuntime):
     @annotate_method(is_data_processor=True)
     def process_current_data(self, thresholded:bool=True):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
-        if data_spec is None:
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
+        if data is None:
             return
         else:
-            completed_iterations = len(data_spec)
-        self.data_iq = data_spec.astype(float).view(complex).squeeze()
+            completed_iterations = len(data)
+        self.data_iq = data.astype(float).view(complex).squeeze()
         self.avg_iq = np.mean(self.data_iq, axis=0)
         self.shots = (1-np.sign(self.data_iq.real))/2
 
@@ -145,7 +145,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.delay_times_us, self.data_to_fit, ".")
+        axs.plot(self.delay_times_us, self.data_to_fit, "o")
         self.fit.plot_fitted(axs, oversample=5, label=f"T1 (us): {self.fitted_t1_us:.4g}")
 
         axs.set_xlabel("Time [us]")

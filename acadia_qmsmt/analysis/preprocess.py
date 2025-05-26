@@ -34,6 +34,26 @@ def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
 
     return data
 
+
+def find_iq_rotation(iq_pts:ComplexDataPointsType):
+    """
+    Find the rotation angle in radian that minimizes the 
+    variation of the q component.
+
+    :param iq_pts: Array of complex iq data points
+
+    :return: optimal angle in radians
+    """
+    def std_q(theta_):
+        iq_temp = iq_pts.ravel() * np.exp(1j * theta_)
+        return np.std(iq_temp.imag)
+
+    res = minimize_scalar(std_q, bounds=[0, TwoPi])
+    angle = res.x
+    
+    return angle
+
+
 def rotate_iq(iq_pts:ComplexDataPointsType, angle: float = None):
     """
     Rotate the iq data points on the complex plane.
@@ -45,12 +65,7 @@ def rotate_iq(iq_pts:ComplexDataPointsType, angle: float = None):
     """
     iq_pts = np.array(iq_pts)
     if angle is None:
-        def std_q(theta_):
-            iq_temp = iq_pts * np.exp(1j * theta_)
-            return np.std(iq_temp.imag)
-
-        res = minimize_scalar(std_q, bounds=[0, TwoPi])
-        angle = res.x
+        angle = find_iq_rotation(iq_pts)
 
     iq_new = iq_pts * np.exp(1j * angle)
 
