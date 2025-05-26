@@ -56,6 +56,37 @@ def rotate_iq(iq_pts:ComplexDataPointsType, angle: float = None):
 
     return iq_new
 
+def to_complex(x, allow_1d_real: bool = False, flatten: bool = False) -> np.ndarray:
+    """
+    Convert various IQ input formats to a 1D complex numpy array.
+
+    Accepted formats:
+      - 1D complex array
+      - ND array with shape (..., 2): [...,0] is real, [...,1] is imag
+      - Optional: 1D real array, interpreted as real-only (if allow_1d_real=True)
+
+    :param x: Input array (list, numpy array, etc).
+    :param allow_1d_real: If True, allow 1D real inputs and interpret as purely real.
+    :param flatten: If True, return a 1D flattened array.
+    :return: ND array of complex numbers.
+    :raises ValueError: If input is not a valid IQ format.
+    """
+    x = np.asarray(x)
+
+    if np.iscomplexobj(x):
+        return x.ravel() if flatten else x
+
+    elif x.ndim >= 1 and x.shape[-1] == 2:
+        iq = x[..., 0] + 1j * x[..., 1]
+        return iq.ravel() if flatten else iq
+
+    elif allow_1d_real and x.ndim == 1 and np.issubdtype(x.dtype, np.floating):
+        iq = x.astype(np.complex128)
+        return iq.ravel() if flatten else iq
+
+    else:
+        raise ValueError(f"Unsupported IQ format: shape={x.shape}, dtype={x.dtype}")
+
 def cut_peak(data, cut_factor=0.5, plot=True, debug=False):
     """
     find the highest peak of a given dataset, set the region around the peak to np.nan. Returns the

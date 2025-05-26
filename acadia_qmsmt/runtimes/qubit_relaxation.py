@@ -6,6 +6,7 @@ from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
+from acadia.runtime import annotate_method
 
 def decay(t, A, tau, B):
     return A*np.exp(-t/tau) + B
@@ -97,89 +98,162 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
         self.final_serve()
 
+
     def initialize(self):
-        
-        if self.plot:
-            from acadia.processing import DynamicLine
-            import matplotlib.pyplot as plt
-            from IPython.display import display
-            from ipywidgets import Label
-
-            self.figsize = (4, 3) if self.figsize is None else self.figsize
-            self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
-            self.fig.tight_layout()
-            self.fig.subplots_adjust(left=0.25, bottom=0.25)
-
-            self.line_pop = DynamicLine(ax, ".", color="red")
-            self.line_fit = DynamicLine(ax, "--", color="red")
-            ax.set_xlabel("Delay Time [s]")
-            ax.set_ylabel("Measurement Polarization")
-            ax.set_xlim(self.delay_times[0], self.delay_times[-1])
-            ax.set_ylim(-1.1, 1.1)
-            ax.grid()
-
-            self.decay_label = Label(style={"description_width": "initial"})
-            display(self.decay_label)
-
-            from tqdm.notebook import tqdm
-
-        else:
-            from tqdm import tqdm
-
-        self.fit = None
-        self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
-        self.iterations_previous = 0
+        pass
 
     def update(self):
-        # First make sure that we actually have new data to process
-        if "points" not in self.data or len(self.data["points"]) < len(self.delay_times):
-            return
-
-        # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["points"]) // len(self.delay_times)
-        if completed_iterations == 0:
-            return
-
-        self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
-
-        valid_points = completed_iterations*len(self.delay_times)
-        data = self.data["points"].records()[:valid_points, ...]
-        data = data.reshape(completed_iterations, len(self.delay_times), 2)
-
-        # Threshold the data according to the I quadrature
-        shots = np.sign(data[:,:,0], dtype=np.int32)
-        self.avg = np.mean(shots, axis=0)
-
-        # Give the fit a reasonable initial guess
-        # p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
-        # self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0,bounds=[(-2.,0.1,-1.),(0.,1e6,1.)])
-
-        # if self.plot:
-        #     self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
-        #     if self.fit is not None:
-        #         self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
-        #         self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
-        #     self.fig.canvas.draw_idle() 
-
-
-        from acadia_qmsmt.analysis.fitting.exponential import Exponential
-        self.fit = Exponential(self.delay_times, self.avg)
-
-        if self.plot:
-            self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
-            if self.fit is not None:
-                self.decay_label.value = f"Decay time: {round(self.fit.ufloat_results['tau'].n*1e6, 3)} +- " +\
-                                         f"{round(self.fit.ufloat_results['tau'].s*1e6, 3)} us" 
-                self.line_fit.update(self.delay_times, self.fit.result.eval(coordinates=self.delay_times), rescale_axis=False)
-            self.fig.canvas.draw_idle() 
-
-
+        # save current data
         self.data.save(self.local_directory)
-        self.iterations_previous = completed_iterations
 
     def finalize(self):
         super().finalize()
-        self.iterations_progress_bar.close()
         if self.plot:
-            self.savefig(self.fig)
+            from acadia_qmsmt.plotting import save_registered_plots
+            save_registered_plots(self)
+
+
+
+    @annotate_method(is_data_processor=True)
+    def process_current_data(self, thresholded:bool=True):
+        from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+        data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
+        if data_spec is None:
+            return
+        else:
+            completed_iterations = len(data_spec)
+        self.data_iq = data_spec.astype(float).view(complex).squeeze()
+        self.avg_iq = np.mean(self.data_iq, axis=0)
+        self.shots = (1-np.sign(self.data_iq.real))/2
+
+        if thresholded:
+            self.data_to_fit = np.mean(self.shots, axis=0)
+        else:
+            from acadia_qmsmt.analysis import rotate_iq
+            self.data_to_fit = rotate_iq(self.avg_iq).real
+        self.thresholded = thresholded
+
+        from acadia_qmsmt.analysis.fitting import Exponential
+        self.delay_times_us = self.delay_times * 1e6
+        self.fit = Exponential(self.delay_times_us, self.data_to_fit)
+        self.fitted_t1_us = self.fit.ufloat_results["tau"]
+        return completed_iterations
+    
+
+    @annotate_method(plot_name="1 qubit T1", axs_shape=(1,1))
+    def plot_data(self, axs=None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+
+        axs.plot(self.delay_times_us, self.data_to_fit, ".")
+        self.fit.plot_fitted(axs, oversample=5, label=f"T1 (us): {self.fitted_t1_us:.4g}")
+
+        axs.set_xlabel("Time [us]")
+        if self.thresholded:
+            axs.set_ylabel("e pop")
+            axs.set_ylim(-0.02, 1.02)
+        else:
+            axs.set_ylabel("re(data) after rotation")
+
+        axs.legend()
+        return fig, axs
+    
+    @annotate_method(plot_name="2 bin averaged T1", axs_shape=(1,1))
+    def plot_bin_avg(self, axs=None, n_avg=1):
+        from acadia_qmsmt.plotting import prepare_plot_axes, plot_binaveraged
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+
+        fig, axs = plot_binaveraged(self.delay_times_us, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
+        axs.set_ylabel("Time [us]")
+        return fig, axs
+
+
+
+# --------------------------------------- in jpynb plotting ------------------------
+
+    # def initialize(self):
+        
+    #     if self.plot:
+    #         from acadia.processing import DynamicLine
+    #         import matplotlib.pyplot as plt
+    #         from IPython.display import display
+    #         from ipywidgets import Label
+
+    #         self.figsize = (4, 3) if self.figsize is None else self.figsize
+    #         self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
+    #         self.fig.tight_layout()
+    #         self.fig.subplots_adjust(left=0.25, bottom=0.25)
+
+    #         self.line_pop = DynamicLine(ax, ".", color="red")
+    #         self.line_fit = DynamicLine(ax, "--", color="red")
+    #         ax.set_xlabel("Delay Time [s]")
+    #         ax.set_ylabel("Measurement Polarization")
+    #         ax.set_xlim(self.delay_times[0], self.delay_times[-1])
+    #         ax.set_ylim(-1.1, 1.1)
+    #         ax.grid()
+
+    #         self.decay_label = Label(style={"description_width": "initial"})
+    #         display(self.decay_label)
+
+    #         from tqdm.notebook import tqdm
+
+    #     else:
+    #         from tqdm import tqdm
+
+    #     self.fit = None
+    #     self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
+    #     self.iterations_previous = 0
+
+    # def update(self):
+    #     # First make sure that we actually have new data to process
+    #     if "points" not in self.data or len(self.data["points"]) < len(self.delay_times):
+    #         return
+
+    #     # Update the progress bar based on the number of iterations
+    #     completed_iterations = len(self.data["points"]) // len(self.delay_times)
+    #     if completed_iterations == 0:
+    #         return
+
+    #     self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
+
+    #     valid_points = completed_iterations*len(self.delay_times)
+    #     data = self.data["points"].records()[:valid_points, ...]
+    #     data = data.reshape(completed_iterations, len(self.delay_times), 2)
+
+    #     # Threshold the data according to the I quadrature
+    #     shots = np.sign(data[:,:,0], dtype=np.int32)
+    #     self.avg = np.mean(shots, axis=0)
+
+    #     # Give the fit a reasonable initial guess
+    #     # p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
+    #     # self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0,bounds=[(-2.,0.1,-1.),(0.,1e6,1.)])
+
+    #     # if self.plot:
+    #     #     self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
+    #     #     if self.fit is not None:
+    #     #         self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
+    #     #         self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
+    #     #     self.fig.canvas.draw_idle() 
+
+
+    #     from acadia_qmsmt.analysis.fitting.exponential import Exponential
+    #     self.fit = Exponential(self.delay_times, self.avg)
+
+    #     if self.plot:
+    #         self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
+    #         if self.fit is not None:
+    #             self.decay_label.value = f"Decay time: {round(self.fit.ufloat_results['tau'].n*1e6, 3)} +- " +\
+    #                                      f"{round(self.fit.ufloat_results['tau'].s*1e6, 3)} us" 
+    #             self.line_fit.update(self.delay_times, self.fit.result.eval(coordinates=self.delay_times), rescale_axis=False)
+    #         self.fig.canvas.draw_idle() 
+
+
+    #     self.data.save(self.local_directory)
+    #     self.iterations_previous = completed_iterations
+
+    # def finalize(self):
+    #     super().finalize()
+    #     self.iterations_progress_bar.close()
+    #     if self.plot:
+    #         self.savefig(self.fig)
 

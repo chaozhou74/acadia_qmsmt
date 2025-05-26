@@ -6,13 +6,14 @@ from matplotlib.axis import Axis
 import numpy as np
 
 from acadia_qmsmt.plotting import prepare_plot_axes
+from acadia_qmsmt.analysis import to_complex
 
 """
 Collection of commonly used plotting functions
 """
 
 
-def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None) -> [Figure, Axis]:
+def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None, vmin=None, v_max=None) -> [Figure, Axis]:
     """
     Plot a pcolormesh of bin-averaged raw traces.
 
@@ -36,7 +37,7 @@ def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None) -
     data_ba = data_vld.reshape(n_lines, n_avg, -1).mean(axis=1)  # bin averaged
     bin_index = np.arange(n_lines)
 
-    pcm = ax.pcolormesh(bin_index, axis_vals, data_ba.T, cmap="bwr")
+    pcm = ax.pcolormesh(bin_index, axis_vals, data_ba.T, cmap="bwr", vmin=vmin, vmax=v_max)
     fig.colorbar(pcm, ax=ax)
     ax.set_xlabel(f"iterations ({n_avg}x) ")
 
@@ -46,20 +47,24 @@ def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None) -
 def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: bool = False,
                              figsize=None, **kwargs):
     """
-    Plot 2D histograms of complex IQ points.
+    Plot 2D histograms of IQ points (complex or real-valued 2D arrays).
 
-    :param iq_pts: One or more arrays of complex IQ data.
+    Accepts either:
+      - 1D complex arrays: [a + bj, ...]
+      - 2D float arrays of shape (N, 2): [[I, Q], ...]
+
+    :param iq_pts: One or more arrays of IQ data.
     :param plot_ax: Optional Matplotlib axes or figure.
     :param bins: Number of bins for histograms.
     :param log_scale: Use logarithmic color scale.
     :param figsize: Figure size if creating new figure.
-    :param kwargs: Additional kwargs for hist2d.
+    :param kwargs: Additional kwargs passed to hist2d.
     :return: (fig, axs) tuple
     """
     from matplotlib.colors import LogNorm
     norm = LogNorm() if log_scale else None
 
-    iq_pts = [np.asarray(pts).ravel() for pts in iq_pts]  # ensure 1D arrays
+    iq_pts = [to_complex(pts, flatten=True) for pts in iq_pts]
     fig, axs = prepare_plot_axes(plot_ax, axs_shape=(1, len(iq_pts)), figsize=figsize)
     axs = np.atleast_1d(axs)
 

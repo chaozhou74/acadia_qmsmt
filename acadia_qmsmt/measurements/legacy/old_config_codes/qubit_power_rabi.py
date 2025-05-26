@@ -180,7 +180,7 @@ class QubitPwrRabiRuntime(AutoConfigMixin, Runtime):
         """
         #todo: this is getting really bloated...
         from acadia_qmsmt.analysis import population_in_quadrant
-        from acadia_qmsmt.analysis.fitting import rotate_iq
+        from acadia_qmsmt.analysis import rotate_iq
         from acadia_qmsmt.analysis.fitting.cosine import Cosine
         from acadia_qmsmt.measurements import CONFIG_FILE_PATH
         from acadia_qmsmt.helpers.plot_utils import add_button

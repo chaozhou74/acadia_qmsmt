@@ -181,7 +181,7 @@ class KernelGeneratorBase:
             axs[0].text(circ_i + circ_r * 0.8, circ_q + circ_r * 0.8, state, fontsize=12, va='center', color="w")
         axs[0].set_aspect('equal')
 
-        axs[1].set_title("IQ traces after selection")
+        axs[1].set_title("average of selected IQ traces")
         trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
         for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
             axs[1].plot(trace.real, ".-", color=trace_colors[2 * i], label=f"{['g', 'e'][i]} trace, re")

@@ -130,15 +130,22 @@ def update_yaml(yaml_path: str, new_param_dict: dict, verbose=False):
 
     :return: yaml dict with updated parameters, plain text version, no handler is applied.
     """
+    def set_by_path(root, items, value, allow_new_key=True):
+        """
+        Set a value in a nested object in root by item sequence.
 
-    def get_by_path(root, items):
-        """Access a nested object in root by item sequence"""
-        return reduce(operator.getitem, items, root)
+        If allow_new_key is False, will raise KeyError if the final key doesn't exist.
+        Intermediate levels are always created if missing.
+        """
+        for item in items[:-1]:
+            if item not in root or not isinstance(root[item], dict):
+                root[item] = {}
+            root = root[item]
 
-    def set_by_path(root, items, value):
-        """Set a value in a nested object in root by item sequence"""
-        target = get_by_path(root, items[:-1])
-        target[items[-1]] =  value
+        if not allow_new_key and items[-1] not in root:
+            raise KeyError(f"Key '{items[-1]}' does not exist in path: {'.'.join(items)}")
+
+        root[items[-1]] = value
 
 
     def float_representer(dumper, data):

@@ -83,6 +83,8 @@ class FitterBase:
 
         self._process_results()
 
+        self.result=CompatResult(self)
+
     @staticmethod
     def model(coordinates: np.ndarray, **params) -> np.ndarray:
         """The model function to fit. Must be overridden by subclass."""
@@ -241,6 +243,18 @@ class FitterBase:
         ax.legend()
         fig.tight_layout()
         return fig, ax
+
+
+class CompatResult:
+    def __init__(self, fitter: FitterBase):
+        """
+        Lightweight mock of lmfit's Result object to maintain compatibility
+        with older code expecting .eval() and .params.
+
+        :param fitter: A fitted FitterBase instance providing the needed methods/attributes.
+        """
+        self.eval = fitter.eval
+        self.params = fitter.ufloat_results
 
 
 if __name__ == "__main__":
