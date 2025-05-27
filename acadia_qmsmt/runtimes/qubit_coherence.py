@@ -139,14 +139,17 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
         if thresholded:
             self.data_to_fit = np.mean(self.shots, axis=0)
+            self.data_sigma = np.std(self.shots, axis=0)/np.sqrt(completed_iterations)
         else:
-            from acadia_qmsmt.analysis import rotate_iq
-            self.data_to_fit = rotate_iq(self.avg_iq).real
+            from acadia_qmsmt.analysis import rotate_iq, find_iq_rotation
+            rot_angle = find_iq_rotation(self.avg_iq)
+            self.data_to_fit = rotate_iq(self.avg_iq, rot_angle).real
+            self.data_sigma = np.std(rotate_iq(self.data_iq, rot_angle).real, axis=0)/np.sqrt(completed_iterations)
         self.thresholded = thresholded
 
         from acadia_qmsmt.analysis.fitting import ExpCosine
         self.delay_times_us = self.delay_times * 1e6
-        self.fit = ExpCosine(self.delay_times_us, self.data_to_fit)
+        self.fit = ExpCosine(self.delay_times_us, self.data_to_fit, sigma=self.data_sigma)
         self.fitted_t2_us = self.fit.ufloat_results["tau"]
         self.fitted_detune_MHz = self.fit.ufloat_results["f"]
         return completed_iterations
@@ -157,8 +160,9 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.delay_times_us, self.data_to_fit, "o")
-        self.fit.plot_fitted(axs, oversample=5, label=f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}")
+        self.fit.plot(axs, oversample=5, data_kwargs={"markersize": 10}, 
+                            result_kwargs={"label":f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}"})
+        # self.fit.plot_fitted(axs, oversample=5, label=f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}")
 
         axs.set_xlabel("Time [us]")
         if self.thresholded:

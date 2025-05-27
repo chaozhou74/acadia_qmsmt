@@ -216,11 +216,15 @@ class FitterBase:
 
         data_kwargs.update(data_kwargs or {})
         result_kwargs.update(result_kwargs or {})
-
-        ax.plot(self.coordinates, self.data, **data_kwargs)
+        if self.sigma is None:
+            ax.plot(self.coordinates, self.data, **data_kwargs)
+        else:
+            errorbar_kwargs = dict(linestyle='', marker='o', markersize=10)
+            errorbar_kwargs.update(data_kwargs)
+            ax.errorbar(self.coordinates, self.data, self.sigma, **errorbar_kwargs)
         self.plot_fitted(ax=ax, oversample=oversample, **result_kwargs)
         ax.legend()
-        ax.grid()
+        ax.grid(True)
         fig.tight_layout()
         return fig, ax
 
@@ -239,7 +243,7 @@ class FitterBase:
 
         fine_x = np.linspace(self.coordinates[0], self.coordinates[-1], len(self.coordinates) * oversample)
         ax.plot(fine_x, self.eval(fine_x), **kwargs)
-        ax.grid()
+        ax.grid(True)
         ax.legend()
         fig.tight_layout()
         return fig, ax

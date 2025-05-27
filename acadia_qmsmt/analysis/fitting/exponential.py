@@ -17,7 +17,3 @@ class Exponential(FitterBase):
         tau_ = (coordinates[-1] - coordinates[0])/3
         tau = {"value": tau_, "bounds": (1e-10, np.inf)}
         return dict(A=A, tau=tau, of=of)
-
-    def plot(self, ax=None):
-        fig, ax = super().plot(ax)
-        ax.set_title(f"tau: {self.ufloat_results['tau']}")

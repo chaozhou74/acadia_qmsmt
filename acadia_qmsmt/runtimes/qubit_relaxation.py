@@ -125,17 +125,21 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         self.data_iq = data.astype(float).view(complex).squeeze()
         self.avg_iq = np.mean(self.data_iq, axis=0)
         self.shots = (1-np.sign(self.data_iq.real))/2
+        
 
         if thresholded:
             self.data_to_fit = np.mean(self.shots, axis=0)
+            self.data_sigma = np.std(self.shots, axis=0)/np.sqrt(completed_iterations)
         else:
-            from acadia_qmsmt.analysis import rotate_iq
-            self.data_to_fit = rotate_iq(self.avg_iq).real
+            from acadia_qmsmt.analysis import rotate_iq, find_iq_rotation
+            rot_angle = find_iq_rotation(self.avg_iq)
+            self.data_to_fit = rotate_iq(self.avg_iq, rot_angle).real
+            self.data_sigma = np.std(rotate_iq(self.data_iq, rot_angle).real, axis=0)/np.sqrt(completed_iterations)
         self.thresholded = thresholded
 
         from acadia_qmsmt.analysis.fitting import Exponential
         self.delay_times_us = self.delay_times * 1e6
-        self.fit = Exponential(self.delay_times_us, self.data_to_fit)
+        self.fit = Exponential(self.delay_times_us, self.data_to_fit, sigma=self.data_sigma)
         self.fitted_t1_us = self.fit.ufloat_results["tau"]
         return completed_iterations
     
@@ -145,8 +149,8 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.delay_times_us, self.data_to_fit, "o")
-        self.fit.plot_fitted(axs, oversample=5, label=f"T1 (us): {self.fitted_t1_us:.4g}")
+        self.fit.plot(axs, oversample=5, data_kwargs={"markersize": 10}, 
+                            result_kwargs={"label": f"T1 (us): {self.fitted_t1_us:.4g}"})
 
         axs.set_xlabel("Time [us]")
         if self.thresholded:

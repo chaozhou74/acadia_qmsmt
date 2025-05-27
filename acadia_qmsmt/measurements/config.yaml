@@ -86,8 +86,7 @@ ro_capture:
       data: 0.1
       offset: [0, 0]
     matched:
-      data: 
-        /home/acadia_test/acadia_test/notebooks/readout_kernels/readout_capture_matched_250526_012106.npy
+      data: 0.1
       offset: [301, 2438]
   state_quadrants: [1, 2]
 
