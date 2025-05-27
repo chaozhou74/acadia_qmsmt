@@ -46,6 +46,95 @@ class InputOutputWaveforms:
         sample_times = np.arange(output.size) / output.size
         output[:] = 0.5 - 0.5 * np.cos(2 * np.pi * (sample_times - offset) / length)
         output[:] *= np.logical_and(sample_times >= offset, sample_times < offset+length)
+
+    @staticmethod
+    def sum_of_cosines(output: NDArray, coeffs: NDArray) -> None:
+        """
+        Return a generalized sum-of-cosines envelope. The entire output is filled.
+        """
+        z = 2 * np.pi * np.arange(output.size) / output.size
+
+        output[:] = 0
+        for idx,coeff in enumerate(coeffs):
+            output[:] += coeff*np.cos(idx*z)
+        
+        # The signal has its maximum value at z = 1/2, where the cosines are passed integer multiples of pi
+        # So the zeroth, second, etc have value 1 and the first, third, etc. terms have value -1
+        signs = np.ones(len(coeffs), dtype=np.float64)
+        signs[1::2] *= -1
+        output[:] /= np.dot(coeffs, signs)
+
+    @staticmethod
+    def sum_of_cosines_precise(output: NDArray, coeffs: NDArray, length: float = 1, offset: float = 0) -> None:
+        """
+        Calculate a Hann (or raised-cosine) function. The length of the pulse 
+        is continuously variable, as is the starting time.
+
+        :param length: The length of the pulse, expressed as a fraction of the 
+            total size of the output
+        :type length: float
+        :param offset: The starting time of the pulse, expressed as a fraction 
+            of the total size of the output.
+        :type offset: float
+        """
+
+        sample_times = np.arange(output.size) / output.size
+        output[:] = 0
+        for idx,coeff in enumerate(coeffs):
+            output[:] += coeff*np.cos(idx*2 * np.pi * (sample_times - offset) / length)
+        
+        signs = np.ones(len(coeffs), dtype=np.float64)
+        signs[1::2] *= -1
+        output[:] /= np.dot(coeffs, signs)
+        output[:] *= np.logical_and(sample_times >= offset, sample_times < offset+length)
+
+    @staticmethod
+    def hft248d(output: NDArray) -> None:
+        """
+        Calculate an HFT248d function. The entire output is filled.
+        """
+        coeffs = np.array([1, -1.985844164102, 1.791176438506, -1.282075284005, 0.667777530266, -0.240160796576, 0.056656381764, -0.008134974479, 0.000624544650, -0.000019808998, 0.000000132974])
+        return InputOutputWaveforms.sum_of_cosines(output, coeffs)
+
+    @staticmethod
+    def hft248d_precise(output: NDArray, length: float = 1, offset: float = 0) -> None:
+        """
+        Calculate an HFT248d function. The entire output is filled.
+        """
+        coeffs = np.array([1, -1.985844164102, 1.791176438506, -1.282075284005, 0.667777530266, -0.240160796576, 0.056656381764, -0.008134974479, 0.000624544650, -0.000019808998, 0.000000132974])
+        return InputOutputWaveforms.sum_of_cosines_precise(output, coeffs, length, offset)
+
+    @staticmethod
+    def matlab_flat_top(output: NDArray) -> None:
+        """
+        Return a pulse with the MATLAB flat-top function. The entire output is filled.
+        """
+        coeffs = np.array([1, -0.41663158/0.21557895, 0.277263158/0.21557895, -0.083578947/0.21557895, 0.006947386/0.21557895])
+        return InputOutputWaveforms.sum_of_cosines(output, coeffs)
+
+    @staticmethod
+    def piecewise_cosine(output: NDArray, handle_times: NDArray, handle_amplitudes: NDArray) -> None:
+        """
+        A piecewise-defined pulse, where the form of the signal between its 
+        "handles" is a half-period of a cosine. The handle times are fractions 
+        of the total pulse length. The entire output is filled.
+        """
+
+        handle_times = np.array(handle_times)
+        handle_amplitudes = np.array(handle_amplitudes)
+
+        sample_times = np.arange(output.size) / output.size
+
+        piece_amplitudes = np.diff(handle_amplitudes)
+        piece_lengths = np.diff(handle_times)
+
+        # Rectangular windows that "select" the different pieces
+        piece_rects = np.logical_and(sample_times[None,:] >= handle_times[:-1,None], 
+                                     sample_times[None,:] < handle_times[1:,None]).astype(output.dtype)
+
+        piece_cosines = piece_amplitudes[:,None] * 0.5 * (1 - np.cos(np.pi * (sample_times[None,:] - handle_times[:-1,None]) / piece_lengths[:,None]))
+        piece_shifted_cosines = piece_cosines + handle_amplitudes[:-1,None]
+        np.sum(piece_shifted_cosines * piece_rects, axis=0, out=output)
         
 
 class InputOutput:
