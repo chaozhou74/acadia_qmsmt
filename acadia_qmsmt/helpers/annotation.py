@@ -2,7 +2,7 @@ from typing import Dict
 
 PLOT_NAME_TAG = "plot_name"
 BUTTON_NAME_TAG = "button_name"
-DISABLE_TAG = "disabled"
+DISABLE_TAG = "disable"
 AXS_SHAPE_TAG = "axs_shape"
 DATA_PROCESS_TAG = "is_data_processor"
 
