@@ -133,7 +133,7 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
 
         from acadia_qmsmt.analysis.fitting import Lorentzian
         self.fit = Lorentzian(self.frequencies, self.data_to_fit)
-        self.fitted_f0 = self.fit.ufloat_results["x0"]
+        self.fitted_f0_MHz = self.fit.ufloat_results["x0"]/1e6
         self.qubit_nco = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
         return completed_iterations
     
@@ -143,18 +143,19 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.frequencies, self.data_to_fit, "o")
-        self.fit.plot_fitted(axs, oversample=5, label=f"{self.fitted_f0:.5g}")
+        self.fit.plot(axs, oversample=5, 
+                      result_kwargs=dict(label=f"{self.fitted_f0_MHz:.5g} MHz"))
 
         axs.set_xlabel("Detuning [Hz]")
         if self.thresholded:
             axs.set_ylabel("e pop")
+            axs.set_ylim(-0.02, 1.02)
         else:
             axs.set_ylabel("re(data) after rotation")
 
         axs.legend()
         axs.grid(True)
-        axs.set_title(f"NCO: {self.qubit_nco}")
+        axs.set_title(f"NCO: {self.qubit_nco/1e9} GHz, fitted_deune: {self.fitted_f0_MHz} MHz")
         return fig, axs
 
     @annotate_method(plot_name="2 bin averaged", axs_shape=(1,1))

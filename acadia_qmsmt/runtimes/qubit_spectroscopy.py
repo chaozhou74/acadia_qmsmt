@@ -146,6 +146,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         axs.set_xlabel("Frequency [Hz]")
         if self.thresholded:
             axs.set_ylabel("e pop")
+            axs.set_ylim(-0.02, 1.02)
         else:
             axs.set_ylabel("re(data) after rotation")
 

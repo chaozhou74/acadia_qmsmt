@@ -211,7 +211,7 @@ class FitterBase:
         else:
             fig = ax.get_figure()
 
-        data_kwargs_ = dict(linestyle='', marker='o', markersize=10, label="data")
+        data_kwargs_ = dict(linestyle='', marker='o', markersize=7, label="data")
         result_kwargs_ = {"label": f'fit: {self.result_string}'}
 
         data_kwargs_.update(data_kwargs or {})

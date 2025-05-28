@@ -160,7 +160,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        self.fit.plot(axs, oversample=5, data_kwargs={"markersize": 10}, 
+        self.fit.plot(axs, oversample=5, 
                             result_kwargs={"label":f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}"})
         # self.fit.plot_fitted(axs, oversample=5, label=f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}")
 

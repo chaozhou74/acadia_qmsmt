@@ -149,7 +149,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        self.fit.plot(axs, oversample=5, data_kwargs={"markersize": 10}, 
+        self.fit.plot(axs, oversample=5,
                             result_kwargs={"label": f"T1 (us): {self.fitted_t1_us:.4g}"})
         axs.set_title(f"T1: {self.fit.ufloat_results['tau']:.5g}")
 
