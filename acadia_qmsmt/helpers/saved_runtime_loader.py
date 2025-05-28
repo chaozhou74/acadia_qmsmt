@@ -110,7 +110,7 @@ def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt:bool = True)
 
     :param data_directory: Path a local data folder
     :param use_saved_qmsmt: If True, attempt to replace the local `acadia_qmsmt.qmsmt` module by the saved
-                            `acadia_qmsmt.py` n the data folder. So direct re-deploy will use the qmsmt classes that
+                            `acadia_qmsmt.py` in the data folder. So direct re-deploy will use the qmsmt classes that
                             were used at the original runtime.
                             If False or not found, fall back to the global version in the Python environment.
     """

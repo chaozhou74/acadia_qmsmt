@@ -11,7 +11,7 @@ from matplotlib.widgets import Button
 import matplotlib.pyplot as plt
 
 from acadia import Runtime
-from acadia_qmsmt.helpers import get_registered_plot_methods, get_data_process_method
+from acadia_qmsmt.helpers import get_registered_plot_methods, get_data_process_method, get_registered_customizer
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,16 @@ def prepare_plot_axes(fig_or_axs: Union[None, Figure, Axes, np.ndarray[Axes]],
         raise TypeError(f"Invalid input type: {type(fig_or_axs)}. Expected None, Figure, or (array if) Axes.")
 
 
-def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, transparent=True) -> None:
+def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, use_customizer=True,
+                          transparent=True) -> None:
     """
     Do a final plot on all registered plot methods and save the figures.
 
     :param runtime: Runtime object that has the registered plot methods.
     :param save_pickle: If True, save a copy of the pickled plot
     :param do_process: If True, re-run the data processing method tagged by `DATA_PROCESS_TAG=True`
+        before plotting the data
+    :param use_customizer: If True, try running the customizer method tagged by `CUSTOMIZATION_METHOD_TAG=True`
         before plotting the data
     :param transparent: If True, save png with transparent background
     :return:
@@ -78,6 +81,11 @@ def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, t
         if do_process:
             data_process_method_name = get_data_process_method(runtime)
             getattr(runtime, data_process_method_name)()
+
+        if use_customizer:
+            customizer_method_name = get_registered_customizer(runtime)
+            if customizer_method_name is not None:
+                getattr(runtime, customizer_method_name)()
 
         plots = get_registered_plot_methods(runtime)
         for plot_name, method_name in plots.items():
