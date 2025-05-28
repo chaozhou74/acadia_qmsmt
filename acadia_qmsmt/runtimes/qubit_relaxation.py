@@ -151,6 +151,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
         self.fit.plot(axs, oversample=5, data_kwargs={"markersize": 10}, 
                             result_kwargs={"label": f"T1 (us): {self.fitted_t1_us:.4g}"})
+        axs.set_title(f"T1: {self.fit.ufloat_results['tau']:.5g}")
 
         axs.set_xlabel("Time [us]")
         if self.thresholded:

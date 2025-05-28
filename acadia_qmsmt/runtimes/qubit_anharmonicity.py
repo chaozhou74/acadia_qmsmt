@@ -6,6 +6,7 @@ from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
+from acadia.runtime import annotate_method
 
 def flopping(pulse_amp, oscillation_amp, oscillation_freq):
     return oscillation_amp * np.cos(2 * np.pi * pulse_amp * oscillation_freq)
@@ -88,84 +89,183 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
 
         self.final_serve()
 
+
     def initialize(self):
-        
-        if self.plot:
-            from acadia.processing import DynamicLine
-            import matplotlib.pyplot as plt
-            from IPython.display import display
-            from ipywidgets import Label
-
-            self.figsize = (4, 3) if self.figsize is None else self.figsize
-            self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
-            self.fig.tight_layout()
-            self.fig.subplots_adjust(left=0.25, bottom=0.25)
-
-            self.line_pop = DynamicLine(ax, ".", color="red")
-            self.line_fit = DynamicLine(ax, "--", color="red")
-            ax.set_xlabel("Pulse Detuning [Hz]")
-            ax.set_ylabel("Population [FS]")
-            ax.set_xlim(self.frequencies[0], self.frequencies[-1])
-            ax.set_ylim(-1.1, 1.1)
-            ax.grid()
-
-            self.amplitude_label = Label(style={"description_width": "initial"})
-            display(self.amplitude_label)
-
-            from tqdm.notebook import tqdm
-
-        else:
-            from tqdm import tqdm
-
-        self.fit = None
-        self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
-        self.iterations_previous = 0
+        pass
 
     def update(self):
-        # First make sure that we actually have new data to process
-        if "points" not in self.data or len(self.data["points"]) < len(self.frequencies):
-            return
-
-        # Update the progress bar based on the number of iterations
-        completed_iterations = len(self.data["points"]) // len(self.frequencies)
-        if completed_iterations == 0:
-            return
-
-        self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
-
-        valid_points = completed_iterations*len(self.frequencies)
-        data = self.data["points"].records()[:valid_points, ...]
-        data = data.reshape(completed_iterations, len(self.frequencies), 2)
-
-        # Threshold the data according to the I quadrature
-        shots = np.sign(data[:,:,0], dtype=np.int32)
-        self.avg = np.mean(shots, axis=0)
-        
-
-        # Fit the data to a sine
-        # try:
-        #     amin = np.argmin(self.avg)
-        #     amax = np.argmax(self.avg)
-        #     osc_period = 2*abs(self.qubit_amplitudes[amin]-self.qubit_amplitudes[amax])
-        #     p0 = (abs(amin-amax)/2, 1/osc_period)
-        #     self.fit, pcov = curve_fit(flopping, self.qubit_amplitudes, self.avg, p0=p0)
-            
-        # except:
-        #     pass
-        
-        if self.plot:
-            self.line_pop.update(self.frequencies, self.avg, rescale_axis=False)
-            # if self.fit is not None:
-            #     self.amplitude_label.value = f"Pi pulse amplitude: {round(0.5/self.fit[1], 6)}"
-            #     self.line_fit.update(self.qubit_amplitudes, flopping(self.qubit_amplitudes, *self.fit), rescale_axis=False)
-            self.fig.canvas.draw_idle() 
-
+        # save current data
         self.data.save(self.local_directory)
-        self.iterations_previous = completed_iterations
 
     def finalize(self):
         super().finalize()
-        self.iterations_progress_bar.close()
         if self.plot:
-            self.savefig(self.fig)
+            from acadia_qmsmt.plotting import save_registered_plots
+            save_registered_plots(self)
+
+
+
+    @annotate_method(is_data_processor=True)
+    def process_current_data(self, thresholded:bool=False):
+        from acadia_qmsmt.analysis import reshape_iq_data_by_axes, find_iq_rotation, rotate_iq
+        data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies)
+        if data_spec is None:
+            return
+        else:
+            completed_iterations = len(data_spec)
+        self.data_iq = data_spec.astype(float).view(complex).squeeze()
+        self.avg_iq = np.mean(self.data_iq, axis=0)
+        self.shots = (1-np.sign(self.data_iq.real))/2
+        self.avg_shots = np.mean(self.shots, axis=0)
+
+        # for non thresholded data, find the best rotation angle that
+        # puts all the information on the I quadrature 
+        rot_angle = find_iq_rotation(self.avg_iq)
+        self.data_iq_rot = rotate_iq(self.data_iq, rot_angle)
+        self.avg_iq_rot = rotate_iq(self.avg_iq, rot_angle)
+
+        if thresholded:
+            self.data_to_fit = self.avg_shots
+        else:
+            from acadia_qmsmt.analysis import rotate_iq
+            self.data_to_fit = self.avg_iq_rot.real
+        self.thresholded = thresholded
+
+        from acadia_qmsmt.analysis.fitting import Lorentzian
+        self.fit = Lorentzian(self.frequencies, self.data_to_fit)
+        self.fitted_f0 = self.fit.ufloat_results["x0"]
+        self.qubit_nco = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
+        return completed_iterations
+    
+
+    @annotate_method(plot_name="1 qubit spectrocopy", axs_shape=(1,1))
+    def plot_data(self, axs=None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+
+        axs.plot(self.frequencies, self.data_to_fit, "o")
+        self.fit.plot_fitted(axs, oversample=5, label=f"{self.fitted_f0:.5g}")
+
+        axs.set_xlabel("Detuning [Hz]")
+        if self.thresholded:
+            axs.set_ylabel("e pop")
+        else:
+            axs.set_ylabel("re(data) after rotation")
+
+        axs.legend()
+        axs.grid(True)
+        axs.set_title(f"NCO: {self.qubit_nco}")
+        return fig, axs
+
+    @annotate_method(plot_name="2 bin averaged", axs_shape=(1,1))
+    def plot_bin_avg(self, axs=None, n_avg=1):
+        from acadia_qmsmt.plotting import prepare_plot_axes, plot_binaveraged
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+        if self.thresholded:
+            axs.set_ylabel("e pop")
+            fig, axs = plot_binaveraged(self.frequencies, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
+        else:
+            axs.set_ylabel("re(data) after rotation")
+            fig, axs = plot_binaveraged(self.frequencies, self.data_iq_rot.real, axs, n_avg=n_avg)
+        axs.set_ylabel("Probe freq [Hz]")
+        return fig, axs
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # def initialize(self):
+        
+    #     if self.plot:
+    #         from acadia.processing import DynamicLine
+    #         import matplotlib.pyplot as plt
+    #         from IPython.display import display
+    #         from ipywidgets import Label
+
+    #         self.figsize = (4, 3) if self.figsize is None else self.figsize
+    #         self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
+    #         self.fig.tight_layout()
+    #         self.fig.subplots_adjust(left=0.25, bottom=0.25)
+
+    #         self.line_pop = DynamicLine(ax, ".", color="red")
+    #         self.line_fit = DynamicLine(ax, "--", color="red")
+    #         ax.set_xlabel("Pulse Detuning [Hz]")
+    #         ax.set_ylabel("Population [FS]")
+    #         ax.set_xlim(self.frequencies[0], self.frequencies[-1])
+    #         ax.set_ylim(-1.1, 1.1)
+    #         ax.grid()
+
+    #         self.amplitude_label = Label(style={"description_width": "initial"})
+    #         display(self.amplitude_label)
+
+    #         from tqdm.notebook import tqdm
+
+    #     else:
+    #         from tqdm import tqdm
+
+    #     self.fit = None
+    #     self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
+    #     self.iterations_previous = 0
+
+    # def update(self):
+    #     # First make sure that we actually have new data to process
+    #     if "points" not in self.data or len(self.data["points"]) < len(self.frequencies):
+    #         return
+
+    #     # Update the progress bar based on the number of iterations
+    #     completed_iterations = len(self.data["points"]) // len(self.frequencies)
+    #     if completed_iterations == 0:
+    #         return
+
+    #     self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
+
+    #     valid_points = completed_iterations*len(self.frequencies)
+    #     data = self.data["points"].records()[:valid_points, ...]
+    #     data = data.reshape(completed_iterations, len(self.frequencies), 2)
+
+    #     # Threshold the data according to the I quadrature
+    #     shots = np.sign(data[:,:,0], dtype=np.int32)
+    #     self.avg = np.mean(shots, axis=0)
+        
+
+    #     # Fit the data to a sine
+    #     # try:
+    #     #     amin = np.argmin(self.avg)
+    #     #     amax = np.argmax(self.avg)
+    #     #     osc_period = 2*abs(self.qubit_amplitudes[amin]-self.qubit_amplitudes[amax])
+    #     #     p0 = (abs(amin-amax)/2, 1/osc_period)
+    #     #     self.fit, pcov = curve_fit(flopping, self.qubit_amplitudes, self.avg, p0=p0)
+            
+    #     # except:
+    #     #     pass
+        
+    #     if self.plot:
+    #         self.line_pop.update(self.frequencies, self.avg, rescale_axis=False)
+    #         # if self.fit is not None:
+    #         #     self.amplitude_label.value = f"Pi pulse amplitude: {round(0.5/self.fit[1], 6)}"
+    #         #     self.line_fit.update(self.qubit_amplitudes, flopping(self.qubit_amplitudes, *self.fit), rescale_axis=False)
+    #         self.fig.canvas.draw_idle() 
+
+    #     self.data.save(self.local_directory)
+    #     self.iterations_previous = completed_iterations
+
+    # def finalize(self):
+    #     super().finalize()
+    #     self.iterations_progress_bar.close()
+    #     if self.plot:
+    #         self.savefig(self.fig)
 

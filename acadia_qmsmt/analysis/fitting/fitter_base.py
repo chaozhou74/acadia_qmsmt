@@ -211,18 +211,17 @@ class FitterBase:
         else:
             fig = ax.get_figure()
 
-        data_kwargs = {"marker": ".", "label": "data", "linestyle": ""}
-        result_kwargs = {"label": f'fit: {self.result_string}'}
+        data_kwargs_ = dict(linestyle='', marker='o', markersize=10, label="data")
+        result_kwargs_ = {"label": f'fit: {self.result_string}'}
 
-        data_kwargs.update(data_kwargs or {})
-        result_kwargs.update(result_kwargs or {})
+        data_kwargs_.update(data_kwargs or {})
+        result_kwargs_.update(result_kwargs or {})
         if self.sigma is None:
-            ax.plot(self.coordinates, self.data, **data_kwargs)
+            ax.plot(self.coordinates, self.data, **data_kwargs_)
         else:
-            errorbar_kwargs = dict(linestyle='', marker='o', markersize=10)
-            errorbar_kwargs.update(data_kwargs)
-            ax.errorbar(self.coordinates, self.data, self.sigma, **errorbar_kwargs)
-        self.plot_fitted(ax=ax, oversample=oversample, **result_kwargs)
+            ax.errorbar(self.coordinates, self.data, self.sigma, **data_kwargs_)
+        
+        self.plot_fitted(ax=ax, oversample=oversample, **result_kwargs_)
         ax.legend()
         ax.grid(True)
         fig.tight_layout()

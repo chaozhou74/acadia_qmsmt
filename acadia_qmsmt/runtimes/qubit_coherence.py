@@ -171,6 +171,8 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         else:
             axs.set_ylabel("re(data) after rotation")
 
+        axs.set_title(f"T2: {self.fit.ufloat_results['tau']:.5g}")
+
         axs.legend()
         return fig, axs
     
