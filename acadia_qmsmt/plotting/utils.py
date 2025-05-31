@@ -92,7 +92,7 @@ def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, u
             figure = None
             try:
                 figure, _ = getattr(runtime, method_name)()
-                fig.tight_layout()
+                figure.tight_layout()
                 image_filename = os.path.join(runtime.local_directory, f"{plot_name}.png")
                 figure.savefig(image_filename, dpi=500, transparent=transparent)
 

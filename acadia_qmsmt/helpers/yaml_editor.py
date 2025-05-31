@@ -150,12 +150,17 @@ def update_yaml(yaml_path: str, new_param_dict: dict, verbose=False):
 
     def float_representer(dumper, data):
         """Use scientific notation for large and small numbers """
-        if abs(data) > 1e5 or (0 < abs(data) < 1e-4):
-            formatted_float = f"{data:.{FLOAT_PRECISION-1}g}"  
-            # remove leading 0 in exponent
-            formatted_float = re.sub(r"e([+-])0(\d+)", r"e\1\2", formatted_float) 
+        if abs(data) >= 1e5 or (0 < abs(data) < 1e-4):
+            formatted_float = f"{data:.{FLOAT_PRECISION-1}e}"                
+            # Strip trailing zeros in mantissa: 1.200000000e+05 -> 1.2e+05
+            formatted_float = re.sub(r'(\.\d*?[1-9])0+e', r'\1e', formatted_float)  # keep up to last non-zero digit
+            formatted_float = re.sub(r'\.0+e', '.0e', formatted_float)              # force .0 if it's all zeros
+            # Strip leading zeros in exponent: e+05 -> e+5, e-06 -> e-6
+            formatted_float = re.sub(r'e([+-])0+(\d+)', r'e\1\2', formatted_float)
         else: 
-            formatted_float = f"{data}"  
+            formatted_float = f"{np.round(data, FLOAT_PRECISION)}"  
+
+
         return dumper.represent_scalar("tag:yaml.org,2002:float", formatted_float)
 
     def inline_list_representer(dumper, data):

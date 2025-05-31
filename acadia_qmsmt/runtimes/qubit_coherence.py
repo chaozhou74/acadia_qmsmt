@@ -24,11 +24,17 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
     iterations: int
     run_delay: int
+    
+    do_echo:bool = False
 
     qubit_first_pulse_name: str = None
     qubit_first_pulse_waveform_name: str = None
     qubit_second_pulse_name: str = None
     qubit_second_pulse_waveform_name: str = None
+    qubit_pi_pulse_name: str = None
+    qubit_pi_pulse_waveform_name: str = None
+
+
     virtual_detuning: float = 0
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
@@ -55,19 +61,30 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
         def sequence(a: Acadia):
             # Initialize a DSP to act as a counter
-            counter = a.sequencer().DSP()
+            counter_1 = a.sequencer().DSP()
+            counter_2 = a.sequencer().DSP()
 
             # Load the counter with the value we put into the cache
-            counter.load(cache[0])
+            counter_1.load(cache[0])
+            counter_2.load(cache[0])
 
             readout_resonator.prepare_cmacc(self.readout_window_name)
 
-            with a.channel_synchronizer(block=False):
+            with a.channel_synchronizer(block=True):
                 qubit.pulse(self.qubit_first_pulse_name)
                 
             # Start the counter and wait until it reaches zero
-            counter.start_count(inc=int(np.int32(-1).astype(np.uint32)))
-            with a.sequencer().repeat_until(counter == 0):
+            counter_1.start_count(inc=int(np.int32(-1).astype(np.uint32)))
+            with a.sequencer().repeat_until(counter_1 == 0):
+                pass
+
+            if self.do_echo:
+                with a.channel_synchronizer():
+                   qubit.pulse(self.qubit_pi_pulse_name)
+
+
+            counter_2.start_count(inc=int(np.int32(-1).astype(np.uint32)))
+            with a.sequencer().repeat_until(counter_2 == 0):
                 pass
 
             with a.channel_synchronizer():
@@ -84,11 +101,14 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         readout_resonator.load_windows()
         readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
         qubit_stimulus_io.load_waveform(self.qubit_first_pulse_name, self.qubit_first_pulse_waveform_name)
+        
+        if self.do_echo:
+            qubit_stimulus_io.load_waveform(self.qubit_pi_pulse_name, self.qubit_pi_pulse_waveform_name)
+        
         second_pulse_scale = qubit_stimulus_io.get_config("waveforms", self.qubit_second_pulse_waveform_name, "scale")
         
         # Determine how many cycles each delay interval should be
-        first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_first_pulse_name)
-        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times, first_pulse_memory)
+        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times/2)
 
         for i in range(self.iterations):
             for idx_delay,delay in enumerate(dsp_count_values):
@@ -171,7 +191,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         else:
             axs.set_ylabel("re(data) after rotation")
 
-        axs.set_title(f"T2: {self.fit.ufloat_results['tau']:.5g}")
+        axs.set_title(f"T2{'E' if self.do_echo else 'R'}: {self.fit.ufloat_results['tau']:.5g}")
 
         axs.legend()
         return fig, axs

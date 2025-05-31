@@ -64,7 +64,7 @@ class FitterBase:
         self.ufloat_results = {}
 
         # default settings
-        use_fit_kwargs = {"maxfev": 10000, "method": "trf"}  # or 'dogbox' for more robust fitting but slower
+        use_fit_kwargs = {"maxfev": 1000, "method": "dogbox"}  # or 'dogbox' for more robust fitting but slower
         use_fit_kwargs.update(fit_kwargs)
 
         if dry:
