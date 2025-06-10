@@ -38,7 +38,6 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
     qubit_pulse_waveform_name: str = None
 
     readout_capture_memory: str = "readout_trace"
-    readout_capture_window: str = "boxcar" # use this for initial matched window generation
 
     iterations: int
     plot: bool = True
@@ -56,9 +55,6 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         qubit = Qubit(qubit_stimulus_io)
 
 
-        # Create a blank waveform between qubit drive and readout drive
-        q_blank_wf = qubit_stimulus_io.blank_waveform_generator()(40e-9)
-
         # Create the record groups for saving captured data
         self.data.add_group("traces_g", uniform=True)
         self.data.add_group("traces_e", uniform=True)
@@ -66,13 +62,11 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
         # Core FPGA (PL) sequence
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_capture_window, output_type="input", output_last_only=False)
 
             with a.channel_synchronizer():
-                qubit.pulse(self.qubit_pulse_name)
-                a.schedule_waveform(q_blank_wf)
+                qubit.pulse(self.qubit_pulse_name) # todo: re-enable waiting time between pulses
                 a.barrier()
-                readout_resonator.measure(self.readout_stimulus_memory, self.readout_capture_memory)
+                readout_resonator.measure_trace(self.readout_stimulus_memory, self.readout_capture_memory)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

@@ -43,12 +43,11 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
-            resonator.prepare_cmacc(self.capture_window_name)
 
             with a.channel_synchronizer():
                 # Measure the resonator by driving the "readout" waveform on the stimulus IO
                 # and capture into the "readout_accumulated" waveform on the capture IO
-                resonator.measure("readout", "readout_accumulated")
+                resonator.measure("readout", "readout_accumulated", self.capture_window_name)
 
         # Compile the sequence
         self.acadia.compile(sequence)

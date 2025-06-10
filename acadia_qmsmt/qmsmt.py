@@ -10,11 +10,13 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.signal.windows import hann as scipy_hann
 
-from acadia import Acadia, Channel, Runtime, ChannelWaveformMemory, WaveformMemory, Operation
+from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Operation
+from acadia.compiler import ManagedResource
 
 __all__ = ["InputOutput", "InputOutputWaveforms", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
 
 logger = logging.getLogger("acadia_qmsmt")
+
 class InputOutputWaveforms:
     """
     A class containing methods for all of the waveform shapes that can be 
@@ -150,7 +152,7 @@ class InputOutput:
         self._config: Dict[str,Any] = config
         self._acadia: Acadia = acadia
         self._channel: Channel = acadia.channel(self.get_config("channel"))
-        self._allocated_memories: Dict[str,ChannelWaveformMemory] = {}
+        self._allocated_memories: Dict[str, WaveformMemory] = {}
 
     def get_config(self, *cfg_path: str):
         """
@@ -179,7 +181,7 @@ class InputOutput:
         
         return current_level
 
-    def get_waveform_memory(self, waveform_memory: Union[str, WaveformMemory] = None) -> ChannelWaveformMemory:
+    def get_waveform_memory(self, waveform_memory: Union[str, WaveformMemory] = None) -> WaveformMemory:
         """
         A shortcut function for allocating waveform memory for a specified 
         channel and waveform using pre-defined configurations.
@@ -214,6 +216,7 @@ class InputOutput:
         # If we haven't yet allocated memory for the waveform, do so
         if waveform_memory not in self._allocated_memories:
             wf_cgf = self.get_config("memories", waveform_memory)
+            wf_cgf = {k: v for k, v in wf_cgf.items() if k != "stretch_length"}
             self._allocated_memories[waveform_memory] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
 
         return self._allocated_memories[waveform_memory]
@@ -231,6 +234,9 @@ class InputOutput:
             `decimation` and `region`
         :returns: A function that creates a blank waveform when called with a length.
         """
+
+        raise NotImplementedError("This function needs to be replaced by `dwell`")
+    
         waveform_args = {"blank": True}
 
         # get decimation and wf region for blank wf in adc channels
@@ -253,7 +259,7 @@ class InputOutput:
                 decimation = 4  # for cmacc 
             waveform_args.update({"decimation": decimation, "region": region})
 
-        def blank_wf_gen(length: float) -> ChannelWaveformMemory:
+        def blank_wf_gen(length: float) -> WaveformMemory:
             blank_wf = self._acadia.create_waveform_memory(self._channel, length=length, **waveform_args)
             return blank_wf
 
@@ -362,7 +368,71 @@ class InputOutput:
             times = np.arange(memory.size, dtype=np.float64) / self.interface_sample_frequency
             samples = np.multiply(samples,np.exp(2 * np.pi * 1j * detune * times))
         memory.load(samples, scale)
-            
+
+
+    def load_multichromatic_waveform(self,
+                        memory: Union[str,WaveformMemory] = None,
+                        waveform: Union[str,NDArray,float,complex,None] = None,
+                        scales: complex = None,
+                        detunes: float = None,
+                        **kwargs) -> None:
+        """
+        Load a wavefrom with multiple spectral components at multiple amplitudes"""
+        # Determine the memory to be loaded
+        if memory is None or isinstance(memory, str):
+            memory = self.get_waveform_memory(memory)
+        elif not isinstance(memory, WaveformMemory):
+            raise TypeError(f"`load_waveform` requires either a WaveformMemory"
+                            " object that can be loaded, or a string that"
+                            " specifies one from the configuration.")
+
+        # Determine the samples to load into the waveform
+        if waveform is None or isinstance(waveform, (str, dict)):
+            samples = self.compute_waveform(memory.size, waveform, **kwargs)
+        else:
+            if len(kwargs) != 0:
+                raise ValueError(f"Keyword arguments may not be provided when"
+                                 f" directly providing sample data.")
+            samples = waveform
+
+        # Determine the scale
+        # If we've provided a scale, that should override anything else; 
+        # otherwise, if we specified the waveform by name, check to see if its
+        # configuration provides a scale
+        if scales is None:
+            if isinstance(waveform, str):
+                scales = self.get_config("waveforms", waveform)["scales"]
+            elif isinstance(waveform, dict):
+                scales = waveform["scales"]
+            else:
+                raise KeyError(f"Unable to infer scales for waveform of type {type(waveform)}")
+        elif isinstance(scales, str):
+            scales = self.get_config("waveforms", scales)["scales"]
+        elif not isinstance(scales, (int, float, complex,np.ndarray,list)):
+            raise TypeError(f"Unable to derive scales from argument of type {scales}")
+
+        if detunes is None:
+            if isinstance(waveform, str):
+                detunes = self.get_config("waveforms", waveform)["detunes"]
+            elif isinstance(waveform, dict):
+                detunes = waveform["detunes"]
+            else:
+                raise KeyError(f"Unable to infer detunes for waveform of type {type(waveform)}")
+        elif isinstance(detunes, str):
+            detunes = self.get_config("waveforms", detunes)["detunes"]
+        elif not isinstance(detunes, (int, float, complex,np.ndarray,list)):
+            raise TypeError(f"Unable to derive detunes from argument of type {detunes}")
+        
+        times = np.arange(memory.size, dtype=np.float64) / self.interface_sample_frequency
+        my_samples = 0.*samples
+        for i,detune in enumerate(detunes):
+            my_samples = np.add(my_samples,np.multiply(samples,scales[i]*np.exp(2 * np.pi * 1j * detune * times)))
+        if np.max(my_samples) > 1:
+            raise Exception
+        memory.load(my_samples)
+
+
+
     def compute_waveform(self, 
                         size: Union[str,WaveformMemory,int] = None, 
                         waveform: Union[str,dict,None] = None, 
@@ -432,7 +502,7 @@ class InputOutput:
 
         if isinstance(waveform_config["data"], str):  
             samples = np.empty(size, dtype=np.complex128)
-            func_kwargs = {k:v for k,v in waveform_config.items() if k != "data" and k != "scale"}
+            func_kwargs = {k:v for k,v in waveform_config.items() if k != "data" and k != "scale" and k != "detune"}
             func_kwargs.update(kwargs)
             getattr(InputOutputWaveforms, waveform_config["data"])(samples, **func_kwargs)
             return samples
@@ -445,7 +515,7 @@ class InputOutput:
 
 
     def generate_full_waveform_from_windowed(self, memory_name:str, waveform_name:str) \
-            -> Tuple[ChannelWaveformMemory, np.ndarray]:
+            -> Tuple[WaveformMemory, np.ndarray]:
         """
         Generate a full waveform memory and its corresponding envelope based on a windowed waveform specification.
 
@@ -458,7 +528,7 @@ class InputOutput:
 
         :return:
         A tuple containing:
-        - ChannelWaveformMemory: The created full waveform memory object.
+        - WaveformMemory: The created full waveform memory object.
         - np.ndarray: The generated waveform envelope array.
 
         """
@@ -473,6 +543,29 @@ class InputOutput:
         sample_times = np.arange(full_mem.size, dtype=np.float64) / self.interface_sample_frequency
         waveform_envelop = waveform_func(sample_times)
         return full_mem, waveform_envelop
+
+
+
+    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None, 
+              stretch_length:Union[float, ManagedResource] = None) -> None:
+        """
+        Play a pulse from the IO channel. The waveform memory parameter is passed directly to 
+        :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
+        argument behavior.
+        """
+
+        if not self._channel.is_dac:
+            raise TypeError(f"`pulse` can only be called from a DAC channel, got {self._channel}")
+
+        if waveform_memory is None:
+            waveform_memory = list(self.get_config("memories").keys())[0]
+
+        if stretch_length is None:
+            if isinstance(waveform_memory, str):
+                stretch_length = self.get_config("memories", waveform_memory).get("stretch_length")
+        logger.warning(f"stretch_length, {stretch_length}")
+
+        self._acadia.schedule_waveform(self.get_waveform_memory(waveform_memory), stretch_length=stretch_length)
 
 
     @property
@@ -745,57 +838,119 @@ class MeasurableResonator:
         self._stream = None
         self._windows = {}
 
-    def prepare_cmacc(self, 
-                window_name: str = None,
-                output_type: Literal["upper", "lower", "input", None] = "upper",
-                output_last_only: bool = True,
-                reset_fifo: bool = True):
-        """
-        Perform a measurement of the resonator. 
 
-        The length and decimation of the capture are retrieved from the provided 
-        capture configuration. Because a CMACC is always used for the measurement, 
-        the decimation of the specified capture configuration must be a multiple of 4. 
-        A value of 0 may also be provided, in which case
-        the decimation factor will automatically be chosen so that the 
-        entire captured trace is decimated into a single point.
 
-        Note that cmacc = "Capture, Multiply, Accumulate"
+    # def prepare_cmacc(self, 
+    #             window_name: str = None,
+    #             output_type: Literal["upper", "lower", "input", None] = "upper",
+    #             output_last_only: bool = True,
+    #             reset_fifo: bool = True):
+    #     """
+    #     Perform a measurement of the resonator. 
+
+    #     The length and decimation of the capture are retrieved from the provided 
+    #     capture configuration. Because a CMACC is always used for the measurement, 
+    #     the decimation of the specified capture configuration must be a multiple of 4. 
+    #     A value of 0 may also be provided, in which case
+    #     the decimation factor will automatically be chosen so that the 
+    #     entire captured trace is decimated into a single point.
+
+    #     Note that cmacc = "Complex-Multiplication and Accumulate"
 
         
-        :param window_name: The name of the window to be used (and newly 
-            allocated, if necessary). The name should be a key in the 
-            "windows" section of the configuration for the provided capture.
-            The value of the window (as provided in the configuration's ``data`` 
-            key may be a float, in which case a boxcar window
-            is allocated. Note that this does not actually populate the window
-            memory with that float, but simply specifies that a boxcar window
-            will be used so that only a single point in window memory is allocated.
-            The value of the window may also be an array, in which case a window 
-            of the appropriate size is allocated. If the name is ``None``, the 
-            first configuration entry is used.
-        :type window_name: str
-        :param output_type: The output port of the CMACC is driven by a multiplexer,
+    #     :param window_name: The name of the window to be used (and newly 
+    #         allocated, if necessary). The name should be a key in the 
+    #         "windows" section of the configuration for the provided capture.
+    #         The value of the window (as provided in the configuration's ``data`` 
+    #         key may be a float, in which case a boxcar window
+    #         is allocated. Note that this does not actually populate the window
+    #         memory with that float, but simply specifies that a boxcar window
+    #         will be used so that only a single point in window memory is allocated.
+    #         The value of the window may also be an array, in which case a window 
+    #         of the appropriate size is allocated. If the name is ``None``, the 
+    #         first configuration entry is used.
+    #     :type window_name: str
+    #     :param output_type: The output port of the CMACC is driven by a multiplexer,
+    #         which allows the user to decide which data is written into memory. 
+    #         The output port has 32 bits per quadrature, but the internal accumulator
+    #         has 48 bits per quadrature, and therefore it is left to the user to
+    #         decide whether the upper or lower 32 bits are presented to the output.
+    #         Using the upper 32 bits reduces the precision of the output but reduces
+    #         the probability of overflow. Alternatively, the stream of data entering
+    #         the accumulator may be passed to the output port rather than the 
+    #         accumulated data, or the memory write may be cancelled altogether.
+    #     :type output_type: str, one of "upper", "lower", "input", or None
+    #     :param output_last_only: The accumulator processes streams of data present
+    #         at its input and creates a stream at its output. However, there are many
+    #         situations in which only the final value is required, such as when only
+    #         the complete sum of a trace is required and the partial sums created while
+    #         the trace is being captured are not. In these situations, the output port
+    #         of the CMACC should only write a single value at the end of the trace.
+    #         This behavior is specified via this flag. If `False`, a value is written 
+    #         to the output port every decimation cycle.
+    #     :type output_last_only: bool
+    #     """
+
+    #     # First, we'll determine what window we need
+    #     # Here we'll cache allocated windows. If we previously used a window, 
+    #     # we'll retrieve its memory, otherwise we'll allocate it fresh
+    #     if window_name is None:
+    #         window_name = list(self._capture.get_config("windows").keys())[0]
+            
+    #     if window_name in self._windows:
+    #         # Regardless of what the window is, if we have it already,
+    #         # we'll pass in its WaveformMemory so that we don't re-allocate it
+    #         kernel_arg = self._windows[window_name]
+
+    #     else:
+    #         # Allocate the memory anew 
+    #         # We'll interpret the type of the argument slightly differently 
+    #         # than configure_cmacc expects; if the window argument is a float,
+    #         # we'll interpret this as the amplitude of a boxcar window, in contrast
+    #         # to configure_cmacc interpreting a float argument as the length in seconds
+    #         # that the window should be. The behavior here will be different as this is a
+    #         # much more likely use case and will be much more intuitive in the config file
+    #         window_config = self._capture.get_config("windows", window_name, "data")
+    #         kernel_arg = None if isinstance(window_config, float) else window_config
+    #     self._kernel_arg_cache  = kernel_arg
+
+    #     # Because the offset is just a number (and not a thing that needs
+    #     # to be allocated), we can just get it from the config every time
+    #     cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
+    #     # Convert the offset appropriately so that negative numbers are 
+    #     # accepted (constants in the compiler must be unsigned)
+    #     self._cmacc_offset_cache = [int(np.int32(q).astype(np.uint32)) for q in cmacc_offset]
+
+
+
+    def measure(self, 
+                stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
+                capture_waveform_memory: Union[str, WaveformMemory] = None,
+                window_name: str = None,
+                write_mode: Literal["upper", "lower"] = "upper",
+                reset_fifo: bool = True
+                ):
+        """
+        Schedules the measurement of accumulated IQ points. 
+        This function should be called inside of a channel synchronizer.
+
+        :param write_mode: The output port of the CMACC is driven by a multiplexer,
             which allows the user to decide which data is written into memory. 
             The output port has 32 bits per quadrature, but the internal accumulator
             has 48 bits per quadrature, and therefore it is left to the user to
             decide whether the upper or lower 32 bits are presented to the output.
             Using the upper 32 bits reduces the precision of the output but reduces
-            the probability of overflow. Alternatively, the stream of data entering
-            the accumulator may be passed to the output port rather than the 
-            accumulated data, or the memory write may be cancelled altogether.
-        :type output_type: str, one of "upper", "lower", "input", or None
-        :param output_last_only: The accumulator processes streams of data present
-            at its input and creates a stream at its output. However, there are many
-            situations in which only the final value is required, such as when only
-            the complete sum of a trace is required and the partial sums created while
-            the trace is being captured are not. In these situations, the output port
-            of the CMACC should only write a single value at the end of the trace.
-            This behavior is specified via this flag. If `False`, a value is written 
-            to the output port every decimation cycle.
-        :type output_last_only: bool
-        """
+            the probability of overflow.
+        :type write_mode: str, one of "upper", "lower".
 
+        """
+        capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory)
+
+        # ------------ schedule drive pulse ------------------------------
+        self._stimulus.pulse(stimulus_waveform_memory)
+
+
+        # ------------ configure and perform capture ---------------------
         # First, we'll determine what window we need
         # Here we'll cache allocated windows. If we previously used a window, 
         # we'll retrieve its memory, otherwise we'll allocate it fresh
@@ -806,11 +961,7 @@ class MeasurableResonator:
             # Regardless of what the window is, if we have it already,
             # we'll pass in its WaveformMemory so that we don't re-allocate it
             kernel_arg = self._windows[window_name]
-            window_cache_key = window_name
 
-            # Because the offset is just a number (and not a thing that needs
-            # to be allocated), we can just get it from the config every time
-            cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
         else:
             # Allocate the memory anew 
             # We'll interpret the type of the argument slightly differently 
@@ -821,45 +972,55 @@ class MeasurableResonator:
             # much more likely use case and will be much more intuitive in the config file
             window_config = self._capture.get_config("windows", window_name, "data")
             kernel_arg = None if isinstance(window_config, float) else window_config
-            window_cache_key = window_name
-            cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
 
-        # If we've used this measurement before, retrieve the stream, otherwise create a new one
-        src_arg = self._capture._channel if self._stream is None else self._stream
+        # Because the offset is just a number (and not a thing that needs
+        # to be allocated), we can just get it from the config every time
+        cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
+        offset_converted = [int(np.int32(q).astype(np.uint32)) for q in cmacc_offset]
 
-        # Configure the CMACC and retrieve the allocated stream and window memory
-        stream, window_mem = self._capture._acadia.configure_cmacc(
-            src=src_arg,
-            kernel=kernel_arg,
-            write_mode=output_type,
-            last_only=output_last_only,
-            reset_fifo=reset_fifo,
-            accumulator_done=False
-        )
 
+        # if kernel is None or a boxcar, the accumulation length will be set to capture length
+        if kernel_arg is None or (hasattr(kernel_arg, "size") and kernel_arg.size == 1):
+            length = self._capture.get_config("memories", capture_waveform_memory, "length")
+        else: # otherwise, stream_cmacc will use kernel length as the accumulation length
+            length = None
+
+        self._stream, window_mem = self._capture._acadia.stream_cmacc(self._capture._channel, capture_waveform,
+                                                                      kernel=kernel_arg, length=length,
+                                                                      preload=offset_converted,
+                                                                      write_mode=write_mode, reset_fifo=reset_fifo,
+                                                                      last_only=True, accumulator_done=False)    
+        
         # Cache the relevant stream and window
         # If we had already allocated and cached these, this will just store 
         # them back with the same values
-        self._stream = stream
-        self._windows[window_cache_key] = window_mem
+        self._windows[window_name] = window_mem
 
-        # Convert the offset appropriately so that negative numbers are 
-        # accepted (constants in the compiler must be unsigned)
-        offset_converted = [int(np.int32(q).astype(np.uint32)) for q in cmacc_offset]
-        self._capture._acadia.cmacc_load(stream, offset_converted)
 
-    def measure(self, 
+    def measure_trace(self, 
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
-                capture_waveform_memory: Union[str, WaveformMemory] = None):
+                capture_waveform_memory: Union[str, WaveformMemory] = None,
+                reset_fifo: bool = True):
         """
-        Schedules the measurement. This function should be called inside of a 
-        channel synchronizer, and prepare_cmacc must have been called before 
-        this. 
+        Schedules the measurement of raw IQ traces. 
+        This function should be called inside of a channel synchronizer.
+
         """
-        self._capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory)
-        self._stimulus_waveform = self._stimulus.get_waveform_memory(stimulus_waveform_memory)
-        self._stimulus._acadia.schedule_waveform(self._stimulus_waveform)
-        self._capture._acadia.stream(self._stream, self._capture_waveform)
+        # todo: allow configurable decimation. Currently this must be 4
+
+        capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory)
+
+        # ------------ schedule drive pulse ------------------------------
+        self._stimulus.pulse(stimulus_waveform_memory)
+
+
+        # ------------ configure and perform capture ---------------------
+        length = self._capture.get_config("memories", capture_waveform_memory, "length")
+        self._capture._acadia.stream_cmacc(self._capture._channel, capture_waveform,
+                                           length=length, kernel=None, preload=(0, 0),
+                                            write_mode="input", reset_fifo=reset_fifo,
+                                            last_only=False, accumulator_done=False)    
+
 
     def get_measurement(self) -> Operation:
         """
@@ -881,7 +1042,6 @@ class MeasurableResonator:
 
         for window_name, window_memory in self._windows.items():
             window_memory.load(self._capture.get_config("windows", window_name, "data"))
-
 
     def set_frequency(self, frequency: float, sync: bool = True):
         """
@@ -928,14 +1088,15 @@ class Qubit:
         if sync:
             self._stimulus._acadia.update_ncos_synchronized()
 
-    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None) -> None:
+    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None, 
+                stretch_length:Union[float, ManagedResource] = None) -> None:
         """
         Apply a pulse to the qubit. The waveform memory parameter is passed directly to 
         :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
         argument behavior.
         """
 
-        self._stimulus._acadia.schedule_waveform(self._stimulus.get_waveform_memory(waveform_memory))
+        self._stimulus.pulse(waveform_memory, stretch_length)
 
     def prepare(self, 
                 state_quadrant: Literal[1,2,3,4],
@@ -1005,14 +1166,15 @@ class DriveChannel:
         if sync:
             self._stimulus._acadia.update_ncos_synchronized()
 
-    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None) -> None:
+    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None, 
+                stretch_length:Union[float, ManagedResource] = None) -> None:
         """
-        Apply a pulse to the qubit. The waveform memory parameter is passed directly to 
+        Apply a beamsplitting pulse. The waveform memory parameter is passed directly to 
         :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
         argument behavior.
         """
 
-        self._stimulus._acadia.schedule_waveform(self._stimulus.get_waveform_memory(waveform_memory))
+        self._stimulus.pulse(waveform_memory, stretch_length)
 
 
 

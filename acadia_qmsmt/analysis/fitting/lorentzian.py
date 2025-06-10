@@ -13,7 +13,7 @@ class Lorentzian(FitterBase):
     @staticmethod
     def guess(coordinates, data):
         non_nan_data = data[np.isfinite(data)]
-        of = (non_nan_data[0] + non_nan_data[-1]) / 2
+        of = np.mean(non_nan_data)
         peak_idx = np.nanargmax(np.abs(data - of))
         x0 = coordinates[peak_idx]
         A = data[peak_idx] - of
