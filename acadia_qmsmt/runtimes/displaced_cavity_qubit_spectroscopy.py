@@ -38,7 +38,7 @@ class DisplacedCavityQubitSpectroscopyRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
     cavity_pulse: dict[str,float] = {"length": 100e-9}
-    qubit_saturation_pulse: dict[str,float] = {"length": 100e-9, "fixed_length": 5e-6}
+    qubit_saturation_pulse: dict[str,float] = {"length": 100e-9, "stretch_length": 5e-6}
     readout_window_name: str = None
     readout_stimulus_waveform_name: str = None
     plot: bool = True
@@ -59,27 +59,23 @@ class DisplacedCavityQubitSpectroscopyRuntime(QMsmtRuntime):
 
         cavity_pulse = self.acadia.create_waveform_memory(
             cavity_stimulus_io.channel, 
-            length=self.cavity_pulse.get("length", 0.0),
-            fixed_length=self.cavity_pulse.get("fixed_length", 0.0)
+            length=self.cavity_pulse.get("length", 0.0)
         )
 
         qubit_saturation_pulse = self.acadia.create_waveform_memory(
             qubit_stimulus_io.channel,
-            length=self.qubit_saturation_pulse.get("length", 0.0),
-            fixed_length=self.qubit_saturation_pulse.get("fixed_length", 0.0)
+            length=self.qubit_saturation_pulse.get("length", 0.0)
         )
 
         self.data.add_group(f"points", uniform=True)
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
             with a.channel_synchronizer():
-                a.schedule_waveform(cavity_pulse)
+                a.schedule_waveform(cavity_pulse, stretch_length=self.cavity_pulse.get("stretch_length", 0.0))
                 a.barrier()
-                qubit.pulse(qubit_saturation_pulse)
+                qubit.pulse(qubit_saturation_pulse, stretch_length=self.qubit_saturation_pulse.get("stretch_length", 0.0))
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

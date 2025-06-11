@@ -22,7 +22,7 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
     run_delay: int
 
     hardware_accumulator: bool = True
-    saturation_pulse_fixed_length: float = 1e-3 - 100e-9
+    saturation_pulse_stretch_length: float = 1e-3 - 100e-9
     saturation_pulse_ramp_time: float = 100e-9
     saturation_pulse_amplitude: float = 0.1
     readout_window_name: str = None
@@ -51,22 +51,19 @@ class ReadoutHistogramRuntime(QMsmtRuntime):
         # measurement
         saturation_waveform = self.acadia.create_waveform_memory(
             qubit._stimulus.channel, 
-            length=self.saturation_pulse_ramp_time, 
-            fixed_length=self.saturation_pulse_fixed_length)
+            length=self.saturation_pulse_ramp_time)
 
         self.data.add_group(f"points", uniform=True)
         readout_name = f"readout_{'accumulated' if self.hardware_accumulator else 'trace'}"
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(
-                self.readout_window_name, 
-                output_type=("upper" if self.hardware_accumulator else "input"), 
-                output_last_only=self.hardware_accumulator)
-
             with a.channel_synchronizer():
-                a.schedule_waveform(saturation_waveform)
+                a.schedule_waveform(saturation_waveform, stretch_length=self.saturation_pulse_stretch_length)
                 a.barrier()
-                readout_resonator.measure("readout", readout_name)
+                if self.hardware_accumulator:
+                    readout_resonator.measure("readout", readout_name, self.readout_window_nam)
+                else:
+                    readout_resonator.measure_trace("readout", readout_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

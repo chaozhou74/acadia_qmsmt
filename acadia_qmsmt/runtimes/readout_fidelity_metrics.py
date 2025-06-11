@@ -43,7 +43,6 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         # Create an array in the cache that we can use to pass what state to prep
         cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
 
-        qubit_blank_wf = qubit_stimulus_io.blank_waveform_generator()(30e-6)
 
         def sequence(a: Acadia):
             # Initialize a DSP to act as a counter
@@ -51,9 +50,6 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
             # Load the counter with the value we put into the cache
             state_prep_selecter.load(cache[0])
-
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
 
             with a.sequencer().test(state_prep_selecter == 0):
                 for i in range(self.num_prep_rounds):
@@ -73,9 +69,8 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
             readout_resonator.wait_until_measurement_done()
 
-            readout_resonator.prepare_cmacc(self.readout_window_name)
             with a.channel_synchronizer():
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

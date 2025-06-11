@@ -3,46 +3,60 @@ qb_stimulus:
   channel_config:
     vop: 30000
     mix_reconstruction: true # flase # for scope check
-    nco_frequency: 8.094e+9    # 50e6 # for scope check
+    nco_frequency: 8.09395e+9   # 50e6 # for scope check
   memories:
     rotation:
-      fixed_length: 200e-9
-      length: 60e-9 # TIME FOR RAMPS!!!
+      stretch_length: 100e-9
+      length: 120e-9 # TIME FOR RAMPS!!!
     rotation_2:
-      fixed_length: 200e-9
-      length: 60e-9 # TIME FOR RAMPS!!!
+      stretch_length: 100e-9
+      length: 120e-9 # TIME FOR RAMPS!!!
+    rotation_3:
+      stretch_length: 100e-9
+      length: 120e-9 # TIME FOR RAMPS!!!
     rotation_selective:
       length: 4000e-9 # TIME FOR RAMPS!!!
-      fixed_length: 0.e+1
+      stretch_length: 0.e+1
     rotation_selective_2:
       length: 4000e-9 # TIME FOR RAMPS!!!
-      fixed_length: 0e+0
+      stretch_length: 0e+0
+    rotation_selective_ef:
+      length: 4000e-9 # TIME FOR RAMPS!!!
+      stretch_length: 0.e+1
   waveforms:
     R_x_180:
       data: hann
-      scale: 0.44643
+      scale: 0.66969
     R_x_180_selective:
       data: hann
-      scale: 0.0517
+      scale: 0.05228
     R_x_90:
       data: hann
-      scale: 0.2205
+      scale: 0.32665
+    R_x_180_selective_ef:
+      data: hann
+      scale: 0.04036
+      detune: -1.601e+8
+    R_x_180_ef:
+      data: hann
+      scale: 0.50832
+      detune: -1.601e+8
 
 ro_stimulus:
   channel: DAC2
   channel_config:
     vop: 25000
     mix_reconstruction: true # true
-    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
+    nco_frequency: 9.0007e+9  # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
   memories:
     readout:
-      fixed_length: 0.4e-6
-      length: 200e-9
+      stretch_length: 1e-6
+      length: 120e-9
     readout_pulse_long_memory:
-      fixed_length: 160e-9
+      stretch_length: 160e-9
       length: 100e-9
     readout_pulse_long_memory_alt:
-      fixed_length: 160e-9
+      stretch_length: 160e-9
       length: 100e-9
   waveforms:
     readout:
@@ -58,14 +72,14 @@ ro_stimulus:
 ro_capture:
   channel: ADC0
   channel_config:
-    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
+    nco_frequency: 9.0007e+9  # 8.9985e9 # 9.00057e9 # 9.0004e9
   memories:
     readout_trace:
-      length: 1.2e-6
+      length: 2.2e-6
       decimation: 4
       region: plddr
     readout_accumulated:
-      length: 1.2e-6
+      length: 2.2e-6
       decimation: 0
       region: plddr
     readout_accumulated_alt_1:
@@ -86,8 +100,9 @@ ro_capture:
       data: 0.1
       offset: [0, 0]
     matched:
-      data: 0.1
-      offset: [301, 2438]
+      data: 
+        /home/acadia_test/acadia_test/notebooks/readout_kernels/readout_capture_matched_250530_144657.npy
+      offset: [180, 1951]
   state_quadrants: [1, 2]
 
   
@@ -100,23 +115,23 @@ qb_alice_bs_stimulus:
   memories:
     swap_mem:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 240e-9
+      stretch_length: 240e-9
     swap_mem_2:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 240e-9
+      stretch_length: 240e-9
     dChi_pump_mem:
       length: 300e-9 # TIME FOR RAMPS!!!
-      fixed_length: 5e-6
+      stretch_length: 5e-6
     dChi_parity_map_mem:
-      length: 400e-9 # TIME FOR RAMPS!!!
-      fixed_length: 560e-9
+      length: 60e-9 # TIME FOR RAMPS!!!
+      stretch_length: 500e-9
   waveforms:
     swap_wf:
       data: hann
-      scale: 0.0395
+      scale: 0.036
     dChi_pump_wf:
       data: hann
-      scale: 0.15
+      scale: 0.17
     dChi_parity_map_wf:
       data: hann
       scale: 0.15
@@ -131,13 +146,22 @@ qb_bob_bs_stimulus:
   memories:
     swap_mem:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 1200e-9
+      stretch_length: 1200e-9
     swap_mem_2:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 1200e-9
+      stretch_length: 1200e-9
     dChi_pump_mem:
-      length: 600e-9 # TIME FOR RAMPS!!!
-      fixed_length: 5e-6
+      length: 300e-9 # TIME FOR RAMPS!!!
+      stretch_length: 5e-6
+    dChi_parity_map_mem:
+      length: 60e-9 # TIME FOR RAMPS!!!
+      stretch_length: 500e-9
+    dChi_pump_multichromatic_mem:
+      length: 110e-9 # TIME FOR RAMPS!!!
+      stretch_length: 430e-9
+    dChi_parity_map_multichromatic_mem:
+      length: 110e-9 # TIME FOR RAMPS!!!
+      stretch_length: 430e-9
   waveforms:
     swap_wf:
       data: hann
@@ -145,7 +169,17 @@ qb_bob_bs_stimulus:
     dChi_pump_wf:
       data: hann
       scale: 0.08
-
+    dChi_pump_multichromatic_wf:
+      data: hann
+      scales: [0.15]
+      detunes: [-20e6]
+    dChi_parity_map_wf:
+      data: hann
+      scale: 0.145
+    dChi_parity_map_bichromatic_wf:
+      data: hann
+      scales: [0.15]
+      detunes: [-20e6]
 
 
 alice_bob_bs_stimulus:
@@ -157,10 +191,10 @@ alice_bob_bs_stimulus:
   memories:
     swap_mem:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 1150e-9
+      stretch_length: 1150e-9
     bs_50_50_mem:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 500e-9
+      stretch_length: 500e-9
   waveforms:
     swap_wf:
       data: hann
@@ -179,10 +213,10 @@ qb_linc_bs_stimulus:
   memories:
     swap_mem:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 60e-9
+      stretch_length: 60e-9
     swap_mem_2:
       length: 80e-9 # TIME FOR RAMPS!!!
-      fixed_length: 60e-9
+      stretch_length: 60e-9
   waveforms:
     swap_wf:
       data: hann
@@ -197,10 +231,10 @@ alice_stimulus:
   memories:
     fast_disp_mem:
       length: 400e-9 # TIME FOR RAMPS!!!
-      fixed_length: 400e-9
+      stretch_length: 400e-9
     slow_disp_mem:
       length: 10000e-9 # TIME FOR RAMPS!!!
-      fixed_length: 0.e+1
+      stretch_length: 0.e+1
   waveforms:
     fast_disp_wf:
       data: hann
@@ -208,3 +242,23 @@ alice_stimulus:
     slow_disp_wf:
       data: hann
       scale: 0.0104
+
+
+
+# scope_bs_stimulus:
+#   channel: DAC7 # DAC7 for scope check 
+#   channel_config:
+#     vop: 30000
+#     mix_reconstruction: false
+#     nco_frequency: 40e6  # 20e6 # for scope check
+#   memories:
+#     swap_mem:
+#       length: 80e-9 # TIME FOR RAMPS!!!
+#       stretch_length: 200e-9
+#     swap_mem_2:
+#       length: 80e-9 # TIME FOR RAMPS!!!
+#       stretch_length: 1200e-9
+#   waveforms:
+#     swap_wf:
+#       data: hann
+#       scale: 0.2

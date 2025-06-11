@@ -519,11 +519,11 @@ class InputOutput:
         """
         Generate a full waveform memory and its corresponding envelope based on a windowed waveform specification.
 
-        This method reconstructs a full-length waveform by expanding a windowed (`fixed_length` + `length`) description.
+        This method reconstructs a full-length waveform by expanding a windowed (`stretch_length` + `length`) description.
         It creates a new waveform memory object sized to the combined flat and ramp lengths, and generates
         the waveform envelope using the specified shaping function.
 
-        :param memory_name: Name of the windowed constant memory to read `fixed_length` and `length` from.
+        :param memory_name: Name of the windowed constant memory to read `stretch_length` and `length` from.
         :param waveform_name: Name of the waveform config to read the waveform shape ("data") from.
 
         :return:
@@ -533,8 +533,8 @@ class InputOutput:
 
         """
         from acadia.pulse_shaping import flattop_function_generator
-        # declare a new memory block that has total length of `fixed_length + length`,  as specified in the yaml
-        flat_len = self.get_config("memories", memory_name, "fixed_length")
+        # declare a new memory block that has total length of `stretch_length + length`,  as specified in the yaml
+        flat_len = self.get_config("memories", memory_name, "stretch_length")
         ramp_len = self.get_config("memories", memory_name, 'length')
         full_mem = self._acadia.create_waveform_memory(self.channel, length=flat_len+ramp_len)
         # generate the flat-top waveform data
@@ -563,7 +563,6 @@ class InputOutput:
         if stretch_length is None:
             if isinstance(waveform_memory, str):
                 stretch_length = self.get_config("memories", waveform_memory).get("stretch_length")
-        logger.warning(f"stretch_length, {stretch_length}")
 
         self._acadia.schedule_waveform(self.get_waveform_memory(waveform_memory), stretch_length=stretch_length)
 
@@ -1134,13 +1133,13 @@ class Qubit:
         ## Measure + conditional flip, until we get the target state
         # todo: try getting the number of msmts in this loop using a counter register
         with a.sequencer().repeat_until(reg == quadrant_reg_value):
-            measurement_resonator.prepare_cmacc(measurement_cmacc_window)
 
             with a.channel_synchronizer():
                 self.pulse(pulse_waveform_memory)
                 a.barrier()
                 measurement_resonator.measure(measurement_stimulus_waveform_memory,
-                                              measurement_capture_waveform_memory)
+                                              measurement_capture_waveform_memory,
+                                              measurement_cmacc_window)
 
             reg.load(measurement_resonator.get_measurement())
 

@@ -68,8 +68,6 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             counter_1.load(cache[0])
             counter_2.load(cache[0])
 
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
             with a.channel_synchronizer(block=True):
                 qubit.pulse(self.qubit_first_pulse_name)
                 
@@ -90,7 +88,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit.pulse(self.qubit_second_pulse_name)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

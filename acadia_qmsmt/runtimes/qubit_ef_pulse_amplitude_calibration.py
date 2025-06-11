@@ -59,14 +59,12 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
                                                                                     self.qubit_ef_pulse_wf)
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
             with a.channel_synchronizer():
                 qubit.pulse(self.qubit_ge_pulse_mem)
                 qubit.pulse(ef_memory_full)
                 qubit.pulse(self.qubit_ge_pulse_mem)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

@@ -22,7 +22,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    saturation_pulse_fixed_length: float = 1e-3 - 100e-9
+    saturation_pulse_stretch_length: float = 1e-3 - 100e-9
     saturation_pulse_ramp_time: float = 100e-9
     saturation_pulse_amplitude: float = 0.1
     readout_window_name: str = None
@@ -47,18 +47,16 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         # measurement
         saturation_waveform = self.acadia.create_waveform_memory(
             qubit._stimulus.channel, 
-            length=self.saturation_pulse_ramp_time, 
-            fixed_length=self.saturation_pulse_fixed_length)
+            length=self.saturation_pulse_ramp_time)
 
         self.data.add_group(f"points", uniform=True)
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_window_name)
 
             with a.channel_synchronizer():
-                a.schedule_waveform(saturation_waveform)
+                a.schedule_waveform(saturation_waveform, stretch_length=self.saturation_pulse_stretch_length)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

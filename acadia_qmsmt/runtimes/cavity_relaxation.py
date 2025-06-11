@@ -48,8 +48,7 @@ class CavityRelaxationRuntime(QMsmtRuntime):
 
         cavity_pulse = self.acadia.create_waveform_memory(
             cavity_stimulus_io.channel, 
-            length=self.cavity_pulse.get("length", 0.0),
-            fixed_length=self.cavity_pulse.get("fixed_length", 0.0)
+            length=self.cavity_pulse.get("length", 0.0)
         )
 
         self.data.add_group(f"points", uniform=True)
@@ -65,10 +64,8 @@ class CavityRelaxationRuntime(QMsmtRuntime):
             # Load the counter with the value we put into the cache
             counter.load(cache[0])
 
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
             with a.channel_synchronizer(block=False):
-                a.schedule_waveform(cavity_pulse)
+                a.schedule_waveform(cavity_pulse, stretch_length=self.cavity_pulse.get("stretch_length", 0.0))
                 
             # Start the counter and wait until it reaches zero
             counter.start_count(inc=int(np.int32(-1).astype(np.uint32)))
@@ -78,7 +75,7 @@ class CavityRelaxationRuntime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit.pulse(self.qubit_pulse_name)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

@@ -46,7 +46,6 @@ class QubitRabiWithPrepareRuntime(QMsmtRuntime):
 
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
         qubit = Qubit(qubit_stimulus_io)
-        qubit_blank_wf = qubit_stimulus_io.blank_waveform_generator()(3e-6) # for readout to empty # todo: should be an inpit
 
         self.data.add_group(f"points", uniform=True)
 
@@ -57,13 +56,10 @@ class QubitRabiWithPrepareRuntime(QMsmtRuntime):
                           "readout_accumulated", 
                           self.readout_window_name)
 
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
             with a.channel_synchronizer():
-                qubit.pulse(qubit_blank_wf)
                 qubit.pulse(self.qubit_pulse_name)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

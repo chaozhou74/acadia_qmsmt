@@ -56,8 +56,6 @@ class QubitRelaxationRuntime(QMsmtRuntime):
             # Load the counter with the value we put into the cache
             counter.load(cache[0])
 
-            readout_resonator.prepare_cmacc(self.readout_window_name)
-
             with a.channel_synchronizer(block=False):
                 qubit.pulse(self.qubit_pulse_name)
                 
@@ -67,7 +65,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
                 pass
 
             with a.channel_synchronizer():
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()

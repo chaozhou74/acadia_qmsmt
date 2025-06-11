@@ -80,8 +80,6 @@ class MyDummyExpRuntime(QMsmtRuntime):
         # Section 2 - the sequence
         # Here, we define the skeleton structure of the pulse sequence we'll be running, handling any sweeps with an outer loop. This is therefore the inner-most part of the for loop later on
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_window_name) # cmacc = "Capture, Multiply, ACCumulate", so this does various setup things to prepare for doing readout
-            # note that prepare_cmacc has argument 'output_last_only' that determines whether you just keep the accumulated IQ point, or the whole accumulation (and therefore trajectory)
 
             # channel_synchronizer() and barrier() work hand in hand, it sync's everything between barrier() calls
             
@@ -97,7 +95,7 @@ class MyDummyExpRuntime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit.pulse(self.qubit_pulse_name) # play a pulse on the qubit
                 a.barrier() # 'barrier' is the new 'sync', but note that that the synchronizer will automatically cascade pulses played on the same channel, even without barrier() calls
-                readout_resonator.measure("readout", "readout_accumulated") # 'capture the readout, multiply by envelope, accumulates, shifts (to put blobs in quadrants), and saves value
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name) # 'capture the readout, multiply by envelope, accumulates, shifts (to put blobs in quadrants), and saves value
 
         # section 3 - function calls equivalent to "make_tables"
         self.acadia.compile(sequence)

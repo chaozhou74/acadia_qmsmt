@@ -50,14 +50,13 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
         self.data.add_group(f"points", uniform=True)
 
         def sequence(a: Acadia):
-            readout_resonator.prepare_cmacc(self.readout_window_name)
 
             with a.channel_synchronizer():
                 qubit.pulse(self.qubit_pulse_name)
                 qubit.pulse(ef_pulse)
                 qubit.pulse(self.qubit_pulse_name)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated")
+                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()
