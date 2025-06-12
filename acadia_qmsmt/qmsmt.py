@@ -11,11 +11,107 @@ from numpy.typing import NDArray
 from scipy.signal.windows import hann as scipy_hann
 
 from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Operation
-from acadia.compiler import ManagedResource
+from acadia.compiler import ManagedResource, Symbol
 
-__all__ = ["InputOutput", "InputOutputWaveforms", "QMsmtRuntime", "MeasurableResonator", "MeasurableQubit"]
+__all__ = ["InputOutput", "InputOutputWaveforms", "QMsmtRuntime", "MeasurableResonator"]
 
 logger = logging.getLogger("acadia_qmsmt")
+
+
+window_functions = {
+    # todo: we need to somehow merge these with functions is InputOutputWaveforms
+    'hann': lambda x: 0.5 - 0.5 * np.cos(2 * np.pi * x),
+    'hamming': lambda x: 0.54 - 0.46 * np.cos(2 * np.pi * x),
+    'blackman': lambda x: 0.42 - 0.5 * np.cos(2 * np.pi * x) + 0.08 * np.cos(4 * np.pi * x),
+}
+
+
+def flattop_function_generator(ramp_function: Union[str, Callable], ramp_time, flat_time) -> Callable:
+    """
+    Create a continuous flattop function for generating waveform data
+    The waveform is defined as follows:
+      - For t < 0 or t >= ramping_time + flat_time, the value is 0.
+      - For 0 ≤ t < ramping_time/2, the function uses the ramping function over the interval [0, 0.5) (ramp up).
+      - For ramping_time/2 ≤ t < ramping_time/2 + flat_time, the waveform holds flat at the value
+        of ramping_function(0.5).
+      - For ramping_time/2 + flat_time ≤ t < ramping_time + flat_time, the function uses the ramping
+        function over the interval [0.5, 1] (ramp down).
+
+    :param ramp_function: A callable (or a string key corresponding to one) that accepts a single input
+        defined on the interval [0, 1].
+    :param ramp_time: Total time for the ramp-up and ramp-down regions.
+    :param flat_time: Duration of the flat region.
+    :return:
+    """
+
+    if type(ramp_function) == str:
+        if ramp_function in window_functions:
+            ramp_function = window_functions[ramp_function]
+        else:
+            raise KeyError(f"Unable to find ramping function {ramp_function}, "
+                           f"available ones are:\n{list(window_functions.keys())}")
+
+    @np.vectorize
+    def func(t):
+        if t < 0:
+            return 0
+        elif t < ramp_time / 2:
+            return ramp_function(t / ramp_time)
+        elif t < ramp_time / 2 + flat_time:
+            return ramp_function(0.5)
+        elif t < ramp_time + flat_time:
+            return ramp_function((t - flat_time) / ramp_time)
+        else:
+            return 0
+
+    return func
+
+
+
+def prepare_flattop_length_sweep(acadia: Acadia, channel: Channel,
+                                 flat_lengths: Union[list, NDArray], ramp_function: Union[str, Callable],
+                                 **pulse_memory_config) -> Tuple[WaveformMemory, NDArray]:
+    """
+    Generate the waveform memory and a 2D array of waveform data for sweeping the flat-part length of a flat-top pulse
+    as an arrayed waveform, instead of sweeping only the stretch_length. This allows sweeping the flat part with abitrary
+    step (instead of 4 samples per step)
+
+    :param acadia: Instance of Acadia
+    :param channel: The channel on which to create the waveform
+    :param flat_lengths: A list or numpy array of duration values for the flat part of the pulses
+    :param ramp_function: The function used to generate the ramp portions of the waveform.
+        See `ramp_function` in `flattop_function_generator`
+    :param pulse_memory_config: Configuration parameters for the waveform memory, in which the `length` value will be
+        used as the total ramping (up+down) time of the pulse, and the `stretch_length` value will be omitted
+
+    :return: A tuple containing:
+        - Waveform memory for storing the pulse
+        - A 2D array (shape: (len(flattop_durations), number of samples)) containing the data to be loaded to the
+            waveform
+
+    """
+    # create a waveform memory that can store the longest pulse
+    mem_cgf = pulse_memory_config.copy()
+    ramp_time = mem_cgf["length"]
+    interface_sample_freq = acadia.channel(channel).interface_sample_frequency
+    max_len = np.max(flat_lengths) + ramp_time
+    # the memory will contain the complete waveform instead of only the ramping part.
+    mem_cgf.pop("stretch_length", None)
+    mem_cgf["length"] = np.ceil(max_len * interface_sample_freq) / interface_sample_freq
+    long_waveform_mem = acadia.create_waveform_memory(channel, **mem_cgf)
+
+    # generate waveform data for pulse with each specific flat-part length
+    samples = long_waveform_mem.shape[0]
+    wf_datas = np.zeros((len(flat_lengths), samples), dtype=complex)
+    t_sampled = np.arange(0, samples) / interface_sample_freq
+
+    for i, length in enumerate(flat_lengths):
+        wf_func = flattop_function_generator(ramp_function, ramp_time, length)
+        wf_datas[i] = wf_func(t_sampled)
+
+    return long_waveform_mem, wf_datas
+
+
 
 class InputOutputWaveforms:
     """
@@ -57,7 +153,7 @@ class InputOutputWaveforms:
         z = 2 * np.pi * np.arange(output.size) / output.size
 
         output[:] = 0
-        for idx,coeff in enumerate(coeffs):
+        for idx, coeff in enumerate(coeffs):
             output[:] += coeff*np.cos(idx*z)
         
         # The signal has its maximum value at z = 1/2, where the cosines are passed integer multiples of pi
@@ -221,49 +317,22 @@ class InputOutput:
 
         return self._allocated_memories[waveform_memory]
 
-    def blank_waveform_generator(self, reference_waveform: str = None) -> Callable:
+    def dwell(self, length: Union[float, Symbol, Operation] = None, length_is_minus_one: bool = False) -> None:
         """
-        Factory function for creating blank waveform functions for DAC or ADC channels.
+        Schedule a dwell on a channel's DMA.
 
-        This is written as a factory function so that the user can easily call the returned function as needed to
-        make blank waveforms of desired lengths for any channel.
-
-        :param acadia: Acadia instance for creating waveforms.
-        :param channel_name: name of the DAC or ADC channel
-        :param reference_waveform: for ADC channel, the name of a reference waveform needs to provided to decide the
-            `decimation` and `region`
-        :returns: A function that creates a blank waveform when called with a length.
+        :param channel: Channel to stream
+        :type channel: :class:`Channel`
+        :param length: The length of the dwell.
+            When a `float` is provided, this is the number of seconds for the dwell.
+            When a sequencer source is provided, no conversion is performed; it is
+            assumed that the source contains the length in units of cycles.
+        :type length: float, Register, DSP
+        :param length_is_minus_one: If ``True``, the provided length is understood
+            to be one less than the actual length to be included in the command.
+        :type length_is_minus_one: bool
         """
-
-        raise NotImplementedError("This function needs to be replaced by `dwell`")
-    
-        waveform_args = {"blank": True}
-
-        # get decimation and wf region for blank wf in adc channels
-        if not self._channel.is_dac:
-            if reference_waveform is None:
-                # check if all the waveform mem configuration in the channel has the same settings
-                for i, wf_cfg in enumerate(self.get_config("memories").values()):
-                    d, r = wf_cfg.get("decimation", None), wf_cfg.get("region", None)
-                    if i == 0:
-                        decimation, region = d, r
-                    if decimation != d or region != r:
-                        raise ValueError(
-                            f"for blank waveform in an ADC channel, a reference waveform name must be provided")
-            else:
-                ref_wf_cfg = self.get_config("memories", reference_waveform)
-                decimation = ref_wf_cfg.get("decimation", None)
-                region = ref_wf_cfg.get("region", None)
-
-            if decimation == 0:
-                decimation = 4  # for cmacc 
-            waveform_args.update({"decimation": decimation, "region": region})
-
-        def blank_wf_gen(length: float) -> WaveformMemory:
-            blank_wf = self._acadia.create_waveform_memory(self._channel, length=length, **waveform_args)
-            return blank_wf
-
-        return blank_wf_gen
+        self._acadia.dwell(self.channel, length, length_is_minus_one)
 
     def load_waveforms(self, **kwargs):
         """
@@ -517,6 +586,10 @@ class InputOutput:
     def generate_full_waveform_from_windowed(self, memory_name:str, waveform_name:str) \
             -> Tuple[WaveformMemory, np.ndarray]:
         """
+        # todo: we need to figure out a better way to do this.
+        # currently it is not guaranteed that the new waveform will be the same as the original one.
+
+
         Generate a full waveform memory and its corresponding envelope based on a windowed waveform specification.
 
         This method reconstructs a full-length waveform by expanding a windowed (`stretch_length` + `length`) description.
@@ -532,7 +605,6 @@ class InputOutput:
         - np.ndarray: The generated waveform envelope array.
 
         """
-        from acadia.pulse_shaping import flattop_function_generator
         # declare a new memory block that has total length of `stretch_length + length`,  as specified in the yaml
         flat_len = self.get_config("memories", memory_name, "stretch_length")
         ramp_len = self.get_config("memories", memory_name, 'length')

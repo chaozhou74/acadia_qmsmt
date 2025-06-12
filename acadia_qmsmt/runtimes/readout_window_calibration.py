@@ -64,7 +64,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         def sequence(a: Acadia):
 
             with a.channel_synchronizer():
-                qubit.pulse(self.qubit_pulse_name) # todo: re-enable waiting time between pulses
+                qubit.pulse(self.qubit_pulse_name)
                 a.barrier()
                 readout_resonator.measure_trace(self.readout_stimulus_memory, self.readout_capture_memory)
 
