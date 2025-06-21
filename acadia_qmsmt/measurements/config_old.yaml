@@ -1,57 +1,78 @@
 qb_stimulus:
   channel: DAC0 # DAC1 # for scope check
   channel_config:
-    vop: 30000 # Gain of the DAC
-    mix_reconstruction: true # flase # for scope check # Set to falso for zero order hold (ZOH) reconstruction
+    vop: 30000
+    mix_reconstruction: true # flase # for scope check
     nco_frequency: 8.09395e+9   # 50e6 # for scope check
-  pulses:
+  memories:
+    rotation:
+      stretch_length: 100e-9
+      length: 120e-9 # TIME FOR RAMPS!!!
+    rotation_2:
+      stretch_length: 100e-9
+      length: 120e-9 # TIME FOR RAMPS!!!
+    rotation_3:
+      stretch_length: 100e-9
+      length: 120e-9 # TIME FOR RAMPS!!!
+    rotation_selective:
+      length: 4000e-9 # TIME FOR RAMPS!!!
+      stretch_length: 0.e+1
+    rotation_selective_2:
+      length: 4000e-9 # TIME FOR RAMPS!!!
+      stretch_length: 0e+0
+    rotation_selective_ef:
+      length: 4000e-9 # TIME FOR RAMPS!!!
+      stretch_length: 0.e+1
+  waveforms:
     R_x_180:
       data: hann
       scale: 0.66969
-      ramp: 120e-9 # Both up and down ramps
-      flat: 100e-9
-      use_stretch: true
     R_x_180_selective:
       data: hann
       scale: 0.05228
-      ramp: 4000e-6
     R_x_90:
       data: hann
       scale: 0.32665
-      ramp: 120e-9
-      flat: 100e-9
-      use_stretch: true
     R_x_180_selective_ef:
       data: hann
       scale: 0.04036
-      ramp: 4000e-6
       detune: -1.601e+8
     R_x_180_ef:
       data: hann
       scale: 0.50832
-      ramp: 4000e-6
       detune: -1.601e+8
-
 
 ro_stimulus:
   channel: DAC2
   channel_config:
     vop: 25000
     mix_reconstruction: true # true
-    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
-  pulses:
+    nco_frequency: 9.0007e+9  # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
+  memories:
+    readout:
+      stretch_length: 1e-6
+      length: 120e-9
+    readout_pulse_long_memory:
+      stretch_length: 160e-9
+      length: 100e-9
+    readout_pulse_long_memory_alt:
+      stretch_length: 160e-9
+      length: 100e-9
+  waveforms:
     readout:
       data: hann
       scale: (0.35, 0deg)
-      ramp: 120e-9
-      flat: 1e-6
-      use_stretch: true
-
+    readout_pulse_long_shape:
+      data: hann
+      scale: (0.8, 0deg)
+    readout_pulse_long_shape_alt:
+      data: hann
+      scale: (0.25, 90deg)
 
 ro_capture:
   channel: ADC0
   channel_config:
-    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
+    nco_frequency: 9.0007e+9  # 8.9985e9 # 9.00057e9 # 9.0004e9
   memories:
     readout_trace:
       length: 2.2e-6
@@ -79,8 +100,10 @@ ro_capture:
       data: 0.1
       offset: [0, 0]
     matched:
-      data: 0.1
-      offset: [0, 0]
+      data: 
+        /home/acadia_test/acadia_test/notebooks/readout_kernels/readout_capture_matched_250530_144657.npy
+      offset: [180, 1951]
+  state_quadrants: [1, 2]
 
   
 qb_alice_bs_stimulus:

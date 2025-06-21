@@ -22,11 +22,10 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    saturation_pulse_stretch_length: float = 1e-3 - 100e-9
-    saturation_pulse_ramp_time: float = 100e-9
-    saturation_pulse_amplitude: float = 0.1
+    saturation_pulse_config: dict = None
     readout_window_name: str = None
-    readout_stimulus_waveform_name: str = None
+    readout_capture_memory_name: str = "readout_accumulated"
+    readout_pulse_name: str = "readout"
     plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
@@ -42,21 +41,14 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
         qubit = Qubit(qubit_stimulus_io)
 
-        # Create the qubit saturation waveform manually, as this is not a waveform
-        # that the user will likely need to keep in the configuration file after this
-        # measurement
-        saturation_waveform = self.acadia.create_waveform_memory(
-            qubit._stimulus.channel, 
-            length=self.saturation_pulse_ramp_time)
-
         self.data.add_group(f"points", uniform=True)
-
+        logger.info("Before sequence")
         def sequence(a: Acadia):
 
             with a.channel_synchronizer():
-                a.schedule_waveform(saturation_waveform, stretch_length=self.saturation_pulse_stretch_length)
+                qubit_stimulus_io.schedule_pulse(self.saturation_pulse_config)
                 a.barrier()
-                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
+                readout_resonator.measure(self.readout_pulse_name, self.readout_capture_memory_name, self.readout_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()
@@ -65,8 +57,13 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         self.acadia.load()
 
         readout_resonator.load_windows()
-        readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_stimulus_io.load_waveform(saturation_waveform, {"data": "hann"}, self.saturation_pulse_amplitude)
+        logger.info("After sequence")
+        readout_stimulus_io.load_pulse(self.readout_pulse_name)
+        logger.info("After readout load pulse")
+        logger.info(self.saturation_pulse_config)
+        logger.info("After saturation pulse config print")
+        qubit_stimulus_io.load_pulse(self.saturation_pulse_config)
+        
 
         for i in range(self.iterations):
             for frequency in self.qubit_frequencies:
@@ -75,7 +72,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
                 # capture data and put in the corresponding group
                 self.acadia.run(minimum_delay=self.run_delay)
 
-                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
+                wf = readout_capture_io.get_waveform_memory(self.readout_capture_memory_name)
                 self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
