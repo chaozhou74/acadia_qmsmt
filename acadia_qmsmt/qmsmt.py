@@ -1049,7 +1049,8 @@ class Qubit:
                 pulse_waveform_memory: str = None,
                 measurement_stimulus_waveform_memory: str = None,
                 measurement_capture_waveform_memory: str = None,
-                measurement_cmacc_window: str = None) -> None:
+                measurement_cmacc_window: str = None,
+                measurement_post_delay: float = 2e-6) -> None:
         """
         A subsequence that prepares the qubit in a given state by measuring and
         conditionally applying a waveform. All mneasurement names are passed 
@@ -1066,6 +1067,7 @@ class Qubit:
         :param measurement_capture_waveform_memory: The name of the measurement
             resonator capture waveform.
         :param measurement_cmacc_window: CMACC window for the measuremnt 
+        :param measurement_post_delay: delay after measurement before starting the next pulse sequnece, in seconds
 
         """
 
@@ -1073,8 +1075,19 @@ class Qubit:
         quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{state_quadrant}")
         reg = a.sequencer().Register()
 
-        # make sure the initial register value is definitely not the target value
-        reg.load(getattr(a, f"CMACC_QUADRANT_{(state_quadrant +1 ) % 4}"))
+
+        # do an initial msmt
+        with a.channel_synchronizer():
+            measurement_resonator.measure(measurement_stimulus_waveform_memory,
+                                        measurement_capture_waveform_memory,
+                                        measurement_cmacc_window)
+        
+        reg.load(measurement_resonator.get_measurement())
+
+        # wait for readout to empty
+        with a.channel_synchronizer():
+            self._stimulus.dwell(measurement_post_delay)
+
 
         ## Measure + conditional flip, until we get the target state
         # todo: try getting the number of msmts in this loop using a counter register
@@ -1086,6 +1099,8 @@ class Qubit:
                 measurement_resonator.measure(measurement_stimulus_waveform_memory,
                                               measurement_capture_waveform_memory,
                                               measurement_cmacc_window)
+            with a.channel_synchronizer():
+                self._stimulus.dwell(measurement_post_delay)
 
             reg.load(measurement_resonator.get_measurement())
 
