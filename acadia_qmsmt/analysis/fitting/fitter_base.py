@@ -38,6 +38,8 @@ class FitterBase:
         """
         self.coordinates = np.array(coordinates)
         self.data = np.array(data)
+        if sigma is not None:
+            sigma = np.clip(sigma, np.mean(sigma/1e10), np.inf) 
         self.sigma = sigma
         self.absolute_sigma = absolute_sigma
 
@@ -79,7 +81,7 @@ class FitterBase:
                 self.pcov = self._reconstruct_cov(fit_pcov)
             except Exception as e:
                 self.popt = [np.nan] * len(expected_keys)
-                logger.error(e)
+                logger.error(e, exc_info=True)
 
         self._process_results()
 

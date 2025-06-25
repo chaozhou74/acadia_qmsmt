@@ -13,7 +13,7 @@ Collection of commonly used plotting functions
 """
 
 
-def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None, vmin=None, v_max=None) -> [Figure, Axis]:
+def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None, vmin=None, v_max=None, **kwargs) -> [Figure, Axis]:
     """
     Plot a pcolormesh of bin-averaged raw traces.
 
@@ -36,10 +36,12 @@ def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None, v
     data_vld = raw_data[:n_lines * n_avg]
     data_ba = data_vld.reshape(n_lines, n_avg, -1).mean(axis=1)  # bin averaged
     bin_index = np.arange(n_lines)
-
-    pcm = ax.pcolormesh(bin_index, axis_vals, data_ba.T, cmap="bwr", vmin=vmin, vmax=v_max)
+    cmap = kwargs.pop("cmap", "bwr")
+    pcm = ax.pcolormesh(bin_index, axis_vals, data_ba.T, cmap=cmap, vmin=vmin, vmax=v_max, **kwargs)
     fig.colorbar(pcm, ax=ax)
     ax.set_xlabel(f"iterations ({n_avg}x) ")
+    if cmap == "bwr":
+        ax.set_facecolor("k") # make the masked/nan points be distinct from actual mid value points
 
     return fig, ax
 

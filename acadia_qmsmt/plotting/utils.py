@@ -32,8 +32,8 @@ def prepare_plot_axes(fig_or_axs: Union[None, Figure, Axes, np.ndarray[Axes]],
     :param subplot_kwargs: Additional kwargs passed to plt.subplots()
     :return: (Figure, Axes or array of Axes)
     """
+    axs_shape = axs_shape or (1, 1)
     if fig_or_axs is None:
-        axs_shape = axs_shape or (1, 1)
         fig, axs = plt.subplots(*axs_shape, **subplot_kwargs)
         return fig, axs
 
@@ -41,10 +41,7 @@ def prepare_plot_axes(fig_or_axs: Union[None, Figure, Axes, np.ndarray[Axes]],
     if isinstance(fig_or_axs, Figure):
         axs = fig_or_axs.get_axes()
         if len(axs) == 0:
-            if axs_shape is not None:
-                axs = fig_or_axs.subplots(*axs_shape)
-            else:
-                warnings.warn("Provided Figure has no axes and axs_shape is None; returning empty axes list.")
+            axs = fig_or_axs.subplots(*axs_shape)
         return fig_or_axs, axs
 
     # provided plot Axes
