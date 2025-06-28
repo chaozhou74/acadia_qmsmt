@@ -1,7 +1,7 @@
 import numpy as np
 
 from acadia import Acadia, DataManager
-from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig, DriveChannel
+from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
 
@@ -16,12 +16,13 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    num_prep_rounds: int = 3
+    qubit_pulse_name: str = "R_x_180"
+    readout_pulse_name: str = "readout"
+    capture_memory_name: str = "readout_accumulated"
+    capture_window_name: str = None
 
-    qubit_pulse_name: str = None
-    qubit_pulse_waveform_name: str = None
-    readout_window_name: str = None
-    readout_stimulus_waveform_name: str = None
+    num_prep_rounds:int = 0
+
     plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
@@ -54,23 +55,21 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
             with a.sequencer().test(state_prep_selecter == 0):
                 for i in range(self.num_prep_rounds):
                     qubit.prepare(1, readout_resonator, self.qubit_pulse_name,
-                          "readout",
-                          "readout_accumulated", 
-                          self.readout_window_name) # prep in g
+                          self.readout_pulse_name,
+                          self.capture_memory_name, 
+                          self.capture_window_name) # prep in g
 
             with a.sequencer().test(state_prep_selecter == 1):
                 with a.channel_synchronizer():
-                    qubit.pulse(self.qubit_pulse_name)
+                    qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
                 for i in range(self.num_prep_rounds):
                     qubit.prepare(2, readout_resonator, self.qubit_pulse_name,
-                          "readout",
-                          "readout_accumulated",
-                          self.readout_window_name) # prep in e
-
-            readout_resonator.wait_until_measurement_done()
+                          self.readout_pulse_name,
+                          self.capture_memory_name,
+                          self.capture_window_name) # prep in e
 
             with a.channel_synchronizer():
-                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
+                readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()
@@ -79,8 +78,8 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         self.acadia.load()
 
         readout_resonator.load_windows()
-        readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
+        readout_stimulus_io.load_pulse(self.readout_pulse_name)
+        qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
 
         for i in range(self.iterations):
@@ -88,7 +87,7 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
                 cache[0] = prep
                 # capture data and put in the corresponding group
                 self.acadia.run(minimum_delay=self.run_delay)
-                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
+                wf = readout_capture_io.get_waveform_memory(self.capture_memory_name)
                 if prep == 0:
                     self.data[f"prep_g"].write(wf.array)
                 elif prep == 1:
@@ -105,17 +104,15 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         pass
 
     def update(self):
-        # # get current completed data
-        # self.process_current_data()
-
         # save current data
         self.data.save(self.local_directory)
 
     def finalize(self):
+        super().finalize()
         from acadia_qmsmt.plotting import save_registered_plots
         if self.plot:
             save_registered_plots(self)
-        super().finalize()
+
 
 
     @annotate_method(is_data_processor=True)

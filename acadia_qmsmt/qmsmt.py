@@ -12,6 +12,8 @@ from scipy.signal.windows import hann as scipy_hann
 
 from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Operation
 from acadia.compiler import ManagedResource, Symbol
+from acadia.sample_arithmetic import complex_to_sample
+from acadia.utils import clock_monotonic_ns
 
 ##############################################################
 # Todo: IN ACADIA_QMSMT
@@ -211,6 +213,7 @@ class InputOutputWaveforms:
     def scale_detune_pulse(pulse: NDArray, scale: complex = None,
                     detune: float = None, sample_frequency: float = 8e8) -> NDArray:
         ''' Scale and detune a pulse'''
+        # TODO: change this to allow tuples of scale and detune (enforcing they have the same length) and that there's no overflow on the samples, for polychromatic pulses -- JWOG
         if scale is not None:
             pulse = np.multiply(pulse, scale)
         if detune is not None:
@@ -233,6 +236,7 @@ class InputOutput:
         self._channel: Channel = acadia.channel(self.get_config("channel"))
         self._pulse_cache: Dict[str, Dict] = {} # Stores all computed pulses and waveform memories 
         self._allocated_memories: Dict[str, WaveformMemory] = {}
+        self._samples_per_cycle = self._acadia._firmware["rfdc"]["dac"]["channel_interface_width"][self._channel.num()] // 32
         
     def get_config(self, *cfg_path: str):
         """
@@ -271,6 +275,7 @@ class InputOutput:
             the configuration is used.
         :return: A dictionary containing the configuration of the specified pulse.
         """
+        # took ~ 10 us
         if pulse is None:
             pulse = list(self._config["pulses"].values())[0]
             pulse["name"] = list(self._config["pulses"].keys())[0]
@@ -307,7 +312,6 @@ class InputOutput:
         use_stretch = pulse_config.get("use_stretch", False)
         f = pulse_config.get("flat", 0e-9)
         clock_sample_time = 1 / self._acadia.sequencer_clock_frequency()
-        samples_per_cycle = self._acadia._firmware["rfdc"]["dac"]["channel_interface_width"][self._channel.num()] // 32
         stretch_length = None # Initialize stretch length to None
         
         if use_stretch: # This part computes 'f' appropriately if use_stretch is True
@@ -359,7 +363,7 @@ class InputOutput:
             flat_frac = f / ml
 
         else:
-            ml = len(pulse_config["data"]) * clock_sample_time/samples_per_cycle
+            ml = len(pulse_config["data"]) * clock_sample_time/self._samples_per_cycle
             ramp_frac = None
             flat_frac = None
 
@@ -374,19 +378,19 @@ class InputOutput:
             containing the configuration of the pulse. If None, the first pulse in
             the configuration is used.
         '''
-        
+         # took ~ 90us
         pulse_config = self.get_pulse_config(pulse_config)
         pulse_name = pulse_config["name"]
-        pulse_hash = make_hash(pulse_config)
+        pulse_hash = make_hash(pulse_config) # took ~ 70us
         # Don't populate cache if pulse_name is None
         if pulse_name is None:
-            return
+            return pulse_hash
         # If pulse doesn't exist, create a new entry in the cache
         if pulse_name not in self._pulse_cache:
             self._pulse_cache[pulse_name] = {'waveforms': {}, 'memory': None}
         # If pulse_hash already exists, return
         if self._pulse_cache[pulse_name]['waveforms'].get(pulse_hash) is not None:
-            return
+            return pulse_hash
         else: # If pulse_hash doesn't exist, compute the pulse parameters
             waveform_container = {}
             ramp_frac, flat_frac, memory_length, stretch_length = self._compute_ramp_flat_memlen_stretchlen(pulse_config)
@@ -395,6 +399,7 @@ class InputOutput:
             waveform_container["memory_length"] = memory_length
             waveform_container["stretch_length"] = stretch_length
             self._pulse_cache[pulse_name]['waveforms'][pulse_hash] = waveform_container
+            return pulse_hash
 
     def get_waveform_memory(self, waveform_memory: Union[str, dict, WaveformMemory] = None) -> WaveformMemory:
             """
@@ -424,11 +429,10 @@ class InputOutput:
                 if waveform_memory is None:
                     waveform_memory = list(self.get_config("pulses").keys())[0]
                 
-                self.prepare_pulse_params(waveform_memory)
                 wfm_name = waveform_memory["name"] if isinstance(waveform_memory, dict) else waveform_memory
-                if self._pulse_cache[wfm_name].get("memory") is None:
+                if (self._pulse_cache.get(wfm_name) is None) or (self._pulse_cache[wfm_name].get("memory") is None):
                     pulse_config = self.get_pulse_config(waveform_memory)
-                    pulse_hash = make_hash(pulse_config)
+                    pulse_hash = self.prepare_pulse_params(pulse_config)
                     memory_length = self._pulse_cache[wfm_name]['waveforms'][pulse_hash]["memory_length"]
                     stretch_length = self._pulse_cache[wfm_name]['waveforms'][pulse_hash]["stretch_length"]
                     wfm = self._acadia.create_waveform_memory(self._channel, length = memory_length)
@@ -465,6 +469,7 @@ class InputOutput:
         :param kwargs: Additional keyword arguments to be passed to the pulse
             generation function. These will override values specified using a str, or Dict
         """
+        # todo: should we still allow this to take `pulse` with a string type? Do we still have a use case for that?
 
         # Determine the memory to be loaded
         memory_name = None
@@ -477,7 +482,7 @@ class InputOutput:
         elif isinstance(memory, WaveformMemory):
             wfm = memory
         else:
-            raise TypeError("`load_waveform` requires either a WaveformMemory"
+            raise TypeError("`load_pulse` requires either a WaveformMemory"
                             " object that can be loaded, or a string or a dict that"
                             " specifies a pulse. If it is a string, it should match the name of a pulse"
                             " in the configuration. If it is a dict, it should contain a pulse configuration.")
@@ -494,7 +499,7 @@ class InputOutput:
                 raise TypeError("You should be knowing what you are doing. memory is a WaveformMemory, and pulse is None. ¯\_(ツ)_/¯")
 
         if isinstance(pulse, (str, dict)):
-            pulse = self.get_pulse_config(pulse)
+            pulse = self.get_pulse_config(pulse).copy()
         else:
             if isinstance(pulse, (float, complex)):
                 # If it is a pulse, convert it into an array
@@ -504,12 +509,15 @@ class InputOutput:
             pulse["name"] = memory_name
             # Need to remember length of memory if pulse is a float or complex
         pulse.update(kwargs)
-        samples = self.compute_pulse(pulse)
-        
-        wfm.load(samples)
+
+        # `compute_pulse` return samples as integer pairs that have been converted using `complex_to_samples`
+        # so we can directly copy it to the memory
+        samples = self.compute_pulse(pulse, return_raw=True)
+        np.copyto(wfm.array, samples)
         
     def compute_pulse(self, 
                         pulse: Union[str,dict,None] = None, 
+                        return_raw = True,
                         **kwargs) -> NDArray:
         """
         This method computes a pulse waveform based on the configuration. This method 
@@ -518,6 +526,8 @@ class InputOutput:
         :param pulse: The name of the pulse in the configuration, or a dictionary
             containing the configuration of the pulse. If None, the first pulse in
             the configuration is used.
+        :param return_raw: When True, return the pulse samples as integers that can be directly loaded to
+            the memory via `np.copyto`
         :param kwargs: Additional keyword arguments to be passed to the pulse
             generation function. These can include parameters such as `scale`,
             `detune`, `ramp`, `flat`, `use_stretch`, and `memory_length`. The values
@@ -525,13 +535,9 @@ class InputOutput:
         :return: A numpy array containing the computed pulse waveform.
         """
         
-        # Create useful variables
-        samples_per_cycle = self._acadia._firmware["rfdc"]["dac"]["channel_interface_width"][self._channel.num()] // 32
-            
         # Get the pulse configuration and its hash
-        pulse_config = self.get_pulse_config(pulse)
+        pulse_config = self.get_pulse_config(pulse).copy()
         pulse_config.update(kwargs)
-        pulse_hash = make_hash(pulse_config)
         scale = pulse_config.get("scale", None)
         detune = pulse_config.get("detune", None)
         use_stretch = pulse_config.get("use_stretch", False)
@@ -541,11 +547,12 @@ class InputOutput:
         
         if pulse_config["name"] is not None:
             # Look in the cache for the pulse
-            self.prepare_pulse_params(pulse_config)
+            pulse_hash = self.prepare_pulse_params(pulse_config)
             waveform_container = self._pulse_cache[pulse_config["name"]]['waveforms'][pulse_hash]
-            samples = waveform_container.get("samples")
-                
-            if samples is None:
+            complex_samples = waveform_container.get("complex_samples")
+            raw_samples = waveform_container.get("raw_samples")
+
+            if complex_samples is None:
                 # This means the pulse hasn't already been computed and cached
                 if scale is not None or detune is not None:
                     # compute waveform_0 (one with no scale or detuning)
@@ -554,29 +561,84 @@ class InputOutput:
                     waveform_0_config = pulse_config.copy()
                     waveform_0_config["scale"] = None
                     waveform_0_config["detune"] = None
-                    samples = self.compute_pulse(waveform_0_config)
+                    complex_samples = self.compute_pulse(waveform_0_config, return_raw=False)
             
                 elif isinstance(pulse_config["data"], str):
                     # If the pulse is a string, we need to compute it
                     ramp_frac = waveform_container["ramp_frac"]
                     flat_frac = waveform_container["flat_frac"]
                     memory_length = waveform_container["memory_length"]
-                    num_samples = self._acadia.seconds_to_cycles(memory_length) * samples_per_cycle
-                    samples = np.zeros(num_samples, dtype = np.complex128)
+                    num_samples = self._acadia.seconds_to_cycles(memory_length) * self._samples_per_cycle
+                    complex_samples = np.zeros(num_samples, dtype = np.complex128)
                     func_kwargs = {k: v for k, v in pulse_config.items() if k not in KWARG_EXCLUDE_LIST}
-                    InputOutputWaveforms.flattop_generator(samples, getattr(InputOutputWaveforms, pulse_config["data"]), ramp_frac, flat_frac, **func_kwargs)
+                    InputOutputWaveforms.flattop_generator(complex_samples, getattr(InputOutputWaveforms, pulse_config["data"]), ramp_frac, flat_frac, **func_kwargs)
                 else: # we just use the data directly
-                    samples = pulse_config["data"]
+                    complex_samples = pulse_config["data"]
                 
-                samples = InputOutputWaveforms.scale_detune_pulse(samples, scale, detune, self._channel.interface_sample_frequency)
-                self._pulse_cache[pulse_config["name"]]['waveforms'][pulse_hash]["samples"] = samples
+                complex_samples = InputOutputWaveforms.scale_detune_pulse(complex_samples, scale, detune, self._channel.interface_sample_frequency)
+                # cache complex samples for scaling and detuning
+                self._pulse_cache[pulse_config["name"]]['waveforms'][pulse_hash]["complex_samples"] = complex_samples
+
+            if raw_samples is None:    
+                raw_samples = complex_to_sample(complex_samples)
+                # cache raw samples for directly loading to memory
+                self._pulse_cache[pulse_config["name"]]['waveforms'][pulse_hash]["raw_samples"] = raw_samples
+
         else:
-            # No caching pulses without names
-            samples = pulse_config["data"]
-            samples = InputOutputWaveforms.scale_detune_pulse(samples, scale, detune, self._channel.interface_sample_frequency)
+            # Pulse without name will not be cached
+            complex_samples = pulse_config["data"]
+            complex_samples = InputOutputWaveforms.scale_detune_pulse(complex_samples, scale, detune, self._channel.interface_sample_frequency)
+            raw_samples = complex_to_sample(complex_samples)
         
-        return samples
+        if return_raw:
+            return raw_samples
+        else:
+            return complex_samples
     
+
+    def duplicate_pulse(self, old_pulse:Union[str, dict], new_pulse_name:str=None, 
+                        create_memory:bool=False, duplicate_waveforms:bool=False):
+        """
+        Duplicate an existing pulse configuration and its waveform memory.
+
+        :param old_pulse: The pulse to duplicate, specified by name or config dictionary.
+        :param new_pulse_name: The name of the new duplicated pulse. If None, "_copy" is appended to the old name.
+        :param duplicate_waveforms: If True, create the waveform memory for this pulse. 
+            Usually this can be False, and `create_waveform_memory` will be called at the compile time.
+        :param duplicate_waveforms: If True, duplicate the cached waveform data as well.
+        """
+        new_config = self.get_pulse_config(old_pulse).copy()
+        old_name = new_config.get("name")
+        if old_name is None:
+            raise ValueError("Cannot duplicate unnamed pulse.")
+
+        # If new pulse name is None, apped _copy (and index)
+        if new_pulse_name is None:
+            base_name = old_name + "_copy"
+            new_pulse_name = base_name
+            i = 1
+            while new_pulse_name in self._config.get("pulses", {}):
+                new_pulse_name = f"{base_name}{i}"
+                i += 1
+        new_config["name"] = new_pulse_name
+
+        # Insert into config tree (modifies in-place)
+        if "pulses" not in self._config:
+            self._config["pulses"] = {}
+        self._config["pulses"][new_pulse_name] = new_config
+
+        # Create WaveformMemory for this pulse
+        if create_memory:
+            self.get_waveform_memory(new_pulse_name)
+
+        # Duplicate waveform entries (by copying the waveform container dicts)
+        if duplicate_waveforms:
+            for h, val in self._pulse_cache.get(old_name, {}).get("waveforms", {}).items():
+                self._pulse_cache[new_pulse_name]["waveforms"][h] = val.copy()
+        
+        return new_pulse_name
+
+
     def schedule_pulse(self, pulse: Union[str, Dict, WaveformMemory] = None,
               stretch_length:Union[float, ManagedResource] = None) -> None:
         """
@@ -609,6 +671,16 @@ class InputOutput:
             :type length_is_minus_one: bool
             """
             self._acadia.dwell(self.channel, length, length_is_minus_one)
+
+    def set_frequency(self, frequency: float, sync: bool = True):
+        """
+        Update the frequency of the IO channel and optionally trigger a synchronization.
+        """
+
+        self.set_nco_frequency(frequency)
+        self.reset_nco_phase()
+        if sync:
+            self._acadia.update_ncos_synchronized()
 
     @property
     def channel(self) -> Channel:
@@ -1034,14 +1106,43 @@ class Qubit:
 
     def set_frequency(self, frequency: float, sync: bool = True):
         """
-        The frequencies of both the stimulus and the capture are updated and 
-        optionally synchronized.
+        Shortcut function for InputOutput.set_frequency
         """
 
-        self._stimulus.set_nco_frequency(frequency)
-        self._stimulus.reset_nco_phase()
-        if sync:
-            self._stimulus._acadia.update_ncos_synchronized()
+        self._stimulus.set_frequency(frequency, sync)
+
+    def make_rotation_pulse(self, polar_deg:float, azim_deg:float, 
+                            reference_pi_pulse:Union[str, dict]="R_x_180",
+                            pulse_name:str=None, create_memory=False):
+
+        # duplicate the pi pulse config
+        stimulus = self._stimulus
+        new_config = stimulus.get_pulse_config(reference_pi_pulse).copy()
+
+        # scale the pulse
+        original_scale = new_config["scale"]
+        scale = original_scale * polar_deg/180 * np.exp(1j*azim_deg/180*np.pi)
+        new_config["scale"] = scale
+
+        # set pulse name
+        if pulse_name is None:
+            pulse_name = f"rotaion_{polar_deg}_{azim_deg}"
+        base_name = pulse_name
+        i=1
+        while pulse_name in stimulus._config.get("pulses", {}):
+            pulse_name = f"{base_name}_{i}"
+            i += 1
+        new_config["name"] = pulse_name
+
+
+        # Insert into config tree (modifies in-place)
+        stimulus._config["pulses"][pulse_name] = new_config
+
+        # Create WaveformMemory for this pulse
+        if create_memory:
+            stimulus.get_waveform_memory(pulse_name)
+        
+        return pulse_name
 
     def prepare(self, 
                 state_quadrant: Literal[1,2,3,4],
@@ -1050,7 +1151,8 @@ class Qubit:
                 measurement_stimulus_waveform_memory: str = None,
                 measurement_capture_waveform_memory: str = None,
                 measurement_cmacc_window: str = None,
-                measurement_post_delay: float = 2e-6) -> None:
+                measurement_post_delay: float = 2e-6,
+                state_register = None) -> None:
         """
         A subsequence that prepares the qubit in a given state by measuring and
         conditionally applying a waveform. All mneasurement names are passed 
@@ -1070,10 +1172,11 @@ class Qubit:
         :param measurement_post_delay: delay after measurement before starting the next pulse sequnece, in seconds
 
         """
+        # raise NotImplementedError("This function currently appears to be buggy. To avoid unexpected behavior, use a long `run_delay` for now")
 
         a = self._stimulus._acadia
         quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{state_quadrant}")
-        reg = a.sequencer().Register()
+        reg = a.sequencer().Register() if state_register is None else state_register
 
 
         # do an initial msmt
@@ -1092,9 +1195,9 @@ class Qubit:
         ## Measure + conditional flip, until we get the target state
         # todo: try getting the number of msmts in this loop using a counter register
         with a.sequencer().repeat_until(reg == quadrant_reg_value):
-
             with a.channel_synchronizer():
                 self._stimulus.schedule_pulse(pulse_waveform_memory)
+                self._stimulus.dwell(100e-9)
                 a.barrier()
                 measurement_resonator.measure(measurement_stimulus_waveform_memory,
                                               measurement_capture_waveform_memory,
@@ -1104,37 +1207,14 @@ class Qubit:
 
             reg.load(measurement_resonator.get_measurement())
 
-class DriveChannel:
-    """
-    A collection of functions that are useful for generic drive pulse
-    """
-
-    def __init__(self, stimulus: InputOutput):
-        """
-        Runtime class that contains experiment specific functions, including sub_sequence functions
-        """
-        self._stimulus = stimulus
-
-    def set_frequency(self, frequency: float, sync: bool = True):
-        """
-        The frequencies of both the stimulus and the capture are updated and 
-        optionally synchronized.
-        """
-
-        self._stimulus.set_nco_frequency(frequency)
-        self._stimulus.reset_nco_phase()
-        if sync:
-            self._stimulus._acadia.update_ncos_synchronized()
-
-    def pulse(self, waveform_memory: Union[str, WaveformMemory] = None, 
+    def schedule_pulse(self, waveform_memory: Union[str, WaveformMemory] = None,
                 stretch_length:Union[float, ManagedResource] = None) -> None:
         """
-        Apply a beamsplitting pulse. The waveform memory parameter is passed directly to 
-        :meth:`InputOutput.get_waveform_memory`; see documentation therein for 
-        argument behavior.
+        Shortcut function for InputOutput.schedule_pulse
         """
 
         self._stimulus.schedule_pulse(waveform_memory, stretch_length)
+
 
 class QubitQmCooler:
     """
@@ -1142,7 +1222,7 @@ class QubitQmCooler:
     # todo: expand to multi-QM cooling
     """
 
-    def __init__(self, qubit: Qubit, readout: MeasurableResonator, beamsplitting: DriveChannel):
+    def __init__(self, qubit: Qubit, readout: MeasurableResonator, beamsplitting: InputOutput):
         self.qubit = qubit
         self.readout = readout
         self.beamsplitter = beamsplitting
@@ -1152,32 +1232,26 @@ class QubitQmCooler:
 
     def cool(self,
                 state_quadrant: Literal[1,2,3,4] = 1,
-                qubit_pulse_mem: str = None,
-                ro_stimulus_mem: str = None,
+                qubit_pulse_name: str = None,
+                ro_pulse_name: str = None,
                 ro_capture_mem: str = None,
                 ro_cmacc_window: str = None,
-                bs_pulse_mem: str = None,
-                qm_cooling_rounds=1) -> None:
+                bs_pulse_name: str = None,
+                qm_cooling_rounds=1,
+                measurement_post_delay: float = 100e-9,
+                state_register = None) -> None:
         """
-
-        :param state_quadrant:
-        :param qubit_pulse_mem:
-        :param ro_stimulus_mem:
-        :param ro_capture_mem:
-        :param ro_cmacc_window:
-        :param bs_pulse_mem:
-        :param qm_cooling_rounds:
-        :return:
+        cools things
         """
         a = self.qubit._stimulus._acadia
 
         ## Step 1: cool qubit
-        self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_mem,
-                           ro_stimulus_mem, ro_capture_mem, ro_cmacc_window)
+        self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
+                           ro_pulse_name, ro_capture_mem, ro_cmacc_window,measurement_post_delay,state_register)
 
         ## Step 2: swap Qm photon to qubit and cool qubit again
         for i in range(qm_cooling_rounds): # in case the first swap failed.
             with a.channel_synchronizer():
-                self.beamsplitter.pulse(bs_pulse_mem)
-            self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_mem,
-                               ro_stimulus_mem, ro_capture_mem, ro_cmacc_window)
+                self.beamsplitter.schedule_pulse(bs_pulse_name)
+            self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
+                               ro_pulse_name, ro_capture_mem, ro_cmacc_window,measurement_post_delay,state_register)

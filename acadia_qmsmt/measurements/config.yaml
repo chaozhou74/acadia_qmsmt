@@ -3,18 +3,20 @@ qb_stimulus:
   channel_config:
     vop: 30000 # Gain of the DAC
     mix_reconstruction: true # flase # for scope check # Set to falso for zero order hold (ZOH) reconstruction
-    nco_frequency: 8.09395e+9   # 50e6 # for scope check
+    nco_frequency: 8.097711962e+9 # 50e6 # for scope check
   pulses:
     R_x_180:
       data: hann
-      scale: 0.66969
+      scale: 0.68918
       ramp: 120e-9 # Both up and down ramps
       flat: 100e-9
       use_stretch: true
     R_x_180_selective:
       data: hann
       scale: 0.05228
-      ramp: 4000e-6
+      ramp: 400e-9
+      flat: 5e-6
+      use_stretch: true
     R_x_90:
       data: hann
       scale: 0.32665
@@ -24,13 +26,16 @@ qb_stimulus:
     R_x_180_selective_ef:
       data: hann
       scale: 0.04036
-      ramp: 4000e-6
-      detune: -1.601e+8
+      ramp: 400e-9
+      flat: 5e-6
+      detune: -1.56597379e+8
+      use_stretch: false
     R_x_180_ef:
       data: hann
-      scale: 0.50832
-      ramp: 4000e-6
-      detune: -1.601e+8
+      scale: 0.38864
+      ramp: 400e-9
+      detune: -1.56597379e+8
+      use_stretch: false
 
 
 ro_stimulus:
@@ -38,7 +43,7 @@ ro_stimulus:
   channel_config:
     vop: 25000
     mix_reconstruction: true # true
-    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
+    nco_frequency: 9.0008e+9      # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
   pulses:
     readout:
       data: hann
@@ -51,7 +56,7 @@ ro_stimulus:
 ro_capture:
   channel: ADC0
   channel_config:
-    nco_frequency: 9.00068e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
+    nco_frequency: 9.0008e+9      # 8.9985e9 # 9.00057e9 # 9.0004e9
   memories:
     readout_trace:
       length: 2.2e-6
@@ -80,7 +85,7 @@ ro_capture:
       offset: [0, 0]
     matched:
       data: 0.1
-      offset: [0, 0]
+      offset: [131, 1545]
 
   
 qb_alice_bs_stimulus:
@@ -89,153 +94,28 @@ qb_alice_bs_stimulus:
     vop: 30000
     mix_reconstruction: false
     nco_frequency: 2.64131e9 # 20e6 # for scope check
-  memories:
-    swap_mem:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 240e-9
-    swap_mem_2:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 240e-9
-    dChi_pump_mem:
-      length: 300e-9 # TIME FOR RAMPS!!!
-      stretch_length: 5e-6
-    dChi_parity_map_mem:
-      length: 60e-9 # TIME FOR RAMPS!!!
-      stretch_length: 500e-9
-  waveforms:
-    swap_wf:
+  pulses:
+    swap:
       data: hann
       scale: 0.036
-    dChi_pump_wf:
+      ramp: 120e-9
+      flat: 100e-9
+      use_stretch: true
+    bs_50_50:
       data: hann
-      scale: 0.17
-    dChi_parity_map_wf:
+      scale: 0.036
+      ramp: 120e-9
+      flat: 100e-9
+      use_stretch: true
+    dChi_pump:
       data: hann
-      scale: 0.15
-
-
-qb_bob_bs_stimulus:
-  channel: DAC4 # DAC7 for scope check 
-  channel_config:
-    vop: 30000
-    mix_reconstruction: false
-    nco_frequency: 1.893915e9  # 20e6 # for scope check
-  memories:
-    swap_mem:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 1200e-9
-    swap_mem_2:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 1200e-9
-    dChi_pump_mem:
-      length: 300e-9 # TIME FOR RAMPS!!!
-      stretch_length: 5e-6
-    dChi_parity_map_mem:
-      length: 60e-9 # TIME FOR RAMPS!!!
-      stretch_length: 500e-9
-    dChi_pump_multichromatic_mem:
-      length: 110e-9 # TIME FOR RAMPS!!!
-      stretch_length: 430e-9
-    dChi_parity_map_multichromatic_mem:
-      length: 110e-9 # TIME FOR RAMPS!!!
-      stretch_length: 430e-9
-  waveforms:
-    swap_wf:
+      scale: 0.1
+      ramp: 120e-9
+      flat: 100e-9
+      use_stretch: true
+    dChi_parity_map:
       data: hann
-      scale: 0.011
-    dChi_pump_wf:
-      data: hann
-      scale: 0.08
-    dChi_pump_multichromatic_wf:
-      data: hann
-      scales: [0.15]
-      detunes: [-20e6]
-    dChi_parity_map_wf:
-      data: hann
-      scale: 0.145
-    dChi_parity_map_bichromatic_wf:
-      data: hann
-      scales: [0.15]
-      detunes: [-20e6]
-
-
-alice_bob_bs_stimulus:
-  channel: DAC3
-  channel_config:
-    vop: 29000
-    mix_reconstruction: false
-    nco_frequency: 0.748e9
-  memories:
-    swap_mem:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 1150e-9
-    bs_50_50_mem:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 500e-9
-  waveforms:
-    swap_wf:
-      data: hann
-      scale: 0.406
-    bs_50_50_wf:
-      data: hann
-      scale: 0.4426
-
-
-qb_linc_bs_stimulus:
-  channel: DAC3
-  channel_config:
-    vop: 20000
-    mix_reconstruction: false
-    nco_frequency: 0.8585e9
-  memories:
-    swap_mem:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 60e-9
-    swap_mem_2:
-      length: 80e-9 # TIME FOR RAMPS!!!
-      stretch_length: 60e-9
-  waveforms:
-    swap_wf:
-      data: hann
-      scale: 0.4
-
-alice_stimulus:
-  channel: DAC5 # DAC??? for scope check, DAC5 for normal operation
-  channel_config:
-    vop: 30000
-    mix_reconstruction: true
-    nco_frequency: 5.452160e9 # 20e6 # for scope check
-  memories:
-    fast_disp_mem:
-      length: 400e-9 # TIME FOR RAMPS!!!
-      stretch_length: 400e-9
-    slow_disp_mem:
-      length: 10000e-9 # TIME FOR RAMPS!!!
-      stretch_length: 0.e+1
-  waveforms:
-    fast_disp_wf:
-      data: hann
-      scale: 0.0856
-    slow_disp_wf:
-      data: hann
-      scale: 0.0104
-
-
-
-# scope_bs_stimulus:
-#   channel: DAC7 # DAC7 for scope check 
-#   channel_config:
-#     vop: 30000
-#     mix_reconstruction: false
-#     nco_frequency: 40e6  # 20e6 # for scope check
-#   memories:
-#     swap_mem:
-#       length: 80e-9 # TIME FOR RAMPS!!!
-#       stretch_length: 200e-9
-#     swap_mem_2:
-#       length: 80e-9 # TIME FOR RAMPS!!!
-#       stretch_length: 1200e-9
-#   waveforms:
-#     swap_wf:
-#       data: hann
-#       scale: 0.2
+      scale: 0.1
+      ramp: 120e-9
+      flat: 100e-9
+      use_stretch: true

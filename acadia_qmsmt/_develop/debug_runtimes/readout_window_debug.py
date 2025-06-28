@@ -57,6 +57,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         self.data.add_group("traces_g", uniform=True)
         self.data.add_group("traces_e", uniform=True)
         self.data.add_group("t_data", uniform=False)
+        self.data.add_group("pulse_debug", uniform=False)
 
         # Core FPGA (PL) sequence
         def sequence(a: Acadia):
@@ -77,14 +78,34 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         readout_stimulus_io.load_pulse(self.readout_pulse_name)
         t_data = None
 
+
+        qubit_pulse_samples_complex = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name, return_raw=False)
+        self.data[f"pulse_debug"].write(qubit_pulse_samples_complex)
+
+        qubit_pulse_samples_complex = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name,scale=0.2, return_raw=False)
+        self.data[f"pulse_debug"].write(qubit_pulse_samples_complex)
+
+        qubit_pulse_samples_complex = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name, return_raw=False)
+        self.data[f"pulse_debug"].write(qubit_pulse_samples_complex)
+
+        qubit_pulse_samples_complex = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name,scale=0.1, return_raw=False)
+        self.data[f"pulse_debug"].write(qubit_pulse_samples_complex)
+
+        qubit_pulse_samples_complex = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name, return_raw=False)
+        self.data[f"pulse_debug"].write(qubit_pulse_samples_complex)
+
+    
+
         # Core python loop that will be running on the ARM (PS)
         for i in range(self.iterations):
             for state_ in ["g", "e"]:
+                # set the pulse amplitude
+                # amp_ = 0 if state_ == "g" else None
 
                 if state_ == "g":
-                    qubit_stimulus_io.load_pulse(self.qubit_pulse_name, scale=0.)
+                    qubit_stimulus_io.load_pulse(self.qubit_pulse_name,scale=0.)
                 else:
-                    qubit_stimulus_io.load_pulse(self.qubit_pulse_name) # !!Note: scale not provided will use the pulse in yaml file; scale=None will set pulse scale to 1
+                    qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
                 # capture data and put in the corresponding group
                 self.acadia.run()

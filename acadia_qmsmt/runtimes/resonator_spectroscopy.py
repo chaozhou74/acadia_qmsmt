@@ -22,8 +22,11 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
+    stimulus_pulse_name: str = "readout"
+    capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = None
-    stimulus_waveform_name: str = None
+
+
     plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
@@ -39,14 +42,13 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         # Create the record group for saving captured data
         self.data.add_group(f"points", uniform=True)
-
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
 
             with a.channel_synchronizer():
                 # Measure the resonator by driving the "readout" waveform on the stimulus IO
                 # and capture into the "readout_accumulated" waveform on the capture IO
-                resonator.measure("readout", "readout_accumulated", self.capture_window_name)
+                resonator.measure(self.stimulus_pulse_name, self.capture_memory_name, self.capture_window_name)
 
         # Compile the sequence
         self.acadia.compile(sequence)
@@ -60,17 +62,17 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         # Load the window memory with the data from the config file
         resonator.load_windows()
-        # Load the stimulus waveform named "readout" with the specified signal
-        stimulus_io.load_pulse("readout", self.stimulus_waveform_name)
+        # Load the stimulus pulse named "readout" with the specified signal
+        stimulus_io.load_pulse(self.stimulus_pulse_name)   # since the readout pulse memory only has one set of sample in it, we don't have to specify the samples here, it will just use that one
 
         for i in range(self.iterations):
-            for frequency in self.frequencies:
+            for j, frequency in enumerate(self.frequencies):
                 resonator.set_frequency(frequency)
 
                 # capture data and put in the corresponding group
                 self.acadia.run(minimum_delay=self.run_delay)
 
-                wf = capture_io.get_waveform_memory("readout_accumulated")
+                wf = capture_io.get_waveform_memory(self.capture_memory_name)
                 self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
