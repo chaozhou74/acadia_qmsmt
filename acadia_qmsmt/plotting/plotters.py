@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axis import Axis
 import numpy as np
+from scipy.optimize import curve_fit
 
 from acadia_qmsmt.plotting import prepare_plot_axes
 from acadia_qmsmt.analysis import to_complex
@@ -82,53 +83,69 @@ def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: 
 
 
 
-def plot_pcolormesh_fft(x_vals, fft_freqs, fft_data, plot_ax=None, figsize=(8, 6),
-                        quadratic_fit=True, fft_peak_threshold=0.4) -> [Figure, Axis]:
+def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=(8, 6),
+                        root_quadratic_fit=True, fft_peak_threshold=0.4, 
+                        fit_freq_min=None, fit_freq_max=None, freq_scale=None) -> [Figure, Axis]:
     """
-    Plot a pcolormesh of FFT data and fit the peak track with a quadratic function.
+    Plot a pcolormesh of FFT data and fit the peak track with a sqrare root quadratic function.
 
     Written based on John's original general plotter code
 
-    x_vals (1D array): Values along x-axis (e.g., sweep parameter).
+    sweep_freqs (1D array): Sweep freqs in Hz
     fft_freqs (1D array): FFT frequencies.
-    fft_data (2D array): FFT amplitudes. Shape = (len(x_vals), len(fft_freqs)).
+    fft_data (2D array): FFT amplitudes. Shape = (len(sweep_freqs), len(fft_freqs)).
     plot_ax: Optional matplotlib axis to plot into.
     figsize: Figure size.
-    quadratic_fit: when True, fit the fft peak track with a quadratic function.
+    root_quadratic_fit: when True, fit the fft peak track with a root quadratic function.
     fft_peak_threshold: Relative threshold (0–1) to mask out low FFT peaks.
     :return:
     """
     fig, ax = prepare_plot_axes(plot_ax, axs_shape=(1, 1), figsize=figsize)
-    pcm = ax.pcolormesh(x_vals, fft_freqs, fft_data.T, cmap="inferno", shading="auto")
+    pcm = ax.pcolormesh(sweep_freqs, fft_freqs, fft_data.T, cmap="inferno", shading="auto")
     fig.colorbar(pcm, ax=ax)
 
     ax.set_ylabel("FFT Frequency")
     ax.set_title(f"FFT of time signal")
-    if not quadratic_fit:
+    if not root_quadratic_fit:
         return fig, ax
 
-    # pick the brightest region in 2d FFT plot
+    fit_freq_min = 0 if fit_freq_min is None else fit_freq_min
+    fit_freq_max = np.inf if fit_freq_max is None else fit_freq_max
+
+    freq_mask = np.where((fft_freqs > fit_freq_min) & (fft_freqs < fit_freq_max))[0]
+
+    fft_data = fft_data[:, freq_mask]
+    fft_freqs = fft_freqs[freq_mask]
+
     fft_max_idxes = np.argmax(fft_data, axis=1)
     fft_maxes = np.max(fft_data, axis=1)
     peak_mask = fft_maxes > np.ptp(fft_maxes) * fft_peak_threshold
 
-    x_peak = x_vals[peak_mask]
+    x_peak = sweep_freqs[peak_mask]
     freq_peak = fft_freqs[fft_max_idxes][peak_mask]
 
     ax.plot(x_peak, freq_peak, 'w.', label="Peak Trace", linestyle='')
 
-    # Fit parabola: freq = a x^2 + b x + c
-    if len(x_peak) >= 3:
-        a, b, c = np.polyfit(x_peak, freq_peak, deg=2)
-        detuning = -b / (2 * a)
-        g_val = c - (b ** 2) / (4 * a)
+    # guess freq scale based on the relative values of x and y
+    if freq_scale is None:
+        freq_scale = (fft_freqs[-1] - fft_freqs[0])/(sweep_freqs[-1]-sweep_freqs[0])
+        freq_scale = 10 ** int(np.round(np.log10(freq_scale)/3)*3)
 
-        title_text = f"On-resonance Freq: {detuning:.3e}   g: {g_val / 2:.3e}"
+    def _fit_model(f, f0, g):
+        return np.sqrt(g**2 + (f-f0)**2 * freq_scale**2)
+
+    if len(x_peak) >= 3:
+        p0 = (x_peak[np.argmin(freq_peak)], np.min(freq_peak))
+        bounds = ((np.min(x_peak), 0), (np.max(x_peak), np.max(freq_peak)))
+        popt, pcov = curve_fit(_fit_model, x_peak, freq_peak, p0=p0, bounds=bounds)
+
+
+        title_text = f"On-resonance Freq: {popt[0]:.3e}   g: {popt[1] / 2:.3e}"
         ax.set_title(f"FFT of time signal\n{title_text}")
 
-        fine_x = np.linspace(x_vals[0], x_vals[-1], 200)
-        ax.plot(fine_x, a * fine_x ** 2 + b * fine_x + c, 'w--', label="Parabolic Fit")
-        ax.axvline(detuning, linestyle='dotted', color='w', label="On-Resonance")
+        fine_x = np.linspace(sweep_freqs[0], sweep_freqs[-1], 200)
+        ax.plot(fine_x, _fit_model(fine_x, *popt), 'w--', label="Parabolic Fit")
+        ax.axvline(popt[0], linestyle='dotted', color='w', label="On-Resonance")
     else:
         ax.set_title("FFT of time signal\n(Not enough peak data to fit parabola)")
     ax.set_ylim(min(fft_freqs), max(fft_freqs))

@@ -24,10 +24,12 @@ class QubitRelaxationRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    qubit_pulse_name: str = None
-    qubit_pulse_waveform_name: str = None
-    readout_window_name: str = None
-    readout_stimulus_waveform_name: str = None
+    qubit_pulse_name: str = "R_x_180"
+    readout_pulse_name: str = "readout"
+    capture_memory_name: str = "readout_accumulated"
+    capture_window_name: str = "boxcar"
+
+
     plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
@@ -41,7 +43,6 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         readout_capture_io = self.io("readout_capture")
 
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
-        qubit = Qubit(qubit_stimulus_io)
 
         self.data.add_group(f"points", uniform=True)
 
@@ -51,21 +52,17 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
         def sequence(a: Acadia):
             # Initialize a DSP to act as a counter
-            counter = a.sequencer().DSP()
-
+            counter = a.sequencer().Register()
             # Load the counter with the value we put into the cache
             counter.load(cache[0])
 
-            with a.channel_synchronizer(block=False):
-                qubit.pulse(self.qubit_pulse_name)
-                
-            # Start the counter and wait until it reaches zero
-            counter.start_count(inc=int(np.int32(-1).astype(np.uint32)))
-            with a.sequencer().repeat_until(counter == 0):
-                pass
-
             with a.channel_synchronizer():
-                readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
+                qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
+                qubit_stimulus_io.dwell(counter)
+                # a.barrier() # doesn't work as of June 26th, 2025 - JWOG
+            with a.channel_synchronizer():
+                readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
+
 
         self.acadia.compile(sequence)
         self.acadia.attach()
@@ -74,12 +71,11 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         self.acadia.load()
 
         readout_resonator.load_windows()
-        readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
-        qubit_stimulus_io.load_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
+        readout_stimulus_io.load_pulse(self.readout_pulse_name)
+        qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
         # Determine how many cycles each delay interval should be
-        first_pulse_memory = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)
-        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times, first_pulse_memory)
+        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times)
 
         for i in range(self.iterations):
             for delay in dsp_count_values:
@@ -87,7 +83,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
                 # capture data and put in the corresponding group
                 self.acadia.run(minimum_delay=self.run_delay)
-                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
+                wf = readout_capture_io.get_waveform_memory(self.capture_memory_name)
                 self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
@@ -169,94 +165,4 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         fig, axs = plot_binaveraged(self.delay_times_us, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
         axs.set_ylabel("Time [us]")
         return fig, axs
-
-
-
-# --------------------------------------- in jpynb plotting ------------------------
-
-    # def initialize(self):
-        
-    #     if self.plot:
-    #         from acadia.processing import DynamicLine
-    #         import matplotlib.pyplot as plt
-    #         from IPython.display import display
-    #         from ipywidgets import Label
-
-    #         self.figsize = (4, 3) if self.figsize is None else self.figsize
-    #         self.fig, ax = plt.subplots(1, 1, figsize=self.figsize)
-    #         self.fig.tight_layout()
-    #         self.fig.subplots_adjust(left=0.25, bottom=0.25)
-
-    #         self.line_pop = DynamicLine(ax, ".", color="red")
-    #         self.line_fit = DynamicLine(ax, "--", color="red")
-    #         ax.set_xlabel("Delay Time [s]")
-    #         ax.set_ylabel("Measurement Polarization")
-    #         ax.set_xlim(self.delay_times[0], self.delay_times[-1])
-    #         ax.set_ylim(-1.1, 1.1)
-    #         ax.grid()
-
-    #         self.decay_label = Label(style={"description_width": "initial"})
-    #         display(self.decay_label)
-
-    #         from tqdm.notebook import tqdm
-
-    #     else:
-    #         from tqdm import tqdm
-
-    #     self.fit = None
-    #     self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
-    #     self.iterations_previous = 0
-
-    # def update(self):
-    #     # First make sure that we actually have new data to process
-    #     if "points" not in self.data or len(self.data["points"]) < len(self.delay_times):
-    #         return
-
-    #     # Update the progress bar based on the number of iterations
-    #     completed_iterations = len(self.data["points"]) // len(self.delay_times)
-    #     if completed_iterations == 0:
-    #         return
-
-    #     self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
-
-    #     valid_points = completed_iterations*len(self.delay_times)
-    #     data = self.data["points"].records()[:valid_points, ...]
-    #     data = data.reshape(completed_iterations, len(self.delay_times), 2)
-
-    #     # Threshold the data according to the I quadrature
-    #     shots = np.sign(data[:,:,0], dtype=np.int32)
-    #     self.avg = np.mean(shots, axis=0)
-
-    #     # Give the fit a reasonable initial guess
-    #     # p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
-    #     # self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0,bounds=[(-2.,0.1,-1.),(0.,1e6,1.)])
-
-    #     # if self.plot:
-    #     #     self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
-    #     #     if self.fit is not None:
-    #     #         self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
-    #     #         self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
-    #     #     self.fig.canvas.draw_idle() 
-
-
-    #     from acadia_qmsmt.analysis.fitting.exponential import Exponential
-    #     self.fit = Exponential(self.delay_times, self.avg)
-
-    #     if self.plot:
-    #         self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
-    #         if self.fit is not None:
-    #             self.decay_label.value = f"Decay time: {round(self.fit.ufloat_results['tau'].n*1e6, 3)} +- " +\
-    #                                      f"{round(self.fit.ufloat_results['tau'].s*1e6, 3)} us" 
-    #             self.line_fit.update(self.delay_times, self.fit.result.eval(coordinates=self.delay_times), rescale_axis=False)
-    #         self.fig.canvas.draw_idle() 
-
-
-    #     self.data.save(self.local_directory)
-    #     self.iterations_previous = completed_iterations
-
-    # def finalize(self):
-    #     super().finalize()
-    #     self.iterations_progress_bar.close()
-    #     if self.plot:
-    #         self.savefig(self.fig)
 

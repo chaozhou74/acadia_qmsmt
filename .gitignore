@@ -163,3 +163,4 @@ cython_debug/
 acadia_qmsmt/.idea/
 .idea/
 *.xml
+*.npy

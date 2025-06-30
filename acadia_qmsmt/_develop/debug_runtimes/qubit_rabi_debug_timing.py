@@ -29,16 +29,16 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     run_delay: int
 
     qubit_pulse_name: str = None
-    qubit_pulse_waveform_name: str = None
     readout_window_name: str = None
-    readout_stimulus_waveform_name: str = None
-    fit_quadratic: bool = False
+    readout_pulse_name: str = None
+
     plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
 
     def main(self):
         import logging
+        from acadia.utils import clock_monotonic_ns
         logger = logging.getLogger("acadia")
 
         qubit_stimulus_io = self.io("qubit_stimulus")
@@ -49,11 +49,12 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         qubit = Qubit(qubit_stimulus_io)
 
         self.data.add_group(f"points", uniform=True)
+        self.data.add_group(f"pulse_debug", uniform=False)
 
         def sequence(a: Acadia):
 
             with a.channel_synchronizer():
-                qubit.pulse(self.qubit_pulse_name)
+                qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
                 a.barrier()
                 readout_resonator.measure("readout", "readout_accumulated", self.readout_window_name)
 
@@ -64,19 +65,46 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         self.acadia.load()
 
         readout_resonator.load_windows()
-        readout_stimulus_io.load_waveform("readout", self.readout_stimulus_waveform_name)
+        readout_stimulus_io.load_pulse("readout")
 
-        # Precompute the envelope so that we're not recalculating it every time, only scaling it
-        qubit_pulse_samples = qubit_stimulus_io.compute_waveform(self.qubit_pulse_name, self.qubit_pulse_waveform_name)
 
+        # from acadia.sample_arithmetic import complex_to_sample
+        # qubit_pulse_samples_complex = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name, scale=0.65, return_raw=False)
+        # qubit_pulse_samples_int = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name, scale=0.65, return_raw=True)
+        # qubit_pulse_mem = qubit_stimulus_io.get_waveform_memory(self.qubit_pulse_name)
+
+        # self.data[f"pulse_debug"].write(qubit_pulse_samples_complex)
+        # self.data[f"pulse_debug"].write(qubit_pulse_samples_int)
+
+        
+        # t0 = clock_monotonic_ns()
+        # qubit_pulse_samples_int = qubit_stimulus_io.compute_pulse(self.qubit_pulse_name, scale=0.65, return_raw=True) # took 
+        # t1 = clock_monotonic_ns()
+        # logger.info(f"Before Loop, num_waveforms:{len(qubit_stimulus_io._pulse_cache[self.qubit_pulse_name]['waveforms'])}," 
+        #             f"compute exising pulse took: {(t1-t0)/1e3} us")
+
+
+        configure_streams = True
         for i in range(self.iterations):
-            for amplitude in self.qubit_amplitudes:
-                qubit_stimulus_io.load_waveform(self.qubit_pulse_name, qubit_pulse_samples, scale=amplitude)
+            for j, amplitude in enumerate(self.qubit_amplitudes):
 
-                self.acadia.run(minimum_delay=self.run_delay)
+                t0 = clock_monotonic_ns()
+                qubit_stimulus_io.load_pulse(self.qubit_pulse_name, scale=amplitude) # took ~ 166 us, in which 120us is `compute_pulse` on existing pulse
+                t1 = clock_monotonic_ns()
+                logger.info(f"In Loop, load exising pulse took: {(t1-t0)/1e3} us")
+    
+                # np.copyto(qubit_pulse_mem.array, qubit_pulse_samples_int)
+
+                t0 = clock_monotonic_ns()
+                self.acadia.run(minimum_delay=self.run_delay, configure_streams=configure_streams)
+                t1 = clock_monotonic_ns()
+
                 wf = readout_capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"points"].write(wf.array)
 
+                logger.info(f"Iter: {i}-{j}: num_waveforms:{len(qubit_stimulus_io._pulse_cache[self.qubit_pulse_name]['waveforms'])}, run took: {(t1-t0)/1e3} us")
+
+                configure_streams = False
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
                 return
@@ -162,7 +190,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
     @annotate_method(button_name="update pipulse amp")
     def update_amp(self):
-        self.update_io_yaml_field("qubit_stimulus", f"waveforms.{self.qubit_pulse_waveform_name}.scale", np.round(self.fitted_pi_amp.n, 5))
+        self.update_io_yaml_field("qubit_stimulus", f"pulses.{self.qubit_pulse_name}.scale", np.round(self.fitted_pi_amp.n, 5))
 
 
 

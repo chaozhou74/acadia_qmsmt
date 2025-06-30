@@ -43,6 +43,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         qubit = Qubit(qubit_stimulus_io)
 
         self.data.add_group(f"points", uniform=True)
+        logger.info("Before sequence")
         def sequence(a: Acadia):
 
             with a.channel_synchronizer():
@@ -57,7 +58,11 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         self.acadia.load()
 
         readout_resonator.load_windows()
+        logger.info("After sequence")
         readout_stimulus_io.load_pulse(self.readout_pulse_name)
+        logger.info("After readout load pulse")
+        logger.info(self.saturation_pulse_config)
+        logger.info("After saturation pulse config print")
         qubit_stimulus_io.load_pulse(self.saturation_pulse_config)
         
 

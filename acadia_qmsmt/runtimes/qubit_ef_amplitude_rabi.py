@@ -1,34 +1,33 @@
-"""
-We generally don't use a length Rabi experiment to tune up a π-pulse; this is just to show 
-how a pulse length sweep could be done with a register. 
-"""
-
 from typing import Union
 
 import numpy as np
+from numpy.typing import NDArray
+from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager
+from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
 
-class QubitLengthRabiRuntime(QMsmtRuntime):
+class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the rabi time
+    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.plot_pcolormesh_fft
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig
     readout_capture: IOConfig
 
-    flat_length_list: Union[list, np.ndarray]
+    # Note that these amplitudes override the ``scale`` parameter in the configuration
+    qubit_amplitudes: Union[list, np.ndarray]
 
     iterations: int
     run_delay: int
 
-    qubit_pulse_name: str = "R_x_180"
+    qubit_ge_pulse_name: str = "R_x_180"
+    qubit_ef_pulse_name: str = "R_x_180_ef"
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
-    capture_window_name: str = None
+    capture_window_name: str = "matched"
 
     plot: bool = True
     figsize: tuple[int] = None
@@ -46,27 +45,15 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
         qubit = Qubit(qubit_stimulus_io)
 
         self.data.add_group(f"points", uniform=True)
-
-        # Create an array in the cache that we can use to pass the
-        # delay value to the sequencer so that we don't have to reassemble every time
-        cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
-
-        if not qubit_stimulus_io.get_config("pulses", self.qubit_pulse_name).get("use_stretch"):
-            raise ValueError("qubit pulse must have use_stretch=True for the length to be sweepable via a register")
-
+        
 
         def sequence(a: Acadia):
-            # Initialize a DSP to act as a counter
-            length_reg = a.sequencer().Register()
-
-            # Load the counter with the value we put into the cache
-            length_reg.load(cache[0])
-
             with a.channel_synchronizer():
-                qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name, stretch_length=length_reg)
-
-            with a.channel_synchronizer():
-                readout_resonator.measure("readout", "readout_accumulated", self.capture_window_name)
+                qubit_stimulus_io.schedule_pulse(self.qubit_ge_pulse_name)
+                qubit_stimulus_io.schedule_pulse(self.qubit_ef_pulse_name)
+                qubit_stimulus_io.schedule_pulse(self.qubit_ge_pulse_name)
+                a.barrier()
+                readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
 
         self.acadia.compile(sequence)
         self.acadia.attach()
@@ -76,18 +63,14 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_pulse(self.readout_pulse_name)
-        qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
+        qubit_stimulus_io.load_pulse(self.qubit_ge_pulse_name)
 
-
-        # Determine how many cycles each delay interval should be
-        dsp_count_values = self.acadia.seconds_to_cycles(self.flat_length_list)
 
         for i in range(self.iterations):
-            for wf_idx, stretch_len in enumerate(dsp_count_values):
-                cache[0] = stretch_len
-                # capture data and put in the corresponding group
+            for amplitude in self.qubit_amplitudes:
+                qubit_stimulus_io.load_pulse(self.qubit_ef_pulse_name, scale=amplitude)
                 self.acadia.run(minimum_delay=self.run_delay)
-                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
+                wf = readout_capture_io.get_waveform_memory(self.capture_memory_name)
                 self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
@@ -95,6 +78,7 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
                 return
 
         self.final_serve()
+
 
 
     def initialize(self):
@@ -115,7 +99,7 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
     @annotate_method(is_data_processor=True)
     def process_current_data(self, thresholded:bool=True):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.flat_length_list)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_amplitudes)
         if data is None:
             return
         else:
@@ -130,22 +114,21 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
             self.data_to_fit = rotate_iq(self.avg_iq).real
         self.thresholded = thresholded
 
-        from acadia_qmsmt.analysis.fitting import ExpCosine
-        self.fit = ExpCosine(self.flat_length_list, self.data_to_fit)
-        self.fitted_pi_length = abs(1/self.fit.ufloat_results["f"]/2)
-        self.fitted_driven_tau = abs(self.fit.ufloat_results["tau"])
+        from acadia_qmsmt.analysis.fitting import Cosine
+        self.fit = Cosine(self.qubit_amplitudes, self.data_to_fit)
+        self.fitted_pi_amp = abs(1/self.fit.ufloat_results["f"]/2)
         return completed_iterations
     
 
-    @annotate_method(plot_name="1 qubit length rabi", axs_shape=(1,1))
+    @annotate_method(plot_name="1 qubit power rabi", axs_shape=(1,1))
     def plot_data(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.flat_length_list, self.data_to_fit, "o")
-        self.fit.plot_fitted(axs, oversample=5, label=f"pi_length: {self.fitted_pi_length:.5g}, driven tau: {self.fitted_driven_tau:.5g}")
+        axs.plot(self.qubit_amplitudes, self.data_to_fit, "o")
+        self.fit.plot_fitted(axs, oversample=5, label=f"pi_amp: {self.fitted_pi_amp:.5g}")
 
-        axs.set_xlabel("flat part length [s]")
+        axs.set_xlabel("Drive Amplitude [DAC]")
         if self.thresholded:
             axs.set_ylabel("e pop")
             axs.set_ylim(-0.02, 1.02)
@@ -154,4 +137,26 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
 
         axs.legend()
         return fig, axs
-    
+
+
+    @annotate_method(plot_name="2 qubit histogram at 0 and pi", axs_shape=(1, 2))
+    def plot_data_hist2d(self, axs=None, bins=50, log_scale:bool=False):
+        from acadia_qmsmt.plotting import prepare_plot_axes, plot_multiple_hist2d
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,2))
+
+        data_g = self.data_iq[:, np.argmin(abs(self.qubit_amplitudes))]
+        closet_pi_amp_idx = np.argmin(abs(self.qubit_amplitudes-self.fitted_pi_amp))
+        data_e = self.data_iq[:, closet_pi_amp_idx]
+
+        plot_multiple_hist2d(data_g, data_e, plot_ax=axs, bins=bins, log_scale=log_scale)
+        axs[0].set_title("amp 0")
+        axs[1].set_title(f"amp {np.round(self.qubit_amplitudes[closet_pi_amp_idx],9)}")
+        return fig, axs
+
+
+
+
+    @annotate_method(button_name="update pipulse amp")
+    def update_amp(self):
+        self.update_io_yaml_field("qubit_stimulus", f"pulses.{self.qubit_ef_pulse_name}.scale", np.round(self.fitted_pi_amp.n, 5))
+

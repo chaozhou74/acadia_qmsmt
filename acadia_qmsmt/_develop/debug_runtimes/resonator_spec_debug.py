@@ -22,11 +22,8 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    stimulus_pulse_name: str = "readout"
-    capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = None
-
-
+    stimulus_waveform_name: str = None
     plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
@@ -42,16 +39,48 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
         # Create the record group for saving captured data
         self.data.add_group(f"points", uniform=True)
+
+
+
+        # --------- pulse cache should be empty at this point since we haven't defined anything yet ---------------------
+        logger.info(f"stimulus._pulse_cache at the beginning, before defining sequence:")
+        logger.info(f"{stimulus_io._pulse_cache}")
+
+
         # Create a sequence for the sequencer to generate the pulse and capture it
         def sequence(a: Acadia):
 
             with a.channel_synchronizer():
                 # Measure the resonator by driving the "readout" waveform on the stimulus IO
                 # and capture into the "readout_accumulated" waveform on the capture IO
-                resonator.measure(self.stimulus_pulse_name, self.capture_memory_name, self.capture_window_name)
+                resonator.measure("readout", "readout_accumulated", self.capture_window_name)
+
+
+
+        # ----------- after defining the sequence, this should still be empty, since the sequence is just defined but not called/compiled ---------------
+        logger.info(f"stimulus._pulse_cache after defining sequence:")
+        logger.info(f"{stimulus_io._pulse_cache}")
+
+
+
 
         # Compile the sequence
         self.acadia.compile(sequence)
+
+
+
+
+        # --------------------after compiling,  ------------------------------------------
+        # this the first time acadia actaully see the pulse parameters under 'ro_stimulus'-'pulses'-'readout' in the yaml file
+        # based on thoes parameters, acadia_qmsmt will do some calculation to figure out the correct size of the memory for the pulse 
+        # as well as some other intermediate parameters that will be used for creating the samples.
+        # 
+        # At this point, the memory got directly allocated, so the value for the "memory" key under "pulse" in `_pulse_cache`` should have a `WavefromMemory` object
+        # and some intermediate pulse parameters are prepared for generating the samples later
+        logger.info(f"stimulus._pulse_cache after compiling sequence:")
+        logger.info(f"{stimulus_io._pulse_cache}")
+
+
         # Attach to the hardware
         self.acadia.attach()
         # Configure channel analog parameters
@@ -60,10 +89,20 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         self.acadia.assemble()
         self.acadia.load()
 
+
         # Load the window memory with the data from the config file
         resonator.load_windows()
         # Load the stimulus pulse named "readout" with the specified signal
-        stimulus_io.load_pulse(self.stimulus_pulse_name)   # since the readout pulse memory only has one set of sample in it, we don't have to specify the samples here, it will just use that one
+        stimulus_io.load_pulse("readout")   # since the readout pulse memory only has one set of sample in it, we don't have to specify the samples here, it will just use that one
+
+
+        # --------------------after loading the pulse ------------------------------------------
+        # load pulse also calls compute pulse, which actually conpute the samples for the pulse and then load.
+        # the pulse shoule now have the `samples` as a numpy array
+        logger.info(f"stimulus._pulse_cache after loading waveform:")
+        logger.info(f"{stimulus_io._pulse_cache}")
+
+
 
         for i in range(self.iterations):
             for j, frequency in enumerate(self.frequencies):
@@ -72,8 +111,14 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
                 # capture data and put in the corresponding group
                 self.acadia.run(minimum_delay=self.run_delay)
 
-                wf = capture_io.get_waveform_memory(self.capture_memory_name)
+                # --------------------after finishing the first iteration ------------------------------------------
+                if i==j==0:
+                    logger.info(f"stimulus._pulse_cache after loading waveform:")
+                    logger.info(f"{stimulus_io._pulse_cache}")
+                    
+                wf = capture_io.get_waveform_memory("readout_accumulated")
                 self.data[f"points"].write(wf.array)
+
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
