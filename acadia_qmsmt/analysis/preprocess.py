@@ -22,7 +22,7 @@ def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
     ax_shapes = []
     for ax in axes:
         ax_shapes.append(len(ax))
-    raw_data = raw_data.reshape(-1, 2)
+    raw_data = np.array(raw_data).reshape(-1, 2)
     points_per_iter = math.prod(ax_shapes)
     completed_iterations = len(raw_data) // points_per_iter
     if completed_iterations == 0:
