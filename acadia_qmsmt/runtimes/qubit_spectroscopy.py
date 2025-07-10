@@ -27,7 +27,6 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
     capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = "boxcar"
 
-    plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
 
@@ -87,9 +86,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
     def finalize(self):
         super().finalize()
-        if self.plot:
-            from acadia_qmsmt.plotting import save_registered_plots
-            save_registered_plots(self)
+        from acadia_qmsmt.plotting import save_registered_plots
+        save_registered_plots(self)
 
 
 
@@ -164,129 +162,4 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         self.update_io_yaml_field("qubit_stimulus", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
 
 
-
-
-
-    # --------------------------------------- in jpynb plotting ------------------------
-    # def initialize(self):
-        
-    #     if self.plot:
-    #         from acadia.processing import DynamicLine
-    #         import matplotlib.pyplot as plt
-    #         from IPython.display import display
-    #         from ipywidgets import FloatText, HBox, Button
-
-    #         self.figsize = (4, 3) if self.figsize is None else self.figsize
-    #         self.fig, axs = plt.subplots(2, 1, figsize=self.figsize)
-    #         self.fig.tight_layout()
-    #         self.fig.subplots_adjust(left=0.25, bottom=0.25)
-
-    #         ax = axs[0]
-    #         self.line_mag = DynamicLine(ax, ".-", label="Mag", color="blue")
-    #         ax.set_xlabel("Qubit Frequency [Hz]")
-    #         ax.set_ylabel("Magnitude [arb.]", color="blue")
-    #         ax.tick_params(axis='y', labelcolor="blue")
-    #         ax.grid()
-
-    #         ax_phase = axs[1]
-    #         # ax_phase = ax.twinx()
-    #         self.line_phase = DynamicLine(ax_phase, ".-", label="Phase", color="red")
-    #         ax_phase.set_ylabel("Phase [rad.]", color="red")
-    #         ax_phase.tick_params(axis='y', labelcolor="red")
-
-    #         from tqdm.notebook import tqdm
-
-    #     else:
-    #         from tqdm import tqdm
-
-    #     self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
-    #     self.iterations_previous = 0
-
-    #     self.data_summed = None
-    #     self.data_complex = None
-    #     self.data_mags = None
-    #     self.data_phases =  None
-
-    # def update(self):
-    #     # First make sure that we actually have new data to process
-    #     if "points" not in self.data or len(self.data["points"]) < len(self.qubit_frequencies):
-    #         return
-
-    #     # Update the progress bar based on the number of iterations
-    #     completed_iterations = len(self.data["points"]) // len(self.qubit_frequencies)
-    #     if completed_iterations == 0:
-    #         return
-
-    #     self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
-
-    #     self.process_data()
-    #     self.update_plot()               
-    #     self.data.save(self.local_directory)
-
-    #     self.iterations_previous = completed_iterations
-
-    # def finalize(self):
-    #     super().finalize()
-    #     self.iterations_progress_bar.close()
-    #     if self.plot:
-    #         self.savefig(self.fig)
-    #     self.fit_lorentzian()
-
-    # def process_data(self):
-    #     completed_iterations = len(self.data["points"]) // len(self.qubit_frequencies)
-    #     valid_traces = completed_iterations*len(self.qubit_frequencies)
-    #     data = self.data["points"].records()[:valid_traces, ...]
-
-    #     # Get the collection of data and reshape it so that the axes index as: 
-    #     # (iteration, frequency, sample time, sample quadrature)
-    #     samples_per_trace = data.shape[-2]
-    #     data_reshaped = data.reshape(-1, len(self.qubit_frequencies), samples_per_trace, 2)
-        
-    #     # Slice the data so that we have an array containing only the traces
-    #     # we didn't have the last time update() was called
-    #     self.new_data = data_reshaped[self.iterations_previous:, :, :, :]
-
-    #     # Sum the new data and then add it to the aggregated array of trace data
-    #     new_data_summed = np.sum(self.new_data, axis=(0,2), keepdims=False)
-    #     if self.data_summed is None:
-    #         self.data_summed = new_data_summed
-    #     else:
-    #         self.data_summed += new_data_summed
-
-    #     # Convert the summed sample data to a complex number and choose 
-    #     # the scale so that we turn the sum into a mean
-    #     self.data_complex = sample_to_complex(self.data_summed, scale=float(completed_iterations))
-    #     self.data_mags = np.abs(self.data_complex)
-    #     self.data_phases = np.angle(self.data_complex)
-
-    # def update_plot(self):
-    #     if self.plot:
-    #         self.line_mag.update(self.qubit_frequencies, self.data_mags)
-    #         self.line_phase.update(self.qubit_frequencies, self.data_phases)
-    #         self.fig.canvas.draw_idle() 
-
-    # def fit_lorentzian(self) -> float:
-    #     from acadia_qmsmt.analysis import rotate_iq
-    #     from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
-    #     from acadia_qmsmt.helpers.plot_utils import add_button
-
-    #     # data_complex has a small absolute value that will case ill-conditioned covariance matrix
-    #     iq_pts = self.data_summed[:, 0] + 1j * self.data_summed[:, 1]
-    #     data_to_fit = rotate_iq(iq_pts).real
-
-    #     fit = Lorentzian(self.qubit_frequencies, data_to_fit)
-    #     f0 = fit.ufloat_results["x0"]
-
-    #     if self.plot:
-    #         fit_fig, fit_ax = fit.plot()
-    #         fit_ax.set_xlabel("Qubit Frequency [Hz]")
-    #         fit_ax.set_ylabel("rotated I component")
-
-    #         def _update_freq(event):
-    #             self.update_ioconfig("qubit_stimulus", "channel_config.nco_frequency", np.round(f0.n))
-
-    #         # add a button for updating the qubit freq in the yaml file
-    #         self._update_button = add_button(fit_fig, _update_freq, label="Update Frequency")
-
-    #     return f0
 

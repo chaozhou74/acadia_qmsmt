@@ -29,7 +29,6 @@ class QubitRpmRuntime(QMsmtRuntime):
     capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = "matched"
 
-    plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
 
@@ -93,9 +92,8 @@ class QubitRpmRuntime(QMsmtRuntime):
 
     def finalize(self):
         super().finalize()
-        if self.plot:
-            from acadia_qmsmt.plotting import save_registered_plots
-            save_registered_plots(self)
+        from acadia_qmsmt.plotting import save_registered_plots
+        save_registered_plots(self)
 
 
 

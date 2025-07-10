@@ -29,7 +29,6 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = "matched"
 
-    plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
 
@@ -42,7 +41,6 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         readout_capture_io = self.io("readout_capture")
 
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
-        qubit = Qubit(qubit_stimulus_io)
 
         self.data.add_group(f"points", uniform=True)
         
@@ -90,9 +88,8 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
     def finalize(self):
         super().finalize()
-        if self.plot:
-            from acadia_qmsmt.plotting import save_registered_plots
-            save_registered_plots(self)
+        from acadia_qmsmt.plotting import save_registered_plots
+        save_registered_plots(self)
 
 
 

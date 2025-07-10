@@ -22,8 +22,9 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     capture_window_name: str = None
 
     num_prep_rounds:int = 0
+    post_prep_delay: float = 20e-9
+    prep_capture_window_name: str = "matched_biased_g"
 
-    plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
 
@@ -49,24 +50,36 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
             # Initialize a DSP to act as a counter
             state_prep_selecter = a.sequencer().Register()
 
+            
+            prepare_register = a.sequencer().Register()
+
             # Load the counter with the value we put into the cache
             state_prep_selecter.load(cache[0])
+
+            with a.channel_synchronizer():
+                    qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
 
             with a.sequencer().test(state_prep_selecter == 0):
                 for i in range(self.num_prep_rounds):
                     qubit.prepare(1, readout_resonator, self.qubit_pulse_name,
                           self.readout_pulse_name,
-                          self.capture_memory_name, 
-                          self.capture_window_name) # prep in g
+                          self.capture_memory_name,
+                          self.prep_capture_window_name, measurement_post_delay=self.post_prep_delay,state_register=prepare_register) # prep in g
 
             with a.sequencer().test(state_prep_selecter == 1):
-                with a.channel_synchronizer():
-                    qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
                 for i in range(self.num_prep_rounds):
-                    qubit.prepare(2, readout_resonator, self.qubit_pulse_name,
+                    qubit.prepare(1, readout_resonator, self.qubit_pulse_name,
                           self.readout_pulse_name,
                           self.capture_memory_name,
-                          self.capture_window_name) # prep in e
+                          self.prep_capture_window_name, measurement_post_delay=self.post_prep_delay,state_register=prepare_register) # prep in g
+
+                with a.channel_synchronizer():
+                    qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
+                # for i in range(self.num_prep_rounds):
+                    # qubit.prepare(2, readout_resonator, self.qubit_pulse_name,
+                        #   self.readout_pulse_name,
+                        #   self.capture_memory_name,
+                        #   "matched_biased_e",measurement_post_delay=self.post_prep_delay,state_register=prepare_register) # prep in e
 
             with a.channel_synchronizer():
                 readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
@@ -110,8 +123,7 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     def finalize(self):
         super().finalize()
         from acadia_qmsmt.plotting import save_registered_plots
-        if self.plot:
-            save_registered_plots(self)
+        save_registered_plots(self)
 
 
 

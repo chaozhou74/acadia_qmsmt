@@ -30,7 +30,6 @@ class QubitRelaxationRuntime(QMsmtRuntime):
     capture_window_name: str = "boxcar"
 
 
-    plot: bool = True
     figsize: tuple[int] = None
     yaml_path: str = None
 
@@ -102,9 +101,8 @@ class QubitRelaxationRuntime(QMsmtRuntime):
 
     def finalize(self):
         super().finalize()
-        if self.plot:
-            from acadia_qmsmt.plotting import save_registered_plots
-            save_registered_plots(self)
+        from acadia_qmsmt.plotting import save_registered_plots
+        save_registered_plots(self)
 
 
 

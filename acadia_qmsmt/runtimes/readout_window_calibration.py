@@ -39,9 +39,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
     capture_window_name: str = None
 
     iterations: int
-    plot: bool = True
     figsize: tuple[int] = None
-    generate_kernel: bool = False
     
     yaml_path: str = None
 
@@ -114,9 +112,8 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
     def finalize(self):
         super().finalize()
-        if self.plot:
-            from acadia_qmsmt.plotting import save_registered_plots
-            save_registered_plots(self)
+        from acadia_qmsmt.plotting import save_registered_plots
+        save_registered_plots(self)
 
 
 
@@ -191,7 +188,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         return fig, axs
 
     @annotate_method(button_name="update window")
-    def update_window(self, window_name:str = "matched"):
+    def update_window(self, window_name:str = "matched", biased_g_offset:int = -1000):
         # can't use self.yaml_path here! because the reloaded runtime will not find the right path
         yaml_path = self.io("readout_capture")._config["__yaml_path__"]
         kernel_dir = Path(yaml_path).parent/"readout_kernels"
@@ -199,8 +196,11 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         kernel_path = self.kernel_gen.save_kernel(kernel_dir,
                           "readout_capture_"+window_name+datetime.now().strftime("_%y%m%d_%H%M%S"))
         # update yaml
+        offset = self.kernel_gen.cmacc_offset
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}.data", kernel_path)
-        self.update_io_yaml_field("readout_capture", f"windows.{window_name}.offset", self.kernel_gen.cmacc_offset)
+        self.update_io_yaml_field("readout_capture", f"windows.{window_name}.offset", offset)
+        self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.data", kernel_path)
+        self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.offset", (offset[0]-biased_g_offset, offset[1]))
 
 
 
