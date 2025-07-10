@@ -22,7 +22,6 @@ from acadia.utils import clock_monotonic_ns
 # Todo: Implement a gaussian pulse
 # Todo: Change Qubit, MeasurableResonator, and QMsmtRuntime to use InputOutput
 # Todo: Should we allow get_waveform_memory to take a dictionary? 
-# think about creation of a long saturation pulse/temporary pulse which we don't put in the YAML file)
 
 ##############################################################
 # Todo: IN RUNTIMES
@@ -210,16 +209,35 @@ class InputOutputWaveforms:
         output[cond4] = func((t[cond4] - 0.5*(1 - ramp + flat))/ramp, **kwargs)
 
     @staticmethod
-    def scale_detune_pulse(pulse: NDArray, scale: complex = None,
-                    detune: float = None, sample_frequency: float = 8e8) -> NDArray:
-        ''' Scale and detune a pulse'''
-        # TODO: change this to allow tuples of scale and detune (enforcing they have the same length) and that there's no overflow on the samples, for polychromatic pulses -- JWOG
-        if scale is not None:
-            pulse = np.multiply(pulse, scale)
-        if detune is not None:
-            t = np.arange(pulse.size, dtype = np.float64) / sample_frequency
-            pulse = np.multiply(pulse, np.exp(2 * np.pi * 1j* detune * t))
-        return pulse
+    def scale_detune_pulse(pulse: NDArray, scale: Union[complex, list, tuple, NDArray] = None,
+                           detune: Union[float, list, tuple, NDArray] = None, sample_frequency: float = 8e8) -> NDArray:
+        ''' 
+        Scale and detune a pulse. Multichromatic pulses are implemented by 
+        providing tuples, lists or NDarrays of scale and detune values, which must have the
+        same length.
+        '''
+        if isinstance(scale, (list, tuple, np.ndarray)) and isinstance(detune, (list, tuple, np.ndarray)):
+            if len(scale) != len(detune):
+                raise ValueError("If scale and detune are tuples or lists, they must have the same length.")
+        else:
+            if isinstance(scale, (tuple, list, np.ndarray)):
+                detune = tuple(detune for _ in scale)
+            elif isinstance(detune, (tuple, list, np.ndarray)):
+                scale = tuple(scale for _ in detune) 
+            else:
+                scale = (scale,)
+                detune = (detune,)
+        pulse_out = np.zeros_like(pulse, dtype=np.complex128)
+        for s, d in zip(scale, detune):
+            if s is None:
+                s = 1
+            if d is not None:
+                t = np.arange(pulse.size, dtype=np.float64) / sample_frequency
+                s = np.multiply(s, np.exp(2 * np.pi * 1j * d * t))
+            pulse_out = np.add(pulse_out, np.multiply(pulse, s))
+        if (np.abs(pulse_out) > 1).any():
+            raise ValueError("The scaled pulse exceeds the maximum value of 1. ")
+        return pulse_out
             
 class InputOutput:
     """
@@ -922,18 +940,34 @@ class QMsmtRuntime(Runtime):
         else:
             raise TypeError(f"Unable to update IO config when provided as type {type(ioconfig)}")
 
+    def get_io_yaml_key(self, ioconfig_name: str) -> str:
+        """
+        Get the YAML key that identifies the IO channel configuration, if it was initialized
+        from a YAML entry. This is useful when reloading a runtime from a completed
+        experiment's data folder.
+
+        :param ioconfig_name : The attribute name of the IO configuration.
+        """
+        ioconfig = getattr(self, ioconfig_name)
+
+        if isinstance(ioconfig, str):
+            return ioconfig
+        elif isinstance(ioconfig, dict):
+            if "__yaml_key__" not in ioconfig:
+                raise KeyError(f"Missing '__yaml_key__' in IO config dict for '{ioconfig_name}'")
+            return ioconfig["__yaml_key__"]
+        else:
+            raise TypeError(f"Can't find the yaml key for '{ioconfig_name}', it was probably not"
+                            f"initialized with a key in a yaml file")
+        
     def update_io_yaml_field(self, ioconfig_name: str, config_field: str, value: Any, verbose=False):
         """
         Update the value of a field in the yaml config file for the specified IOConfig.
         """
         from acadia_qmsmt.helpers.yaml_editor import update_yaml
         yaml_path = self._ios[ioconfig_name]._config["__yaml_path__"]
-        
-        ioconfig = getattr(self, ioconfig_name)
-        if type(ioconfig) == str:
-            yaml_key = ioconfig
-        elif type(ioconfig) == dict:
-            yaml_key = ioconfig["__yaml_key__"]
+        yaml_key = self.get_io_yaml_key(ioconfig_name)
+
         new_cfg = update_yaml(yaml_path, {f"{yaml_key}.{config_field}": value}, verbose=verbose)
         logger.info(f"!! updated yaml file `{yaml_path}`: {yaml_key}.{config_field}: {value}")
         return new_cfg
@@ -1197,7 +1231,7 @@ class Qubit:
         with a.sequencer().repeat_until(reg == quadrant_reg_value):
             with a.channel_synchronizer():
                 self._stimulus.schedule_pulse(pulse_waveform_memory)
-                self._stimulus.dwell(100e-9)
+                # self._stimulus.dwell(100e-9)
                 a.barrier()
                 measurement_resonator.measure(measurement_stimulus_waveform_memory,
                                               measurement_capture_waveform_memory,
@@ -1206,6 +1240,8 @@ class Qubit:
                 self._stimulus.dwell(measurement_post_delay)
 
             reg.load(measurement_resonator.get_measurement())
+        
+        return reg
 
     def schedule_pulse(self, waveform_memory: Union[str, WaveformMemory] = None,
                 stretch_length:Union[float, ManagedResource] = None) -> None:
@@ -1245,13 +1281,18 @@ class QubitQmCooler:
         """
         a = self.qubit._stimulus._acadia
 
+        reg = a.sequencer().Register() if state_register is None else state_register
+
         ## Step 1: cool qubit
         self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
-                           ro_pulse_name, ro_capture_mem, ro_cmacc_window,measurement_post_delay,state_register)
+                           ro_pulse_name, ro_capture_mem, ro_cmacc_window, measurement_post_delay, reg)
+        
 
         ## Step 2: swap Qm photon to qubit and cool qubit again
         for i in range(qm_cooling_rounds): # in case the first swap failed.
             with a.channel_synchronizer():
                 self.beamsplitter.schedule_pulse(bs_pulse_name)
             self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
-                               ro_pulse_name, ro_capture_mem, ro_cmacc_window,measurement_post_delay,state_register)
+                               ro_pulse_name, ro_capture_mem, ro_cmacc_window, measurement_post_delay, reg)
+            
+        return reg
