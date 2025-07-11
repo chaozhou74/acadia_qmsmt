@@ -19,19 +19,20 @@ class FitterBase:
     """
 
     def __init__(self, coordinates: np.ndarray, data: np.ndarray,
-                 params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None, sigma: Optional[np.ndarray] = None,
+                 sigma: Optional[np.ndarray] = None,
+                 params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None, 
                  dry: bool = False, absolute_sigma: bool = True, **fit_kwargs):
         """
 
         :param coordinates: Independent variable(s), passed to the model.
         :param data: Measured dependent data.
+        :param sigma: Optional standard deviations of data for weighted fit.
         :param params: Dict of parameter definitions. Each value can be:
                     - float (initial guess)
                     - dict with keys:
                         - 'value': initial guess
                         - 'bounds': (lower, upper)
                         - 'fixed': True if parameter should not be varied
-        :param sigma: Optional standard deviations of data for weighted fit.
         :param dry: If True, do not perform the fit; just use initial guesses.
         :param absolute_sigma: If True, errors are treated as absolute in uncertainty calc.
         :param fit_kwargs: Additional keyword arguments for `curve_fit`.

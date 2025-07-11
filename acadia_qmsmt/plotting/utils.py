@@ -11,7 +11,7 @@ from matplotlib.widgets import Button
 import matplotlib.pyplot as plt
 
 from acadia import Runtime
-from acadia_qmsmt.helpers import get_registered_plot_methods, get_data_process_method, get_registered_customizer
+from acadia_qmsmt.helpers import get_registered_plot_methods, get_data_process_method, get_registered_customizer, sanitize_filename
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +88,14 @@ def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, u
         for plot_name, method_name in plots.items():
             figure = None
             try:
+                save_name = sanitize_filename(plot_name)
                 figure, _ = getattr(runtime, method_name)()
                 figure.tight_layout()
-                image_filename = os.path.join(runtime.local_directory, f"{plot_name}.png")
+                image_filename = os.path.join(runtime.local_directory, f"{save_name}.png")
                 figure.savefig(image_filename, dpi=500, transparent=transparent)
 
                 if save_pickle:
-                    with open(os.path.join(runtime.local_directory, f"{plot_name}.pkl"), "wb") as f:
+                    with open(os.path.join(runtime.local_directory, f"{save_name}.pkl"), "wb") as f:
                         pickle.dump(figure, f)
 
             except Exception as e:

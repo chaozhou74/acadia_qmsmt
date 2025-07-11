@@ -75,3 +75,35 @@ def to_local_path(path: str) -> str:
     elif platform_type == "windows":
         return to_windows_path(path)
     return path
+
+
+def sanitize_filename(filename: str) -> str:
+    """
+    Replace invalid filename characters with semantically related but safe characters.
+    Works for Windows and Linux.
+    """
+    char_map = {
+        '<': '(',
+        '>': ')',
+        ':': '-',       # colons often mean separation
+        '"': "'",       # quote to quote
+        '/': '-',       # path separator
+        '\\': '-',      # backslash as dash
+        '|': '+',       # pipe to plus
+        '?': '',        # question mark just removed
+        '*': 'x',       # wildcard or multiply
+    }
+
+    def translate_char(c):
+        if c in char_map:
+            return char_map[c]
+        elif ord(c) < 32:  # control characters
+            return ''
+        else:
+            return c
+
+    sanitized = ''.join(translate_char(c) for c in filename)
+
+    # Remove trailing spaces or dots (Windows restriction)
+    return sanitized.rstrip(". ")
+

@@ -6,3 +6,4 @@ from .lorentzian import Lorentzian
 from .gauss_cosine import GaussCosine
 from .linear import Linear
 from .zero_center_gaussian import ZeroCenterGaussian
+from .driven_decoherence import DrivenDecoherence
