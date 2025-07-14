@@ -106,7 +106,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         second_pulse_scale = qubit_stimulus_io.get_config("pulses", second_pi_over_2_pulse_name, "scale")
         
         # Determine how many cycles each delay interval should be
-        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times/2)
+        dsp_count_values = self.acadia.seconds_to_cycles(self.delay_times/2)
 
         for i in range(self.iterations):
             for idx_delay,delay in enumerate(dsp_count_values):

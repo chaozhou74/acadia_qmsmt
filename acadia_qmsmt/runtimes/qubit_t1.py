@@ -74,7 +74,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
         # Determine how many cycles each delay interval should be
-        dsp_count_values = self.acadia.delay_times_to_counter_values(self.delay_times)
+        dsp_count_values = self.acadia.seconds_to_cycles(self.delay_times)
 
         for i in range(self.iterations):
             for delay in dsp_count_values:

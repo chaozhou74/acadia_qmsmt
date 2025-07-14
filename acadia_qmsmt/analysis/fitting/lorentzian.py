@@ -21,5 +21,10 @@ class Lorentzian(FitterBase):
         half_peak_idx = cut_idx_r
         half_peak_width_2 = coordinates[half_peak_idx]-x0 if half_peak_idx!=peak_idx else coordinates[peak_idx + 1] - x0
         k = 1 / (half_peak_width_2) ** 2
+
+        max_mag = np.max(data) - np.min(data)
+        A = {"value": A, "bounds":(-max_mag*2, max_mag*2)}
+
+
         return dict(A=A, x0=x0, k=k, of=of)
 

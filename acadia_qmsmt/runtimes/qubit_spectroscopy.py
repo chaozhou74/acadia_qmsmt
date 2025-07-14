@@ -9,6 +9,9 @@ from acadia.sample_arithmetic import sample_to_complex
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
+import logging
+logger = logging.getLogger("acadia")
+
 class QubitSpectroscopyRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for qubit spectroscopy
@@ -31,9 +34,6 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
     yaml_path: str = None
 
     def main(self):
-        import logging
-        logger = logging.getLogger("acadia")
-
         qubit_stimulus_io = self.io("qubit_stimulus")
         readout_stimulus_io = self.io("readout_stimulus")
         readout_capture_io = self.io("readout_capture")
@@ -117,9 +117,13 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
             self.data_to_fit = self.avg_iq_rot.real
         self.thresholded = thresholded
 
-        from acadia_qmsmt.analysis.fitting import Lorentzian
-        self.fit = Lorentzian(self.qubit_frequencies, self.data_to_fit)
-        self.fitted_f0 = self.fit.ufloat_results["x0"]
+        try:
+            from acadia_qmsmt.analysis.fitting import Lorentzian
+            self.fit = Lorentzian(self.qubit_frequencies, self.data_to_fit)
+            self.fitted_f0 = self.fit.ufloat_results["x0"]
+        except Exception as e:
+            logger.error(f"Error fitting: {e}", exc_info=True)
+            self.fit = None
 
         return completed_iterations
     
@@ -130,7 +134,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
         axs.plot(self.qubit_frequencies, self.data_to_fit, "o")
-        self.fit.plot_fitted(axs, oversample=5, label=f"{self.fitted_f0:.5g}")
+        if self.fit is not None:
+            self.fit.plot_fitted(axs, oversample=5, label=f"{self.fitted_f0:.5g}")
 
         axs.set_xlabel("Frequency [Hz]")
         if self.thresholded:
@@ -159,7 +164,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
     @annotate_method(button_name="update frequency")
     def update_freq(self):
-        self.update_io_yaml_field("qubit_stimulus", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
+        if self.fit is not None:
+            self.update_io_yaml_field("qubit_stimulus", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
 
 
 

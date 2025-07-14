@@ -39,6 +39,8 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
     capture_window_name: str = None
 
     iterations: int
+    run_delay:int = 200e3 #ns
+
     figsize: tuple[int] = None
     
     yaml_path: str = None
@@ -85,7 +87,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
                     qubit_stimulus_io.load_pulse(self.qubit_pulse_name) # !!Note: scale not provided will use the pulse in yaml file; scale=None will set pulse scale to 1
 
                 # capture data and put in the corresponding group
-                self.acadia.run()
+                self.acadia.run(minimum_delay=self.run_delay)
                 wf = readout_capture_io.get_waveform_memory(self.capture_memory_name)
                 self.data[f"traces_{state_}"].write(wf.array)
                 
@@ -200,7 +202,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}.data", kernel_path)
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}.offset", offset)
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.data", kernel_path)
-        self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.offset", (offset[0]-biased_g_offset, offset[1]))
+        self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.offset", (offset[0]+biased_g_offset, offset[1]))
 
 
 

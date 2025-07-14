@@ -5,6 +5,7 @@ from typing import Callable, Literal, Dict, List, Any, Union, Literal, Tuple
 from pathlib import Path
 import json
 import logging
+import math
 
 import numpy as np
 from numpy.typing import NDArray
@@ -315,6 +316,14 @@ class InputOutput:
 
         return pulse
     
+    def _make_pulse_id_message(self, pulse: Union[str,dict,None] = None) -> str:
+        """
+        Make a informative string for specifying a pulse in log/error messages
+        """
+        pulse_config = self.get_pulse_config(pulse)
+        pulse_identifier = pulse_config.get("name", make_hash(pulse_config))
+        return f"IO '{self._name}' pulse '{pulse_identifier}'"
+
     def _compute_ramp_flat_memlen_stretchlen(self, pulse_config: dict) -> Tuple[float, float, float, float]:
         '''
         This helper function takes a pulse configuration dictionary and computes the
@@ -342,9 +351,10 @@ class InputOutput:
             stretch_length = (stretch_factor -  1) * clock_sample_time
             # Passing 0 to the stretch_length variable causes errors
             stretch_length = stretch_length if stretch_length > 0 else None
-            if (f/clock_sample_time) % 1 > 1e-15:
-                logger.warning("Warning: flat is not a multiple of clock_sample_time"
-                                "Because use_stretch = True, the actual flat played will be %.3g seconds.", clock_sample_time * stretch_factor)
+            f_rounded = round(f / clock_sample_time) * clock_sample_time
+            if not math.isclose(f, f_rounded, abs_tol=1e-12):
+                logger.warning(f"{self._make_pulse_id_message(pulse_config)} has a flat length that is not a multiple of {clock_sample_time}, and 'use_stretch = True'. "
+                                f"The actual flat played will be {f_rounded:.9g} seconds, instead of {f:.9g}")
             f = clock_sample_time # The flat part is always set to clock_sample_time when using stretch
 
         # If the pulse data is a string, we compute the ramp and flat fractions and         
@@ -355,7 +365,7 @@ class InputOutput:
             
             if use_stretch:
                 if r is None or r == 0:
-                    logger.warning("Warning: ramp is None, and use_stretch = True."
+                    logger.warning(f"Warning: {self._make_pulse_id_message(pulse_config)} ramp is None, and use_stretch = True."
                                    "Your pulse will be zero padded with 5 ns on either side")
                     r = 1e-12
                 # Find the padding necessary to ensure that there is a flat cycle in the middle of the pulse
@@ -363,17 +373,17 @@ class InputOutput:
                 # Adjust memory length
                 ml = tau_pad + r + f
                 if memory_length is not None:
-                    logger.warning("Warning: memory_length can't be set when using stretch, the value used is %.3g.", ml)
+                    logger.warning(f"Warning: {self._make_pulse_id_message(pulse_config)} memory_length can't be set when using stretch, the value used is {ml:.3g}")
             else:
                 if memory_length is None:
                     # Find the closest multiple of clock_sample_time to r + f
                     ml = np.ceil((r + f) / clock_sample_time) * clock_sample_time
                 elif (memory_length - r - f) < -1e-12:
                     ml = memory_length
-                    logger.warning("Warning: memory_length %s is less than ramp + flat %.3g. Truncating the pulse.", memory_length, r + f)
+                    logger.warning(f"Warning: {self._make_pulse_id_message(pulse_config)} memory_length {memory_length:.3g} is less than ramp + flat {(r + f):.3g}. Truncating the pulse.")
                 elif (memory_length - r - f) > 1e-12:
                     ml = memory_length
-                    logger.warning("Warning: memory_length %s is greater than ramp + flat %.3g. Zero padding the pulse with %.3g seconds.",
+                    logger.warning(f"Warning: {self._make_pulse_id_message(pulse_config)}" + "memory_length %s is greater than ramp + flat %.3g. Zero padding the pulse with %.3g seconds.",
                                    memory_length, r + f, ml - r - f)
 
             # Calculate the ramp and flat lengths as fractions of the memory length
@@ -971,6 +981,16 @@ class QMsmtRuntime(Runtime):
         new_cfg = update_yaml(yaml_path, {f"{yaml_key}.{config_field}": value}, verbose=verbose)
         logger.info(f"!! updated yaml file `{yaml_path}`: {yaml_key}.{config_field}: {value}")
         return new_cfg
+
+    
+    def wait_for_deploy_completion(self):
+        try:
+            self._event_loop.join()  # blocking until done
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt caught. Stopping...")
+            self.stop()
+            self.finalize()
+            logger.info("Cleanup complete.")
 
 class MeasurableResonator:
     """

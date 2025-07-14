@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,7 +23,7 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    qubit_pulse_name: str = "R_x_90"
+    qubit_pulse_name: str = "R_x_180"
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = None
@@ -49,8 +49,6 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
                 a.barrier()
-                # Measure the resonator by driving the "readout" waveform on the stimulus IO
-                # and capture into the "readout_accumulated" waveform on the capture IO
                 resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
 
         # Compile the sequence
@@ -67,17 +65,17 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         resonator.load_windows()
         # Load the stimulus waveform named "readout" with the specified signal
         stimulus_io.load_pulse(self.readout_pulse_name)
-        qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
+        qubit_pipulse_scale = qubit_stimulus_io.get_config("pulses", self.qubit_pulse_name, "scale")
 
         for i in range(self.iterations):
             for frequency in self.frequencies:
                 resonator.set_frequency(frequency)
-
-                # capture data and put in the corresponding group
-                self.acadia.run(minimum_delay=self.run_delay)
-
-                wf = capture_io.get_waveform_memory(self.capture_memory_name)
-                self.data[f"points"].write(wf.array)
+                for prep in [0,1]:
+                    qubit_stimulus_io.load_pulse(self.qubit_pulse_name, scale=qubit_pipulse_scale*prep)
+                    # capture data and put in the corresponding group
+                    self.acadia.run(minimum_delay=self.run_delay)
+                    wf = capture_io.get_waveform_memory(self.capture_memory_name)
+                    self.data[f"points"].write(wf.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -100,47 +98,66 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, e_delay:float=76E-9, auto_edelay:bool=False):
+    def process_current_data(self, e_delay:Union[float, str]="auto", fit_type:Literal["mag", "phase"]="phase"):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies)
-        if data_spec is None:
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies, [0, 1])
+        if data is None:
             return
         else:
-            completed_iterations = len(data_spec)
-        self.data_iq = data_spec.astype(float).view(complex).squeeze()
+            completed_iterations = len(data)
+        self.data_iq = data.astype(float).view(complex).squeeze()
         self.avg_iq = np.mean(self.data_iq, axis=0)
+        self.fit_type = fit_type
 
-        if auto_edelay:
-            from numpy import polyfit
-            k, b = polyfit(self.frequencies, np.unwrap(np.angle(self.avg_iq)), deg=1)
-            e_delay = -k / np.pi / 2
-        self.avg_iq_corrected = self.avg_iq * np.exp(1j * self.frequencies * e_delay * np.pi * 2)
 
+        if e_delay == "auto":
+            # find edelay
+            phase_data = np.unwrap(np.angle(self.avg_iq[:, 0]))
+            k_fit_idx =  np.max([len(self.frequencies)//10, 4])
+            k0, _ = np.polyfit(self.frequencies[:k_fit_idx], phase_data[:k_fit_idx], deg=1)
+            k1, _ = np.polyfit(self.frequencies[-k_fit_idx:], phase_data[-k_fit_idx:], deg=1)
+            e_delay = -(k0 + k1)/2 / np.pi / 2
         self.e_delay_applied = e_delay
+        self.avg_iq_corrected = self.avg_iq * np.exp(1j * self.frequencies[:, np.newaxis] * e_delay * np.pi * 2)
+        self.phase_corrected = np.array([np.unwrap(np.angle(iq)) for iq in self.avg_iq_corrected.T]).T
+
+        if fit_type == "mag":
+            from acadia_qmsmt.analysis.fitting import Lorentzian
+            self.fit_g = Lorentzian(self.frequencies, np.abs(self.avg_iq[:, 0]))
+            self.fit_e = Lorentzian(self.frequencies, np.abs(self.avg_iq[:, 1]))
+            
+        elif fit_type == "phase":
+            from acadia_qmsmt.analysis.fitting import Arctan
+            self.fit_g = Arctan(self.frequencies, self.phase_corrected[:, 0]/np.pi*180)
+            self.fit_e = Arctan(self.frequencies, self.phase_corrected[:, 1]/np.pi*180)
+
+        self.fitted_f0_g = self.fit_g.ufloat_results["x0"]
+        self.fitted_f0_e = self.fit_e.ufloat_results["x0"]
 
         return completed_iterations
     
 
     @annotate_method(plot_name="mag_phase_vs_dac", axs_shape=(2,1))
-    def plot_data(self, axs=None, apply_e_delay:bool=True, unwrap_phase:bool=True):
+    def plot_data(self, axs=None, unwrap_phase:bool=True):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(2,1), figsize=self.figsize)
 
-        data = self.avg_iq_corrected if apply_e_delay else self.avg_iq
-        axs[0].plot(self.frequencies, np.abs(data), "o")
+        for i in range(2):
+            axs[0].plot(self.frequencies, np.abs(self.avg_iq_corrected[:, i]), "o")
+            phases = self.phase_corrected # if unwrap_phase else self.phase_corrected % (2*np.pi)
+            axs[1].plot(self.frequencies, phases[:, i]/np.pi*180, ".-")
 
-        phases = np.angle(data, deg=True)
-        if unwrap_phase:
-            phases = np.unwrap(phases, period=360)
-        e_delay_label = None if not apply_e_delay else f"edelay: {self.e_delay_applied}"
-        axs[1].plot(self.frequencies, phases, ".-", label=e_delay_label)
+        plot_fit_ax = axs[0] if self.fit_type == "mag" else axs[1]
+        self.fit_g.plot_fitted(plot_fit_ax, label=f"prep g f0: {self.fitted_f0_g}")
+        self.fit_e.plot_fitted(plot_fit_ax, label=f"prep e f0: {self.fitted_f0_e}")
+        plot_fit_ax.legend()
 
         axs[1].set_xlabel("Frequency [Hz]")
         axs[1].set_ylabel("Phase (deg)")
         axs[0].set_ylabel("Mag (a.u.)")
-
+        axs[0].set_title(f"edelay applied: {self.e_delay_applied:.6g}, "
+                         f"chi: {(self.fitted_f0_e - self.fitted_f0_g)/1e6:.6g} MHz")
         for ax in axs:
-            ax.legend()
             ax.grid(True)
 
         fig.tight_layout()
