@@ -983,9 +983,15 @@ class QMsmtRuntime(Runtime):
         return new_cfg
 
     
-    def wait_for_deploy_completion(self):
+    def wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = True):
+        """
+        wait for the deployment to complete by joining the event loop.
+        :param suppress_data_sync_warnings: If True, suppress warnings related to data synchronization.
+        """
+        from acadia_qmsmt.helpers import suppress_data_sync_messages
         try:
-            self._event_loop.join()  # blocking until done
+            with suppress_data_sync_messages(suppress_data_sync_warnings):
+                self._event_loop.join()
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt caught. Stopping...")
             self.stop()
@@ -1137,6 +1143,7 @@ class MeasurableResonator:
         self._capture.reset_nco_phase()
         if sync:
             self._stimulus._acadia.update_ncos_synchronized()
+            self._stimulus._acadia.update_ncos_synchronized()# somehow this is needed to ensure that the nco update is actaully finished, and simply wating for extra 5us does not work
 
     def wait_until_measurement_done(self):
         """
