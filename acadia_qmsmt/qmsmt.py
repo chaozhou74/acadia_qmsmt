@@ -1193,7 +1193,7 @@ class Qubit:
 
         # set pulse name
         if pulse_name is None:
-            pulse_name = f"rotaion_{polar_deg}_{azim_deg}"
+            pulse_name = f"rotation_{polar_deg}_{azim_deg}"
         base_name = pulse_name
         i=1
         while pulse_name in stimulus._config.get("pulses", {}):
