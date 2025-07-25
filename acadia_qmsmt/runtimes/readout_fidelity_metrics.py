@@ -46,6 +46,11 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
 
 
+        # create a capture memory for storing the msmt results for the prep rounds
+        if self.num_prep_rounds > 0:
+            prep_msmt_mem = readout_capture_io.get_waveform_memory(self.capture_memory_name).duplicate()
+            self.data.add_group(f"pre_prep", uniform=True)
+
         def sequence(a: Acadia):
             # Initialize a DSP to act as a counter
             state_prep_selecter = a.sequencer().Register()
@@ -56,30 +61,22 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
             # Load the counter with the value we put into the cache
             state_prep_selecter.load(cache[0])
 
-            with a.channel_synchronizer():
-                    qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
-
             with a.sequencer().test(state_prep_selecter == 0):
                 for i in range(self.num_prep_rounds):
                     qubit.prepare(1, readout_resonator, self.qubit_pulse_name,
                           self.readout_pulse_name,
-                          self.capture_memory_name,
+                          prep_msmt_mem,
                           self.prep_capture_window_name, measurement_post_delay=self.post_prep_delay,state_register=prepare_register) # prep in g
 
             with a.sequencer().test(state_prep_selecter == 1):
                 for i in range(self.num_prep_rounds):
                     qubit.prepare(1, readout_resonator, self.qubit_pulse_name,
                           self.readout_pulse_name,
-                          self.capture_memory_name,
+                          prep_msmt_mem,
                           self.prep_capture_window_name, measurement_post_delay=self.post_prep_delay,state_register=prepare_register) # prep in g
 
                 with a.channel_synchronizer():
                     qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
-                # for i in range(self.num_prep_rounds):
-                    # qubit.prepare(2, readout_resonator, self.qubit_pulse_name,
-                        #   self.readout_pulse_name,
-                        #   self.capture_memory_name,
-                        #   "matched_biased_e",measurement_post_delay=self.post_prep_delay,state_register=prepare_register) # prep in e
 
             with a.channel_synchronizer():
                 readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
@@ -105,6 +102,9 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
                     self.data[f"prep_g"].write(wf.array)
                 elif prep == 1:
                     self.data[f"prep_e"].write(wf.array)
+
+                if self.num_prep_rounds > 0:
+                    self.data[f"pre_prep"].write(prep_msmt_mem.array)
 
             if self.data.serve() == DataManager.serve_hangup():
                 self.data.disconnect()
@@ -139,11 +139,15 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
             completed_iterations = len(data_e)
 
         self.data_g, self.data_e = data_g, data_e
+        if self.num_prep_rounds > 0:
+            self.data_pre_prep = reshape_iq_data_by_axes(self.data["pre_prep"].records())
+        else:
+            self.data_pre_prep = np.zeros_like(data_g)
 
         # Threshold the data according to the I quadrature
         self.real_g = data_g[..., 0]
         self.real_e = data_e[..., 0]
-        
+
         self.shots_prep_g_thresh = (1 - np.sign(self.real_g, dtype=np.int32))/2
         self.shots_prep_e_thresh = (1 - np.sign(self.real_e, dtype=np.int32))/2
 
@@ -221,3 +225,10 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
         fig.tight_layout()
         return fig, ax
+    
+    @annotate_method(plot_name="Readout_pre_prep_result", axs_shape=(1,1))
+    def plot_pre_prep(self, axs=None, bins:int=51, log_scale:bool=True):
+        from acadia_qmsmt.plotting import  plot_multiple_hist2d
+        fig, axs = plot_multiple_hist2d(self.data_pre_prep, plot_ax=axs, bins=bins, log_scale=log_scale)
+        axs.set_title("pre-prep msmt results")
+        return fig, axs

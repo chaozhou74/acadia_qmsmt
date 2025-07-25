@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from lmfit import Parameter
 
-from acadia_test.processing.fitting.fitter_base import FitterBase
+from acadia_qmsmt.analysis.fitting.fitter_base import FitterBase
 
 class ZeroCenterGaussian(FitterBase):
     @staticmethod

@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -8,6 +8,7 @@ from acadia import Acadia, DataManager, Runtime
 from acadia.runtime import annotate_method
 from acadia.sample_arithmetic import sample_to_complex
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig
+
 
 class ResonatorSpectroscopyRuntime(QMsmtRuntime):
     """
@@ -94,52 +95,61 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, e_delay:float=76E-9, auto_edelay:bool=False):
+    def process_current_data(self, e_delay:Union[float, str]="auto", fit_type:Literal["mag", "phase"]="phase"):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies)
-        if data_spec is None:
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies)
+        if data is None:
             return
         else:
-            completed_iterations = len(data_spec)
-        self.data_iq = data_spec.astype(float).view(complex).squeeze()
+            completed_iterations = len(data)
+        self.data_iq = data.astype(float).view(complex).squeeze()
         self.avg_iq = np.mean(self.data_iq, axis=0)
+        self.fit_type = fit_type
 
-        if auto_edelay:
-            from numpy import polyfit
-            k, b = polyfit(self.frequencies, np.unwrap(np.angle(self.avg_iq)), deg=1)
-            e_delay = -k / np.pi / 2
-        self.avg_iq_corrected = self.avg_iq * np.exp(1j * self.frequencies * e_delay * np.pi * 2)
 
-        from acadia_qmsmt.analysis.fitting.lorentzian import Lorentzian
-        self.fit = Lorentzian(self.frequencies, np.abs(self.avg_iq))
-        self.fitted_f0 = self.fit.ufloat_results["x0"]
+        if e_delay == "auto":
+            # find edelay
+            phase_data = np.unwrap(np.angle(self.avg_iq))
+            k_fit_idx =  np.max([len(self.frequencies)//10, 4])
+            k0, _ = np.polyfit(self.frequencies[:k_fit_idx], phase_data[:k_fit_idx], deg=1)
+            k1, _ = np.polyfit(self.frequencies[-k_fit_idx:], phase_data[-k_fit_idx:], deg=1)
+            e_delay = -(k0 + k1)/2 / np.pi / 2
         self.e_delay_applied = e_delay
+        self.avg_iq_corrected = self.avg_iq * np.exp(1j * self.frequencies * e_delay * np.pi * 2)
+        self.phase_corrected = np.unwrap(np.angle(self.avg_iq_corrected))
+
+        if fit_type == "mag":
+            from acadia_qmsmt.analysis.fitting import Lorentzian
+            self.fit = Lorentzian(self.frequencies, np.abs(self.avg_iq))
+            self.fitted_f0 = self.fit.ufloat_results["x0"]
+            
+        elif fit_type == "phase":
+            from acadia_qmsmt.analysis.fitting import Arctan
+            self.fit = Arctan(self.frequencies, self.phase_corrected/np.pi*180)
+            self.fitted_f0 = self.fit.ufloat_results["x0"]
 
         return completed_iterations
     
 
     @annotate_method(plot_name="mag_phase_vs_dac", axs_shape=(2,1))
-    def plot_data(self, axs=None, apply_e_delay:bool=True, unwrap_phase:bool=True):
+    def plot_data(self, axs=None, unwrap_phase:bool=True):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(2,1), figsize=self.figsize)
 
-        data = self.avg_iq_corrected if apply_e_delay else self.avg_iq
-        axs[0].plot(self.frequencies, np.abs(data), "o")
-        
-        # axs[0].plot(self.frequencies, self.fit.eval(), "-", label=f"{self.fitted_f0}")
-        self.fit.plot_fitted(axs[0], oversample=1, label=f"{self.fitted_f0}")
+        axs[0].plot(self.frequencies, np.abs(self.avg_iq_corrected), "o")
+        phases = self.phase_corrected if unwrap_phase else self.phase_corrected % (2*np.pi)
+        axs[1].plot(self.frequencies, phases/np.pi*180, ".-")
 
-        phases = np.angle(data, deg=True)
-        if unwrap_phase:
-            phases = np.unwrap(phases, period=360)
-        e_delay_label = None if not apply_e_delay else f"edelay: {self.e_delay_applied}"
-        axs[1].plot(self.frequencies, phases, ".-", label=e_delay_label)
+        plot_fit_ax = axs[0] if self.fit_type == "mag" else axs[1]
+        self.fit.plot_fitted(plot_fit_ax, label=f"{self.fitted_f0}")
+        plot_fit_ax.legend()
+
 
         axs[1].set_xlabel("Frequency [Hz]")
         axs[1].set_ylabel("Phase (deg)")
         axs[0].set_ylabel("Mag (a.u.)")
+        axs[0].set_title(f"edelay applied: {self.e_delay_applied:.6g} s, f0: {self.fitted_f0/1e9:.6g} GHz")
         for ax in axs:
-            ax.legend()
             ax.grid(True)
 
         fig.tight_layout()

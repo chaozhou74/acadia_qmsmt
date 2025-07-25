@@ -79,6 +79,8 @@ def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: 
                       bins=bins, range=hist_range, norm=norm, **kwargs)
         axs[i].set_aspect('equal', adjustable='box')
         axs[i].autoscale(enable=True, axis='both', tight=True)
+    if len(axs) == 1:
+        axs = axs[0]
     return fig, axs
 
 
