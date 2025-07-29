@@ -681,11 +681,11 @@ class InputOutput:
         if stretch_length is None:
             stretch_length = getattr(wfm, "_stretch_length", None)
         else:
-            detune = self.get_pulse_config(pulse).get("detune", 0)
-            if np.any(np.array(detune) != 0):
-                logger.warning(f"{self._make_pulse_id_message(pulse)} has soft detune: {detune} "
-                               f"and non-zero stretch length: '{stretch_length}'. The stretched region will not "
-                                "have soft detuning, which may lead to unexpected results.")
+            use_stretch = self.get_pulse_config(pulse).get("use_stretch", False)
+            if not use_stretch and stretch_length != 0:
+                logger.warning(f"{self._make_pulse_id_message(pulse)} had 'use_stretch = True' in the configuration, "
+                               f"but a non-zero stretch length: '{stretch_length}' is used in `schedule_pulse`."
+                                "This may lead to unexpected results.")
       
         self._acadia.schedule_waveform(wfm, stretch_length=stretch_length)
 
