@@ -630,7 +630,7 @@ class InputOutput:
         Duplicate an existing pulse configuration and its waveform memory.
 
         :param old_pulse: The pulse to duplicate, specified by name or config dictionary.
-        :param new_pulse_name: The name of the new duplicated pulse. If None, "_copy" is appended to the old name.
+        :param new_pulse_name: The name of the new duplicated pulse. If None, "_copy{idx}" is appended to the old name.
         :param duplicate_waveforms: If True, create the waveform memory for this pulse. 
             Usually this can be False, and `create_waveform_memory` will be called at the compile time.
         :param duplicate_waveforms: If True, duplicate the cached waveform data as well.
@@ -1004,6 +1004,29 @@ class QMsmtRuntime(Runtime):
             self.finalize()
             logger.info("Cleanup complete.")
 
+    def deploy(self, *args, no_backup: bool = False, **kwargs):
+        """
+        Call Runtime.deploy with the same arguments and then create a
+        '.no_backup_flag' file in the resulting local data directory.
+        If `no_backup` is True, this file will be created to indicate that
+        This is useful for runs that should not be backed up.
+        """
+
+        super().deploy(*args, **kwargs)
+
+        # Create the flag file in the local data directory
+        if no_backup:
+            try:
+                data_dir = Path(self.local_directory)
+                flag_path = data_dir / ".no_backup_flag"
+                # Write a simple message to the file
+                flag_path.write_text("Exclude this run from backups.\n", encoding="utf-8")
+            except Exception as e:
+                logger.warning("Failed to create .no_backup_flag in %s: %s", getattr(self, "local_directory", "?"), e)
+
+        
+
+
 class MeasurableResonator:
     """
     A collection of functions that are useful for interacting with a resonator
@@ -1022,7 +1045,7 @@ class MeasurableResonator:
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
                 window_name: str = None,
                 write_mode: Literal["upper", "lower"] = "upper",
-                reset_fifo: bool = True
+                reset_fifo: bool = False
                 ):
         """
         Schedules the measurement of accumulated IQ points. 
@@ -1094,7 +1117,7 @@ class MeasurableResonator:
     def measure_trace(self, 
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
-                reset_fifo: bool = True):
+                reset_fifo: bool = False):
         """
         Schedules the measurement of raw IQ traces. 
         This function should be called inside of a channel synchronizer.
