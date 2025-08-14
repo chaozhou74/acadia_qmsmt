@@ -8,9 +8,6 @@ from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig, Qub
 from acadia.runtime import annotate_method
 
 
-def decay(t, A, tau, B):
-    return A*np.exp(-t/tau) + B
-
 class QMT1Runtime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for sweeping the rabi time
@@ -209,80 +206,4 @@ class QMT1Runtime(QMsmtRuntime):
         fig, axs = plot_binaveraged(self.delay_times_us, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
         axs.set_ylabel("Time [us]")
         return fig, axs
-
-
-    # ----------------------------- live plot in jpynb----------------------
-    # def initialize(self):
-    #     if self.plot:
-    #         import matplotlib.pyplot as plt
-    #         import matplotlib as mpl
-    #         from IPython.display import display
-    #         from ipywidgets import Label
-    #         from acadia.processing import DynamicLine
-
-    #         self.figsize = (4.5, 3) if self.figsize is None else self.figsize
-    #         self.fig, self.ax = plt.subplots(1, 1, figsize=self.figsize)
-    #         self.fig.subplots_adjust(left=0.25, bottom=0.25)
-    #         self.ax.set_xlabel("Wait length [s.]")
-    #         self.ax.set_xlim(self.delay_times[0], self.delay_times[-1])
-    #         self.ax.set_ylim(-1, 1)
-    #         self.ax.grid()
-    #         self.line_pop = DynamicLine(self.ax, ".-")
-    #         self.line_fit = DynamicLine(self.ax, "--")
-    #         self.fig.tight_layout()
-
-    #         self.decay_label = Label(style={"description_width": "initial"})
-    #         display(self.decay_label)
-
-    #         from tqdm.notebook import tqdm
-
-    #     else:
-    #         from tqdm import tqdm
-
-    #     self.fit = None
-    #     self.iterations_progress_bar = tqdm(desc="Iterations", dynamic_ncols=True, total=self.iterations)
-    #     self.iterations_previous = 0
-    #     self.points_per_iter = len(self.delay_times)
-
-    # def update(self):
-    #     # First make sure that we actually have new data to process
-    #     if "points" not in self.data or len(self.data["points"]) < self.points_per_iter:
-    #         return
-
-    #     # Update the progress bar based on the number of iterations
-    #     completed_iterations = len(self.data["points"]) // self.points_per_iter
-    #     if completed_iterations == 0:
-    #         return
-
-    #     self.iterations_progress_bar.update(completed_iterations - self.iterations_previous)
-
-    #     valid_points = completed_iterations * self.points_per_iter
-    #     data = self.data["points"].records()[:valid_points, ...]
-    #     data = data.reshape(completed_iterations, len(self.delay_times), 2)
-
-    #     # Threshold the data according to the I quadrature
-    #     shots = np.sign(data[..., 0], dtype=np.int32)
-    #     self.avg = np.mean(shots, axis=0)
-
-    #     if completed_iterations == 1:
-    #         self.fig.tight_layout()
-
-    #     p0 = (abs(np.max(self.avg)) - abs(np.min(self.avg)), self.delay_times[len(self.delay_times) // 2], self.avg[-1])
-    #     self.fit, pcov = curve_fit(decay, self.delay_times, self.avg, p0=p0)
-
-    #     if self.plot:
-    #         self.line_pop.update(self.delay_times, self.avg, rescale_axis=False)
-    #         if self.fit is not None:
-    #             self.decay_label.value = f"Decay time: {round(self.fit[1]*1e6, 3)} us" 
-    #             self.line_fit.update(self.delay_times, decay(self.delay_times, *self.fit), rescale_axis=False)
-    #         self.fig.canvas.draw_idle() 
-
-
-    #     self.data.save(self.local_directory)
-    #     self.iterations_previous = completed_iterations
-
-    # def finalize(self):
-    #     super().finalize()
-    #     self.iterations_progress_bar.close()
-    #     # if self.plot:
-    #     #     self.savefig(self.fig)
+    

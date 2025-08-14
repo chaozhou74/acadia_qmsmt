@@ -284,6 +284,7 @@ class InputOutput:
         
         return current_level
 
+    # ----------Pulse calculation and DAC specific methods ------------
     def get_pulse_config(self, pulse: Union[str,dict,None] = None) -> dict:
         """
         This method retrieves the configuration for a pulse, either from the
@@ -429,60 +430,6 @@ class InputOutput:
             self._pulse_cache[pulse_name]['waveforms'][pulse_hash] = waveform_container
             return pulse_hash
 
-    def get_waveform_memory(self, waveform_memory: Union[str, dict, WaveformMemory] = None) -> WaveformMemory:
-            """
-            A shortcut function for getting waveform for a specific pulse.
-            Serves as a shortcut for creating waveform memory objects based on the
-            parameters defined in ``config["pulses"]``.
-            If no name is provided, the first memory in the list of available
-            memories is used.
-            :param waveform_memory: Name of the waveform memory defined under the
-                "pulses" sub-dictionary for the given channel
-            :return: Allocated WaveformMemory object
-            """
-            # Just return the input if we were directly given a memory
-            # This is useful behavior for writing objects later that, when calling this
-            # function to retrieve a waveform, can be directly passed either a name or
-            # an actual memory
-
-            if isinstance(waveform_memory, WaveformMemory):
-                return waveform_memory
-            if waveform_memory is not None and not isinstance(waveform_memory, (str, dict)):
-                raise TypeError(f"Waveform memories must be specified by string or dictionary"
-                                f" when not directly provided or inferred;"
-                                f" received memory specified of type"
-                                f" {type(waveform_memory)}")
-
-            if self._channel.is_dac: # If it is a dac, check in the pulse cache
-                if waveform_memory is None:
-                    waveform_memory = list(self.get_config("pulses").keys())[0]
-                
-                wfm_name = waveform_memory["name"] if isinstance(waveform_memory, dict) else waveform_memory
-                if (self._pulse_cache.get(wfm_name) is None) or (self._pulse_cache[wfm_name].get("memory") is None):
-                    pulse_config = self.get_pulse_config(waveform_memory)
-                    pulse_hash = self.prepare_pulse_params(pulse_config)
-                    memory_length = self._pulse_cache[wfm_name]['waveforms'][pulse_hash]["memory_length"]
-                    stretch_length = self._pulse_cache[wfm_name]['waveforms'][pulse_hash]["stretch_length"]
-                    wfm = self._acadia.create_waveform_memory(self._channel, length = memory_length)
-                    setattr(wfm, "_stretch_length", stretch_length)
-                    self._pulse_cache[wfm_name]["memory"] = wfm
-                else:
-                    wfm = self._pulse_cache[wfm_name]["memory"]
-            else: # If it is an adc, check in allocated memories
-                if waveform_memory is None:
-                    waveform_memory = list(self.get_config("memories").keys())[0]
-                if isinstance(waveform_memory, dict):
-                    raise TypeError("Waveform memory must be specified by string or WaveformMemory object"
-                                    " for ADC channels; received a dictionary.")
-                if waveform_memory not in self._allocated_memories:
-                    wf_cgf = self.get_config("memories", waveform_memory)
-                    wf_cgf = {k: v for k, v in wf_cgf.items() if k != "stretch_length"}
-                    self._allocated_memories[waveform_memory] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
-
-                wfm = self._allocated_memories[waveform_memory]
-            
-            return wfm
-    
     def load_pulse(self,
                    memory: Union[str, Dict, WaveformMemory] = None,
                    pulse: Union[str, Dict, NDArray, float, complex] = None, **kwargs) -> None:
@@ -689,6 +636,189 @@ class InputOutput:
       
         self._acadia.schedule_waveform(wfm, stretch_length=stretch_length)
 
+    # ------------ ADC specific methods ------------
+    def capture_cmacc(self, capture_waveform_memory: Union[str, dict, WaveformMemory],
+                      kernel: Union[str, dict, WaveformMemory] = None, cmacc_offset: Tuple[int,int]=None,
+                      write_mode: Literal["upper", "lower"] = "upper", reset_fifo: bool = False):
+        """
+        Schedule ADC capture with CMACC (Complex Multiply and Accumulate).
+
+        :param capture_waveform_memory: The capture waveform memory to be used.
+        :param kernel: Can be either a string (name of the window in the config), 
+            or a dict that specifies the configuration of a window, or a pre-allocated memory for the kernel.
+        :param cmacc_offset: Preloaded offset for the CMACC kernel, as a tuple of two integers.
+            If not None, this will overwrite the value in the config dict.
+        :param write_mode: The output port of the CMACC is driven by a multiplexer,
+            which allows the user to decide which data is written into memory. 
+            The output port has 32 bits per quadrature, but the internal accumulator
+            has 48 bits per quadrature, and therefore it is left to the user to
+            decide whether the upper or lower 32 bits are presented to the output.
+            Using the upper 32 bits reduces the precision of the output but reduces
+            the probability of overflow.
+        :type write_mode: str, one of "upper", "lower".
+        """
+
+        if self._channel.is_dac:
+            raise TypeError(f"`capture_trace` can only be called from an ADC channel, got {self._channel}")
+
+        capture_waveform = self.get_waveform_memory(capture_waveform_memory)
+
+        # If kernel is specifyed with a key in yaml or just a dict, allocate the memory anew 
+        # We'll interpret the type of the argument slightly differently,
+        # than configure_cmacc expects; if the window argument is a float,
+        # we'll interpret this as the amplitude of a boxcar window, in contrast
+        # to configure_cmacc interpreting a float argument as the length in seconds
+        # that the window should be. The behavior here will be different as this is a
+        # much more likely use case and will be much more intuitive in the config file
+        # The actual amplitude/data of the window will be set when calling `window_memory.load()`
+        if isinstance(kernel, (str, dict)):
+            window_config = self.get_config("windows", kernel) if isinstance(kernel, str) else kernel
+            window_data = window_config["data"]
+            kernel_arg = None if isinstance(window_data, float) else window_data
+            if cmacc_offset is None:
+                cmacc_offset = window_config.get("offset", (0, 0))
+
+        else: # we will let stream_cmacc to handle the other types 
+            kernel_arg = kernel
+        
+        # Because the offset is just a number (and not a thing that needs
+        # to be allocated), we can just get it from the config every time
+        offset_converted = [int(np.int32(q).astype(np.uint32)) for q in cmacc_offset]
+
+
+        # if kernel is None or a boxcar, the accumulation length will be set to capture length
+        if kernel_arg is None or (hasattr(kernel_arg, "size") and kernel_arg.size == 1):
+            length = self.get_config("memories", capture_waveform_memory, "length")
+        else: # otherwise, stream_cmacc will use kernel length as the accumulation length
+            length = None
+
+        stream, window_mem = self._acadia.stream_cmacc(self._channel, capture_waveform,
+                                                                      kernel=kernel_arg, length=length,
+                                                                      preload=offset_converted,
+                                                                      write_mode=write_mode, reset_fifo=reset_fifo,
+                                                                      last_only=True, accumulator_done=False)    
+        
+        return stream, window_mem
+
+    def capture_trace(self, capture_waveform_memory: Union[str, dict, WaveformMemory], decimation:int=None):
+        """
+        Capture a IQ trace from the ADC channel into the specified waveform memory.
+
+        :param capture_waveform_memory: Waveform memory to store the captured trace,
+            can be a string (name of the memory), a dict (configuration of the memory),
+            or a `WaveformMemory` object.
+            If a string or dict is provided, it should match the name of a memory in the
+            configuration under the "memories" section.
+
+        :param decimation: When not None, this value overrides the decimation factor
+            specified in the waveform memory configuration.
+            If `capture_waveform_memory` is a `WaveformMemory` object, this parameter must be specified, because
+            the decimation factor is not stored in the `WaveformMemory` object.
+        """
+        if self._channel.is_dac:
+            raise TypeError(f"`capture_trace` can only be called from an ADC channel, got {self._channel}")
+        
+        if isinstance(capture_waveform_memory, str):
+            deci = self.get_config("memories", capture_waveform_memory, "decimation")
+            decimation = decimation if decimation is not None else deci
+        elif isinstance(capture_waveform_memory, dict):
+            deci = capture_waveform_memory.get("decimation")
+            decimation = decimation if decimation is not None else deci
+        
+        if decimation is None:
+            raise ValueError("Decimation must be secified (Either in the yaml, input dict, or input to this function)"
+                            f"for capture trace with {capture_waveform_memory}")
+
+        src = self._channel
+        dst  = self.get_waveform_memory(capture_waveform_memory)
+
+        dsp_stream_config = self._acadia.configure_dsp(src=src, decimation=decimation, reset=True)
+
+        if decimation == 0:
+            raise ValueError("Decimation factor cannot be zero for capture trace.")
+
+        length_cycles = dst._shape[0]
+        output_size_bytes = length_cycles * (2*dst.itemsize) 
+
+        if decimation > 1:# the decimation % 4 check should have already been done in `create_wageform_memory`
+            # when decimate, the capture cycles need to be scaled to capture the full trace
+            length_cycles = length_cycles * (decimation //4)
+
+        capture_dict = self.get_waveform_memory("readout_trace").__dict__
+        logger.info(f"output_size_bytes {output_size_bytes}, capture_dict: {capture_dict}, length_cycles: {length_cycles}")
+
+        self._acadia.stream(configuration=dsp_stream_config, 
+                    dst=dst,
+                    length_cycles=length_cycles,
+                    output_size_bytes=output_size_bytes,
+                    memory_input=(src if dsp_stream_config.input_source == "memory" else None))
+
+
+    # ------------Generic IO methods ------------
+    def get_waveform_memory(self, waveform_memory: Union[str, dict, WaveformMemory] = None) -> WaveformMemory:
+        """
+        A shortcut function for getting waveform for a specific pulse.
+        Serves as a shortcut for creating waveform memory objects based on the
+        parameters defined in ``config["pulses"]``.
+        If no name is provided, the first memory in the list of available
+        memories is used.
+        :param waveform_memory: Name of the waveform memory defined under the
+            "pulses" sub-dictionary for the given channel
+        :return: Allocated WaveformMemory object
+        """
+        # Just return the input if we were directly given a memory
+        # This is useful behavior for writing objects later that, when calling this
+        # function to retrieve a waveform, can be directly passed either a name or
+        # an actual memory
+
+        if isinstance(waveform_memory, WaveformMemory):
+            return waveform_memory
+        if waveform_memory is not None and not isinstance(waveform_memory, (str, dict)):
+            raise TypeError(f"Waveform memories must be specified by string or dictionary"
+                            f" when not directly provided or inferred;"
+                            f" received memory specified of type"
+                            f" {type(waveform_memory)}")
+
+        if self._channel.is_dac: # If it is a dac, check in the pulse cache
+            if waveform_memory is None:
+                waveform_memory = list(self.get_config("pulses").keys())[0]
+            
+            wfm_name = waveform_memory["name"] if isinstance(waveform_memory, dict) else waveform_memory
+            if (self._pulse_cache.get(wfm_name) is None) or (self._pulse_cache[wfm_name].get("memory") is None):
+                pulse_config = self.get_pulse_config(waveform_memory)
+                pulse_hash = self.prepare_pulse_params(pulse_config)
+                memory_length = self._pulse_cache[wfm_name]['waveforms'][pulse_hash]["memory_length"]
+                stretch_length = self._pulse_cache[wfm_name]['waveforms'][pulse_hash]["stretch_length"]
+                wfm = self._acadia.create_waveform_memory(self._channel, length = memory_length)
+                setattr(wfm, "_stretch_length", stretch_length)
+                self._pulse_cache[wfm_name]["memory"] = wfm
+            else:
+                wfm = self._pulse_cache[wfm_name]["memory"]
+        else: # If it is an adc, check in allocated memories
+            if waveform_memory is None:
+                waveform_memory = list(self.get_config("memories").keys())[0]
+            if isinstance(waveform_memory, dict):
+                raise TypeError("Waveform memory must be specified by string or WaveformMemory object"
+                                " for ADC channels; received a dictionary.")
+            if waveform_memory not in self._allocated_memories:
+                wf_cgf = self.get_config("memories", waveform_memory)
+                wf_cgf = {k: v for k, v in wf_cgf.items() if k != "stretch_length"}
+                self._allocated_memories[waveform_memory] = self._acadia.create_waveform_memory(self._channel, **wf_cgf)
+
+            wfm = self._allocated_memories[waveform_memory]
+        
+        return wfm
+    
+    def set_frequency(self, frequency: float, sync: bool = True):
+        """
+        Update the frequency of the IO channel and optionally trigger a synchronization.
+        """
+
+        self.set_nco_frequency(frequency)
+        self.reset_nco_phase()
+        if sync:
+            self._acadia.update_ncos_synchronized()
+
     def dwell(self, length: Union[float, Symbol, Operation] = None, length_is_minus_one: bool = False) -> None:
             """
             Schedule a dwell on a channel's DMA.
@@ -705,16 +835,6 @@ class InputOutput:
             :type length_is_minus_one: bool
             """
             self._acadia.dwell(self.channel, length, length_is_minus_one)
-
-    def set_frequency(self, frequency: float, sync: bool = True):
-        """
-        Update the frequency of the IO channel and optionally trigger a synchronization.
-        """
-
-        self.set_nco_frequency(frequency)
-        self.reset_nco_phase()
-        if sync:
-            self._acadia.update_ncos_synchronized()
 
     @property
     def channel(self) -> Channel:
@@ -1044,6 +1164,8 @@ class MeasurableResonator:
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
                 window_name: str = None,
+                cmacc_offset: Tuple[int,int]=None,
+                capture_delay:float=0,
                 write_mode: Literal["upper", "lower"] = "upper",
                 reset_fifo: bool = False
                 ):
@@ -1051,6 +1173,12 @@ class MeasurableResonator:
         Schedules the measurement of accumulated IQ points. 
         This function should be called inside of a channel synchronizer.
 
+        :param stimulus_waveform_memory: The pulse waveform memory to be played.
+        :param capture_waveform_memory: The capture waveform memory to be used.
+        :param window_name: Name of the window to be used for the CMACC kernel.
+        :param cmacc_offset: Preloaded offset for the CMACC kernel, as a tuple of two integers.
+            If not None, this will overwrite the value in the config dict.
+        :param capture_delay: Delaytime between scheduling the pulse and starting the capture, in seconds.
         :param write_mode: The output port of the CMACC is driven by a multiplexer,
             which allows the user to decide which data is written into memory. 
             The output port has 32 bits per quadrature, but the internal accumulator
@@ -1061,54 +1189,29 @@ class MeasurableResonator:
         :type write_mode: str, one of "upper", "lower".
 
         """
-        capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory)
-
-        # ------------ schedule drive pulse ------------------------------
-        self._stimulus.schedule_pulse(stimulus_waveform_memory)
-
-
-        # ------------ configure and perform capture ---------------------
-        # First, we'll determine what window we need
-        # Here we'll cache allocated windows. If we previously used a window, 
-        # we'll retrieve its memory, otherwise we'll allocate it fresh
         if window_name is None:
             window_name = list(self._capture.get_config("windows").keys())[0]
-            
+
         if window_name in self._windows:
             # Regardless of what the window is, if we have it already,
             # we'll pass in its WaveformMemory so that we don't re-allocate it
             kernel_arg = self._windows[window_name]
-
         else:
-            # Allocate the memory anew 
-            # We'll interpret the type of the argument slightly differently 
-            # than configure_cmacc expects; if the window argument is a float,
-            # we'll interpret this as the amplitude of a boxcar window, in contrast
-            # to configure_cmacc interpreting a float argument as the length in seconds
-            # that the window should be. The behavior here will be different as this is a
-            # much more likely use case and will be much more intuitive in the config file
-            window_config = self._capture.get_config("windows", window_name, "data")
-            kernel_arg = None if isinstance(window_config, float) else window_config
-
-        # Because the offset is just a number (and not a thing that needs
-        # to be allocated), we can just get it from the config every time
-        cmacc_offset = self._capture._config["windows"][window_name].get("offset", (0,0))
-        offset_converted = [int(np.int32(q).astype(np.uint32)) for q in cmacc_offset]
-
-
-        # if kernel is None or a boxcar, the accumulation length will be set to capture length
-        if kernel_arg is None or (hasattr(kernel_arg, "size") and kernel_arg.size == 1):
-            length = self._capture.get_config("memories", capture_waveform_memory, "length")
-        else: # otherwise, stream_cmacc will use kernel length as the accumulation length
-            length = None
-
-        self._stream, window_mem = self._capture._acadia.stream_cmacc(self._capture._channel, capture_waveform,
-                                                                      kernel=kernel_arg, length=length,
-                                                                      preload=offset_converted,
-                                                                      write_mode=write_mode, reset_fifo=reset_fifo,
-                                                                      last_only=True, accumulator_done=False)    
+            kernel_arg = window_name
         
-        # Cache the relevant stream and window
+        if cmacc_offset is None:
+                cmacc_offset = self._capture.get_config("windows", window_name).get("offset", (0, 0))
+
+        # ------------ schedule drive pulse ------------------------------
+        self._stimulus.schedule_pulse(stimulus_waveform_memory)
+        if capture_delay > 0:
+            self._capture.dwell(capture_delay)
+
+        # ----------- configure and schedule ADC capture with CMACC --------------
+        self._stream, window_mem = self._capture.capture_cmacc(capture_waveform_memory, kernel_arg, cmacc_offset,
+                                                              write_mode=write_mode, reset_fifo=reset_fifo)
+        
+        # # Cache the relevant stream and window
         # If we had already allocated and cached these, this will just store 
         # them back with the same values
         self._windows[window_name] = window_mem
@@ -1117,26 +1220,24 @@ class MeasurableResonator:
     def measure_trace(self, 
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
-                reset_fifo: bool = False):
+                capture_delay:float=0):
         """
         Schedules the measurement of raw IQ traces. 
         This function should be called inside of a channel synchronizer.
+        
+        :param stimulus_waveform_memory: The pulse waveform memory to be played.
+        :param capture_waveform_memory: The capture waveform memory to be used.
+        :param capture_delay: Delaytime between scheduling the pulse and starting the capture, in seconds.
 
         """
-        # todo: allow configurable decimation. Currently this must be 4
-
-        capture_waveform = self._capture.get_waveform_memory(capture_waveform_memory)
 
         # ------------ schedule drive pulse ------------------------------
         self._stimulus.schedule_pulse(stimulus_waveform_memory)
+        if capture_delay > 0:
+            self._capture.dwell(capture_delay) 
 
-
-        # ------------ configure and perform capture ---------------------
-        length = self._capture.get_config("memories", capture_waveform_memory, "length")
-        self._capture._acadia.stream_cmacc(self._capture._channel, capture_waveform,
-                                           length=length, kernel=None, preload=(0, 0),
-                                            write_mode="input", reset_fifo=reset_fifo,
-                                            last_only=False, accumulator_done=False)    
+        # ------------ configure and schedule capture stream ---------------------
+        self._capture.capture_trace(capture_waveform_memory)
 
 
     def get_measurement(self) -> Operation:

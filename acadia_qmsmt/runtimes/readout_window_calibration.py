@@ -162,7 +162,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         return fig, axs
 
     @annotate_method(plot_name="result kernel", axs_shape=(1,1))
-    def plot_calculated_kernel(self, axs=None, plot_uploaded:bool=False):
+    def plot_calculated_kernel(self, axs=None, plot_uploaded:bool=True):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1, 1), figsize=self.figsize)
         self.kernel_gen.plot_kernel(axs, plot_uploaded=plot_uploaded)
