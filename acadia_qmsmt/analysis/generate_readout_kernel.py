@@ -15,63 +15,69 @@ from acadia_qmsmt.analysis.state_discrimination import find_state_circles, mask_
 
 logger = logging.getLogger(__name__)
 
-class KernelGeneratorBase:
-    def __init__(self, traces: Union[List, np.ndarray], g_circle: StateCircleType, e_circle: StateCircleType,
-                 norm_factor:float = 1, decimation_used: int = 4, plot=True):
-        """
-        generate matched kernel based on a given set of IQ traces and specified g/e locations.
 
-        :param traces: raw data complex IQ traces, should have the dimension of (iterations, time_points)
-        :param g_circle: (I_center + 1j * Q_center, circle_radius)
-        :param e_circle: (I_center + 1j * Q_center, circle_radius)
+def calculate_matched_kernel(g_trace, e_trace):
+    """
+    calculate the matched kernel trace based on data traces.
+
+    The kernel trace is calculated as the conjugate of the difference between the average g and e traces.
+    """
+    kernel_trace = np.conjugate(g_trace - e_trace)
+
+    return kernel_trace
+
+
+def load_kernel(kernel_path):
+    kernel = np.load(kernel_path)
+    return kernel
+
+
+def compute_hist_range(*arrays):
+    combined = np.concatenate(arrays)
+    return [
+        [np.min(combined.real), np.max(combined.real)],
+        [np.min(combined.imag), np.max(combined.imag)]
+    ]
+
+
+class KernelHandler:
+    def __init__(self, kernel_trace: Union[List, np.ndarray], norm_factor:float = 1, decimation_used: int = 4):
+        
+        """
+        Base class for handling readout kernel generation and uploading to a yaml file for use in acadia.    
+
         :param norm_factor: normalization factor for the generated kernel
         :param decimation_used: Decimation factor used when getting the `traces` data. This will only be used for
             generating the kernel to be uploaded to cmacc.
             Since by default the input data to cmacc will always have a decimation of 4, if the trace data used to
             generate the kernel array had a different decimation factor, the resulting kernel array must be adjusted
             (interpolated or decimated) to match the expected decimation of the incoming data to cmacc.
-        :param plot:
         """
-        self.all_traces = np.array(traces, dtype=np.complex128)
-        self.all_pts = np.sum(traces, axis=1)
-        self.g_circle = g_circle
-        self.e_circle = e_circle
+        self.kernel_trace = kernel_trace
         self.norm_factor = norm_factor
         self.decimation_used = decimation_used
-        self.generate_kernel_trace(g_circle, e_circle)
-        self.generate_kernel_for_upload(norm_factor, decimation_used)
-        self.generate_cmacc_offset()
-        if plot:
-            self.plot_kernel_generation()
 
-    def generate_kernel_trace(self, g_circle: StateCircleType, e_circle: StateCircleType):
-        """calculate the kernel trace based on the selected data traces
+        self.kernel_trace_norm = kernel_trace / np.max(abs(kernel_trace)) * norm_factor
 
-        :param g_circle: (I_center + 1j * Q_center, circle_radius)
-        :param e_circle: (I_center + 1j * Q_center, circle_radius)
+        self.generate_kernel_for_upload()
+
+    
+    def calculate_expected_iq_points(self, traces_raw: Union[List, np.ndarray]):
         """
-        self.g_mask = mask_state_with_circle(self.all_pts, g_circle)
-        self.e_mask = mask_state_with_circle(self.all_pts, e_circle)
-        self.g_trace_avg = np.mean(self.all_traces[self.g_mask], axis=0)
-        self.e_trace_avg = np.mean(self.all_traces[self.e_mask], axis=0)
-
-        self.kernel_trace = np.conjugate(self.g_trace_avg - self.e_trace_avg)
-        kernel_norm = self.kernel_trace / np.max(abs(self.kernel_trace)) * self.norm_factor # normalize to 1
-        self.kernel_trace_norm = kernel_norm
-
-        # calculate expected IQ points when kernel is used
-        self.new_iq_pts = np.sum(self.all_traces * kernel_norm, axis=1)
-
-        return self.kernel_trace
-
-    def generate_kernel_for_upload(self, norm_factor: float = 1, decimation_used: int = None):
+        Calculate the expected IQ points given the raw IQ points when kernel is used.
         """
-        Calculate the kernel array for uploading to cmacc based on the decimation used to get the `traces` data
+        pts_new = np.sum(traces_raw * self.kernel_trace_norm, axis=1)
 
+        return pts_new
+
+    def generate_kernel_for_upload(self):
+        """
+        Calculate the kernel array for uploading to cmacc based on the decimation used to get the `traces` data.
         :return:
         """
 
-        deci = self.decimation_used if decimation_used is None else decimation_used
+        deci = self.decimation_used 
+        
         scale = deci // 4
         kernel = self.kernel_trace
 
@@ -97,9 +103,10 @@ class KernelGeneratorBase:
         else:
             raise ValueError("Invalid trace decimation, must be 1 or a positive multiple of 4 ")
 
-        self.kernel_upload = kernel_array / np.max(abs(kernel_array)) * norm_factor
+        self.kernel_upload = kernel_array / np.max(abs(kernel_array)) * self.norm_factor
 
         return self.kernel_upload
+
 
     def plot_kernel(self, plot_ax:Axes=None, plot_uploaded=True):
         if plot_uploaded:
@@ -135,9 +142,11 @@ class KernelGeneratorBase:
 
         save_name = datetime.now().strftime("kernel_%y%m%d_%H%M%S") if filename is None else filename
         save_path = os.path.join(directory, save_name)
-        np.save(save_path, self.kernel_upload)
+        base = os.path.splitext(save_path)[0]
+        np.save(base, self.kernel_upload)
         print(f"kernel saved to: {save_path}.npy")
-        return save_path + ".npy"
+        return base + ".npy"
+
 
     def update_kernel(self, yaml_file: str, key_path: str, kernel_dir: str, kernel_name: str = None):
         """
@@ -157,77 +166,15 @@ class KernelGeneratorBase:
         update_dict = {key_path: kernel_path}
         update_yaml(yaml_file, update_dict, verbose=True)
 
-    def plot_kernel_generation(self, plot_axs:List[Axes]=None, log_scale=False, bins:int = 101):
-        """
-        Plot the selection of g/e circles for kernel generation, the average of the selected g/e traces, and the
-        expected IQ points after applying kernel.
-
-        :param plot_axs:
-        :param log_scale:
-        :return:
-        """
-        from matplotlib.colors import LogNorm
-        norm = LogNorm() if log_scale else None
-
-        if plot_axs is None:
-            fig, axs = plt.subplots(3, 1, figsize=(5, 8))
-        else:
-            fig, axs = plot_axs[0].get_figure(), plot_axs
-
-        axs[0].set_title("raw IQ points and g/e selection")
-        axs[0].hist2d(self.all_pts.real, self.all_pts.imag, bins=bins, cmap="hot", norm=norm)
-        for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
-            circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
-            axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor="w", facecolor="none"))
-            axs[0].text(circ_i + circ_r * 0.8, circ_q + circ_r * 0.8, state, fontsize=12, va='center', color="w")
-        axs[0].set_aspect('equal')
-
-        axs[1].set_title("average of selected IQ traces")
-        trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
-        for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
-            axs[1].plot(trace.real, ".-", color=trace_colors[2 * i], label=f"{['g', 'e'][i]} trace, re")
-            axs[1].plot(trace.imag, ".-", color=trace_colors[2 * i + 1], label=f"{['g', 'e'][i]} trace, im")
-            axs[1].set_xlabel("pts")
-            axs[1].legend()
-            axs[1].grid(True)
-
-        axs[2].set_title("IQ points after applying kernel")
-        hist, xedges, yedges, _ = axs[2].hist2d(self.new_iq_pts.real, self.new_iq_pts.imag,
-                                                bins=bins, cmap="hot", norm=norm)
-        if hasattr(self, "cmacc_offset"):
-            x0, y0 = -self.cmacc_offset[0], -self.cmacc_offset[1]
-            y0 = np.clip(y0, yedges[0], yedges[-1])
-            axs[2].axvline(x=x0, color='w', linestyle='-', linewidth=0.5)
-            axs[2].axhline(y=y0, color='w', linestyle='-', linewidth=0.5)
-            text_d = (xedges[-1]-xedges[0]) * 0.03
-            for i, quadrant in enumerate(self.state_quadrants):
-                sign_x, sign_y = quadrant_signs(quadrant)
-                axs[2].text(x0 + text_d * sign_x, y0 + text_d * sign_y, QubitStateLabels[i], fontsize=12,
-                            va='center', ha='center', color="w")
-
-        axs[2].set_aspect('equal')
-
-        fig.tight_layout()
-        # fig.show(block=False)
-
-        self.fig = fig
-
-        return fig, axs
-
-    def generate_cmacc_offset(self, *args, **kwargs):
-        pass
-
-    def update_cmacc_offset(self, yaml_file: str, offset_key_path: str, quadrant_key_path: str):
-        pass
 
 
-class KernelFromGETraces(KernelGeneratorBase):
+class KernelFromGETraces(KernelHandler):
     def __init__(self, g_traces: ComplexDataTracesType, e_traces: ComplexDataTracesType,
                  g_circle: StateCircleType = None, e_circle: StateCircleType = None,
                  i_threshold: int = None, q_threshold: int = None,
                  bins: int = 50, sigma_factor: float = 2.5, average_radius=True,
                  norm_factor:float = 1, decimation_used: int = 4,
-                 plot=True, debug=False):
+                 plot=True, debug=False, mask_with_pre_kernel=False):
         """
         Generate readout kernel based on the complex IQ traces from g/e state preparation.
 
@@ -253,21 +200,46 @@ class KernelFromGETraces(KernelGeneratorBase):
         :param decimation_used: Decimation factor used when getting the `traces` data. This will only be used for
             generating the kernel to be uploaded to cmacc. See `KernelGeneratorBase.decimation_used`
         :param plot:
+        :param debug:
+        :param mask_with_pre_kernel: If True, apply the direct subtraction kernel to the raw traces before
+            identifying the g/e circles. This is useful when the directly integrated g/e points are not well separated,
+            for example, when the traces has extra carrier frequencies that was not fully demodulated out.
         """
         self.g_traces_raw = g_traces
         self.e_traces_raw = e_traces
-        self.g_pts_raw = np.sum(g_traces, axis=1)
-        self.e_pts_raw = np.sum(e_traces, axis=1)
         self.i_threshold = i_threshold
         self.q_threshold = q_threshold
+
+
+        self.g_pts_raw = np.sum(g_traces, axis=1)
+        self.e_pts_raw = np.sum(e_traces, axis=1)
+
+
         self.all_traces = np.concatenate([g_traces, e_traces])
+        self.all_pts_raw = np.concatenate([self.g_pts_raw, self.e_pts_raw])
+
         self.bins = bins
+        self.norm_factor = norm_factor
         # if at least one of the circle parameters is not provided, use search function
         g_center, g_radius = (None, None) if g_circle is None else g_circle
         e_center, e_radius = (None, None) if e_circle is None else e_circle
+
+        self.mask_with_pre_kernel = mask_with_pre_kernel
+
         try: # incase anything fails in kernel calculation, we still have the averaged traces and data
+
+            if mask_with_pre_kernel:
+                # apply direct subtraction kernel to the raw traces
+                g_pts_for_sel, e_pts_for_sel = self._apply_direct_subtraction_kernel()
+            else:
+                g_pts_for_sel, e_pts_for_sel = self.g_pts_raw, self.e_pts_raw
+
+            self.all_pts_for_sel = np.concatenate([g_pts_for_sel, e_pts_for_sel])
+
+
+
             if any(x is None for x in (g_center, g_radius, e_center, e_radius)):
-                g_e_circles = find_state_circles(self.g_pts_raw, self.e_pts_raw, bins=bins,
+                g_e_circles = find_state_circles(g_pts_for_sel, e_pts_for_sel, bins=bins,
                                                  sigma_factor=sigma_factor, average_radius=average_radius, debug=debug)
 
             g_circle = (g_center if g_center is not None else g_e_circles[0][0],
@@ -275,13 +247,123 @@ class KernelFromGETraces(KernelGeneratorBase):
             e_circle = (e_center if e_center is not None else g_e_circles[1][0],
                         e_radius if e_radius is not None else g_e_circles[1][1])
 
-            super().__init__(self.all_traces, g_circle, e_circle, norm_factor, decimation_used, plot)
-        except Exception as e:
-            logger.error(f"Kernel calculation error: {e}")
+            self.g_circle = g_circle
+            self.e_circle = e_circle
 
-    def plot_kernel_generation(self, plot_axs:List[Axes]=None, log_scale=False, bins:int = None):
+
+            # generate g/e masks based on the identified circles
+            self.g_mask = mask_state_with_circle(self.all_pts_for_sel, g_circle)
+            self.e_mask = mask_state_with_circle(self.all_pts_for_sel, e_circle)
+
+            self.g_traces = self.all_traces[self.g_mask]
+            self.e_traces =  self.all_traces[self.e_mask]
+            self.g_pts = np.sum(self.g_traces, axis=1)
+            self.e_pts = np.sum(self.e_traces, axis=1)
+            self.g_trace_avg = np.mean(self.g_traces, axis=0)
+            self.e_trace_avg = np.mean(self.e_traces, axis=0)
+
+            kernel_trace = calculate_matched_kernel(self.g_trace_avg, self.e_trace_avg)
+            super().__init__(kernel_trace, norm_factor, decimation_used)
+            self.g_pts_new = self.calculate_expected_iq_points(self.g_traces_raw)
+            self.e_pts_new =  self.calculate_expected_iq_points(self.e_traces_raw)
+
+
+            self.generate_cmacc_offset(i_threshold, q_threshold)
+            
+
+        except Exception as e:
+            logger.error(f"Kernel calculation error: {e}", exc_info=True)
+
+
+        if plot:
+            self.plot_kernel_generation()
+
+
+    def _apply_direct_subtraction_kernel(self):
+        """
+        Apply the direct subtraction kernel to the raw traces to get the g/e points for selection.
+        """
+
+        kernel_trace_mid = np.conjugate(np.mean(self.g_traces_raw, axis=0) -np.mean(self.e_traces_raw, axis=0))
+        kernel_trace_mid /=  np.max(abs(kernel_trace_mid)) / self.norm_factor  # normalize to 1
+
+        # calculate expected IQ points when simple subtraction kernel is applied
+        g_pts_mid = np.sum(self.g_traces_raw * kernel_trace_mid, axis=1)
+        e_pts_mid = np.sum(self.e_traces_raw * kernel_trace_mid, axis=1)
+
+        return g_pts_mid, e_pts_mid
+    
+
+    def plot_kernel_generation(self, plot_axs:List[Axes]=None, log_scale=True, bins:int = None):
+        """
+        Plot the selection of g/e circles for kernel generation, the average of the selected g/e traces, and the
+        expected IQ points after applying kernel.
+
+        :param plot_axs:
+        :param log_scale:
+        :return:
+        """
+        from matplotlib.colors import LogNorm
+        norm = LogNorm() if log_scale else None
         bins = self.bins if bins is None else bins
-        super().plot_kernel_generation(plot_axs, log_scale, bins)
+        state_label_color = "grey" if log_scale else "w"
+        if plot_axs is None:
+            fig, axs = plt.subplots(3, 1, figsize=(5, 8))
+        else:
+            fig, axs = plot_axs[0].get_figure(), plot_axs
+        
+        if not self.mask_with_pre_kernel:
+            axs[0].set_title("raw IQ points and g/e selection")
+        else:
+            axs[0].set_title("IQ points after applying direct substraction kernel")
+        axs[0].hist2d(self.all_pts_for_sel.real, self.all_pts_for_sel.imag, bins=bins, cmap="hot", norm=norm)
+        for circ, state in zip([self.g_circle, self.e_circle], ["g", "e"]):
+            circ_i, circ_q, circ_r = circ[0].real, circ[0].imag, circ[1]
+            axs[0].add_patch(patches.Circle((circ_i, circ_q), circ_r, edgecolor=state_label_color, facecolor="none"))
+            axs[0].text(circ_i + circ_r*0.8, circ_q + circ_r*0.8, state, fontsize=12, va='center', color=state_label_color)
+        axs[0].set_aspect('equal')
+
+        axs[1].set_title("average of selected IQ traces")
+        trace_colors = [(0.27, 0.51, 0.71), (1.0, 0.65, 0.47), (0.18, 0.31, 0.56), (0.94, 0.5, 0.5)]
+        for i, trace in enumerate([self.g_trace_avg, self.e_trace_avg]):
+            axs[1].plot(trace.real, ".-", color=trace_colors[2 * i], label=f"{['g', 'e'][i]} trace, re")
+            axs[1].plot(trace.imag, ".-", color=trace_colors[2 * i + 1], label=f"{['g', 'e'][i]} trace, im")
+            axs[1].set_xlabel("pts")
+            axs[1].legend()
+            axs[1].grid(True)
+
+        axs[2].set_title("IQ points after applying kernel")
+        new_iq_pts_all = np.concatenate([self.g_pts_new, self.e_pts_new])
+        
+
+        if hasattr(self, "cmacc_offset"):
+            x0, y0 = -self.cmacc_offset[0], -self.cmacc_offset[1]            
+            hist_range = compute_hist_range(new_iq_pts_all)
+            hist_range[1] = (np.min([hist_range[1][0], y0]), np.max([hist_range[1][1], y0]))
+
+            hist, xedges, yedges, _ = axs[2].hist2d(new_iq_pts_all.real, new_iq_pts_all.imag,
+                                                    bins=bins, cmap="hot", norm=norm, range=hist_range)
+
+            axs[2].axvline(x=x0, color=state_label_color, linestyle='-', linewidth=0.5)
+            axs[2].axhline(y=y0, color=state_label_color, linestyle='-', linewidth=0.5)
+            text_d = (xedges[-1]-xedges[0]) * 0.03
+            for i, quadrant in enumerate(self.state_quadrants):
+                sign_x, sign_y = quadrant_signs(quadrant)
+                axs[2].text(x0 + text_d * sign_x, y0 + text_d * sign_y, QubitStateLabels[i], fontsize=12,
+                            va='center', ha='center', color=state_label_color)
+        else:
+            hist, xedges, yedges, _ = axs[2].hist2d(new_iq_pts_all.real, new_iq_pts_all.imag,
+                                                    bins=bins, cmap="hot", norm=norm)
+
+        axs[2].set_aspect('equal')
+
+        fig.tight_layout()
+        # fig.show(block=False)
+
+        self.fig = fig
+
+        return fig, axs
+
 
     def generate_cmacc_offset(self, i_threshold: int = None, q_threshold: int = None) \
             -> Tuple[complex, Tuple[int, int]]:
@@ -310,7 +392,7 @@ class KernelFromGETraces(KernelGeneratorBase):
 
         # Calculate default Q offset based on the 3-sigma radius of the g states
         if q_threshold is None:
-            radius = np.std(self.new_iq_pts[self.g_mask] - g_center_pk) * 3
+            radius = np.std(self.g_pts_new - g_center_pk) * 3
             # offset_Q = ((g_center_pk.imag > 0) * 2 - 1) * radius - g_center_pk.imag
             offset_Q = radius - g_center_pk.imag
         else:
@@ -346,11 +428,6 @@ class KernelFromGETraces(KernelGeneratorBase):
         update_yaml(yaml_file, update_dict, verbose=True)
 
 
-def load_kernel(kernel_path):
-    kernel = np.load(kernel_path)
-    return kernel
-
-
 if __name__ == "__main__":
     from acadia.data import DataManager
     # import matplotlib
@@ -359,7 +436,7 @@ if __name__ == "__main__":
     plt.ion()
 
 
-    data_dir = "/home/rsl/Data/LINC_Cooldown_20250506/ChipA/RoTrace/250525_142611"
+    data_dir = "/home/chao/Data/test1/Readout_WindowCal/250820/011042"
     dm = DataManager()
     dm.load(data_dir)
     g_traces = np.array(dm[f"traces_g"].records()).astype(float).view(complex).squeeze()
@@ -368,6 +445,7 @@ if __name__ == "__main__":
 
     kgen = KernelFromGETraces(np.repeat(g_traces, 2, axis=0), e_traces, plot=True)
 
+    # check the base class plotting method
 
     # kernel=load_kernel(r"../_develop//"+"readoutkernel_241105_113318.npy")
     #
@@ -383,8 +461,3 @@ if __name__ == "__main__":
     # plt.show()
     # ax.set_aspect(1)
 
-    plt.figure()
-    plt.hist2d(kgen.new_iq_pts[kgen.g_mask].real, kgen.new_iq_pts[kgen.g_mask].imag, bins=51)
-    plt.hist2d(kgen.all_pts[kgen.g_mask].real, kgen.all_pts[kgen.g_mask].imag, bins=51)
-
-    plt.show()
