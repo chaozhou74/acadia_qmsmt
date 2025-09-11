@@ -1284,6 +1284,12 @@ class MeasurableResonator:
         with a.sequencer().repeat_until(a.cmacc_done(self._stream)):
             pass
 
+    def load_pulse(self, pulse_name:str):
+        """
+        Load a pulse into the stimulus.
+        """
+        self._stimulus.load_pulse(pulse_name)
+
 class Qubit:
     """
     A collection of functions that are useful for manipulating and measuring a qubit.
@@ -1335,6 +1341,38 @@ class Qubit:
         
         return pulse_name
 
+    def make_selective_pulse(self, cavity_state:int, chi: float, 
+                             chi_prime: float=0.0,
+                             reference_pi_pulse:str="R_x_180_selective", 
+                             pulse_name:str=None,
+                             create_memory:bool=False):
+        # duplicate the pi pulse config
+        stimulus = self._stimulus
+        new_config = stimulus.get_pulse_config(reference_pi_pulse).copy()
+
+        # scale the pulse
+        new_config["detune"] = cavity_state * chi + 0.5*cavity_state*(cavity_state-1)*chi_prime
+
+        # set pulse name
+        if pulse_name is None:
+            pulse_name = f"selective_{cavity_state}"
+        base_name = pulse_name
+        i=1
+        while pulse_name in stimulus._config.get("pulses", {}):
+            pulse_name = f"{base_name}_{i}"
+            i += 1
+        new_config["name"] = pulse_name
+
+
+        # Insert into config tree (modifies in-place)
+        stimulus._config["pulses"][pulse_name] = new_config
+
+        # Create WaveformMemory for this pulse
+        if create_memory:
+            stimulus.get_waveform_memory(pulse_name)
+        
+        return pulse_name
+    
     def prepare(self, 
                 state_quadrant: Literal[1,2,3,4],
                 measurement_resonator: MeasurableResonator,
@@ -1401,13 +1439,24 @@ class Qubit:
         return reg
 
     def schedule_pulse(self, waveform_memory: Union[str, WaveformMemory] = None,
-                stretch_length:Union[float, ManagedResource] = None) -> None:
+                stretch_length:Union[float, ManagedResource] = None, **kwargs) -> None:
         """
         Shortcut function for InputOutput.schedule_pulse
         """
 
-        self._stimulus.schedule_pulse(waveform_memory, stretch_length)
+        self._stimulus.schedule_pulse(waveform_memory, stretch_length, **kwargs)
 
+    def load_pulse(self, pulse_name:str, **kwargs):
+        """
+        Load a pulse into the stimulus.
+        """
+        self._stimulus.load_pulse(pulse_name, **kwargs)
+
+    def dwell(self, length: float):
+        """
+        Dwell for a specified duration.
+        """
+        self._stimulus.dwell(length)
 
 class QubitQmCooler:
     """
