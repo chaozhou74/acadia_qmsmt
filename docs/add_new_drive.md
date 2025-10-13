@@ -221,8 +221,45 @@ df -h "$MOUNTDIR"
 
 ---
 
-## Step 2 (Native Linux). Mount the Drive (with systemd)
-To be written and tested. This should be much simpler than WSL, as it can see the drive directly.
+## Step 2 (Native Linux). Mount the Drive
+This is much simpler than WSL, as it can see the drive directly.
+### 2A. Find the UUID of the drive
+```bash
+lsblk -f
+```
+Copy the UUID of the data drive
+
+### 2B. Make a director for mounting
+```bash
+sudo mkdir -p /mnt/Data
+```
+You can replace `Data` with your prefered folder name.
+
+### 2C. Add the mount to `fstab`
+Edit the fstab file
+```bash
+sudo nano /etc/fstab
+```
+
+Add a line at the bottom (replace UUID and mount point accordingly):
+```
+UUID=<your_UUID> /mnt/Data ext4 defaults 0 2
+```
+Save and exit (`Ctrl+O`, `Enter`, `Ctrl+X`).
+
+### 2D. Test your `fstab` entry and change permissions
+```bash
+sudo mount -a
+```
+If no errors appear, you’re good to go — it’ll mount automatically on boot.
+
+Change to writer permission
+
+```bash
+sudo chown -R $USER:$USER /mnt/Data
+```
+
+
 
 ---
 
@@ -354,7 +391,9 @@ In the **remote** WSL or Linux terminal:
    # Where to mount it on this client
    LOCAL_MOUNT_DIR="/mnt/data_from_yyy"      # ← change me to your prefered name
    ```
-   > make sure there is no existing file in `LOCAL_MOUNT_DIR`
+   > If the remote folder in on wsl, make sure to use the __ip of the wsl, not the windows system__
+
+   > Make sure there is no existing file in `LOCAL_MOUNT_DIR`
    
 
 3. Mount it now:
