@@ -8,22 +8,37 @@ from uncertainties import ufloat
 
 logger = logging.getLogger(__name__)
 
+# Optional lmfit backend
+try:
+    import lmfit
+    _HAS_LMFIT = True
+except Exception:
+    lmfit = None
+    _HAS_LMFIT = False
+
+
 class FitterBase:
     """
-    Base class for fitting data using scipy.optimize.curve_fit with named parameter support,
-    optional fixed parameters, uncertainty tracking, and plotting utilities.
+    Base class for fitting data using lmfit if available, else scipy.optimize.curve_fit,
+    with named parameter support, optional fixed parameters, uncertainty tracking,
+    and plotting utilities.
 
     Subclasses must implement:
     - `model(coordinates, **params)`: the model function to be fitted
     - `guess(coordinates, data)`: initial parameter guesses as a dict
     """
 
-    def __init__(self, coordinates: np.ndarray, data: np.ndarray,
-                 sigma: Optional[np.ndarray] = None,
-                 params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None, 
-                 dry: bool = False, absolute_sigma: bool = True, **fit_kwargs):
+    def __init__(
+        self,
+        coordinates: np.ndarray,
+        data: np.ndarray,
+        sigma: Optional[np.ndarray] = None,
+        params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None,
+        dry: bool = False,
+        absolute_sigma: bool = True,
+        **fit_kwargs
+    ):
         """
-
         :param coordinates: Independent variable(s), passed to the model.
         :param data: Measured dependent data.
         :param sigma: Optional standard deviations of data for weighted fit.
@@ -35,21 +50,46 @@ class FitterBase:
                         - 'fixed': True if parameter should not be varied
         :param dry: If True, do not perform the fit; just use initial guesses.
         :param absolute_sigma: If True, errors are treated as absolute in uncertainty calc.
-        :param fit_kwargs: Additional keyword arguments for `curve_fit`.
+        :param fit_kwargs: Additional keyword arguments for the backend optimizer.
         """
         self.coordinates = np.array(coordinates)
         self.data = np.array(data)
         if sigma is not None:
-            sigma = np.clip(sigma, np.mean(sigma/1e10), np.inf) 
+            sigma = np.asarray(sigma, dtype=float)
+            floor = max(np.mean(np.abs(sigma)) * 1e-10, np.finfo(float).eps)
+            sigma = np.clip(sigma, floor, np.inf)
         self.sigma = sigma
         self.absolute_sigma = absolute_sigma
 
         self.param_order = self._extract_param_order()
         params = {} if params is None else params
-        self.params_def = self.guess(self.coordinates, self.data)
-        self.params_def.update(params)
+        guess_def = self.guess(self.coordinates, self.data)
 
-        # Validate provided param keys match expected
+        def _norm_params(p):
+            if isinstance(p, dict):
+                return {
+                    "value": p.get("value", 0.0),
+                    "bounds": p.get("bounds", (-np.inf, np.inf)),
+                    "fixed": bool(p.get("fixed", False)),
+                }
+            return {"value": float(p), "bounds": (-np.inf, np.inf), "fixed": False}
+
+        # Start from guess; only update fields user supplied (keeps guess value if only bounds given)
+        params_def = {name: _norm_params(guess_def[name]) for name in self.param_order}
+        for name, supplied in params.items():
+            if name not in params_def:
+                raise ValueError(f"Unexpected parameter not used by model: {name}")
+            if isinstance(supplied, dict):
+                for k in ("value", "bounds", "fixed"):
+                    if k in supplied:
+                        params_def[name][k] = supplied[k]
+            else:
+                # user passed a bare float -> set value only
+                params_def[name]["value"] = float(supplied)
+
+        self.params_def = {name: params_def[name] for name in self.param_order}
+
+        # Validate keys
         provided_keys = set(self.params_def.keys())
         expected_keys = set(self.param_order)
         missing = expected_keys - provided_keys
@@ -59,6 +99,7 @@ class FitterBase:
         if extra:
             raise ValueError(f"Unexpected parameters not used by model: {extra}")
 
+        # Parse -> vectors used by SciPy backend (and for bookkeeping)
         self._parse_params()
 
         self.popt = None
@@ -66,46 +107,47 @@ class FitterBase:
         self.perr = None
         self.ufloat_results = {}
 
-        # default settings
-        use_fit_kwargs = {"maxfev": 1000, "method": "dogbox"}  # trf or 'dogbox' for more robust fitting but slower
-        use_fit_kwargs.update(fit_kwargs)
+        # Default optimizer kwargs (used by whichever backend)
+        self._fit_kwargs = {"max_nfev": 1000}  # for lmfit least_squares; SciPy maps to maxfev
+        self._fit_kwargs.update(fit_kwargs)
+
+        self.backend = "lmfit" if _HAS_LMFIT else "scipy"
 
         if dry:
-            self.popt = self.initial_full
+            self.popt = np.array(self.initial_full, dtype=float)
             self.pcov = np.full((len(self.popt), len(self.popt)), np.nan)
+            self._backend_result = None
         else:
             try:
-                fit_popt, fit_pcov = curve_fit(self._fit_model, self.coordinates, self.data,
-                                                p0=self.initial, bounds=self.bounds, sigma=self.sigma,
-                                                absolute_sigma=self.absolute_sigma, **use_fit_kwargs)
-                self.popt = self._reinsert_fixed(fit_popt)
-                self.pcov = self._reconstruct_cov(fit_pcov)
+                if _HAS_LMFIT:
+                    self._fit_with_lmfit()
+                else:
+                    self._fit_with_scipy()
             except Exception as e:
-                self.popt = [np.nan] * len(expected_keys)
-                logger.error(e, exc_info=True)
+                logger.error("Fit failed", exc_info=True)
+                self.popt = np.array([np.nan] * len(self.param_order))
+                self.pcov = np.full((len(self.param_order), len(self.param_order)), np.nan)
+                self._backend_result = None
 
         self._process_results()
+        self.result = CompatResult(self)
 
-        self.result=CompatResult(self)
-
+    # ----- abstract API -----
     @staticmethod
     def model(coordinates: np.ndarray, **params) -> np.ndarray:
-        """The model function to fit. Must be overridden by subclass."""
         raise NotImplementedError
 
     @staticmethod
     def guess(coordinates, data) -> Dict[str, Union[float, Dict[str, Any]]]:
-        """Provide initial parameter guesses. Must be overridden by subclass."""
         raise NotImplementedError
 
+    # ----- internals -----
     def _extract_param_order(self):
-        """Extract parameter names from model signature."""
         sig = inspect.signature(self.model)
         names = list(sig.parameters.keys())
         return names[1:] if names and names[0] in {"x", "coordinates"} else names
 
     def _parse_params(self):
-        """Parse parameter dictionary into internal fit structures."""
         self.initial = []
         self.bounds_lower = []
         self.bounds_upper = []
@@ -114,18 +156,9 @@ class FitterBase:
         self.initial_full = []
 
         for name in self.param_order:
-            raw = self.params_def[name]
-            if isinstance(raw, dict):
-                val = raw.get("value", 0.0)
-                fixed = raw.get("fixed", False)
-                bounds = raw.get("bounds", (-np.inf, np.inf))
-            else:
-                val = raw
-                fixed = False
-                bounds = (-np.inf, np.inf)
-
+            spec = self.params_def[name]
+            val, bounds, fixed = spec["value"], spec["bounds"], bool(spec["fixed"])
             self.initial_full.append(val)
-
             if fixed:
                 self.fixed_mask.append(True)
             else:
@@ -135,15 +168,15 @@ class FitterBase:
                 self.bounds_upper.append(bounds[1])
                 self.fit_order.append(name)
 
-        self.bounds = (np.array(self.bounds_lower), np.array(self.bounds_upper))
+        self.bounds = (np.array(self.bounds_lower, dtype=float),
+                       np.array(self.bounds_upper, dtype=float))
 
+    # ---------- SciPy backend ----------
     def _fit_model(self, coordinates, *fit_params):
-        """Internal callable passed to curve_fit."""
         full_params = self._reinsert_fixed(fit_params)
         return self.model(coordinates, **dict(zip(self.param_order, full_params)))
 
     def _reinsert_fixed(self, fit_params):
-        """Reinsert fixed parameters into the full parameter list."""
         full = []
         idx = 0
         for is_fixed, val in zip(self.fixed_mask, self.initial_full):
@@ -152,63 +185,133 @@ class FitterBase:
             else:
                 full.append(fit_params[idx])
                 idx += 1
-        return np.array(full)
+        return np.array(full, dtype=float)
 
     def _reconstruct_cov(self, fit_pcov):
-        """Reconstruct full covariance matrix including fixed parameters."""
         full_size = len(self.param_order)
-        full_pcov = np.full((full_size, full_size), np.nan)
+        full_pcov = np.full((full_size, full_size), np.nan, dtype=float)
         idxs = [i for i, fixed in enumerate(self.fixed_mask) if not fixed]
         for i_full, i_fit in zip(idxs, range(len(idxs))):
             for j_full, j_fit in zip(idxs, range(len(idxs))):
                 full_pcov[i_full, j_full] = fit_pcov[i_fit, j_fit]
         return full_pcov
 
+    def _fit_with_scipy(self):
+        # Map generic kwargs to curve_fit
+        cf_kwargs = {}
+        if "max_nfev" in self._fit_kwargs and "maxfev" not in self._fit_kwargs:
+            cf_kwargs["maxfev"] = self._fit_kwargs["max_nfev"]
+        cf_kwargs.update({k: v for k, v in self._fit_kwargs.items() if k not in {"max_nfev"}})
+        # A robust method by default (user can override via fit_kwargs)
+        cf_kwargs.setdefault("method", "dogbox")
+
+        fit_popt, fit_pcov = curve_fit(
+            self._fit_model,
+            self.coordinates,
+            self.data,
+            p0=self.initial if len(self.initial) else None,
+            bounds=self.bounds if len(self.initial) else (-np.inf, np.inf),
+            sigma=self.sigma,
+            absolute_sigma=self.absolute_sigma,
+            **cf_kwargs,
+        )
+        self.popt = self._reinsert_fixed(fit_popt)
+        self.pcov = self._reconstruct_cov(fit_pcov)
+        self._backend_result = ("scipy", {"popt": fit_popt, "pcov": fit_pcov})
+
+    # ---------- lmfit backend ----------
+    def _lmfit_params(self):
+        p = lmfit.Parameters()
+        for name in self.param_order:
+            spec = self.params_def[name]
+            val, (lo, hi), fixed = spec["value"], spec["bounds"], bool(spec["fixed"])
+            p.add(name, value=float(val), min=float(lo), max=float(hi), vary=not fixed)
+        return p
+
+    def _residual_lmfit(self, params: "lmfit.Parameters", coords, data, sigma):
+        vals = {name: params[name].value for name in self.param_order}
+        res = self.model(coords, **vals) - data
+        if sigma is not None:
+            # absolute_sigma semantics: we use sigma as true stdev to weight residuals
+            res = res / sigma
+        return res
+
+    def _fit_with_lmfit(self):
+        params = self._lmfit_params()
+        # Map a few user kwargs to lmfit.minimize (least_squares)
+        method = self._fit_kwargs.get("method", "least_squares")
+        max_nfev = self._fit_kwargs.get("max_nfev", 1000)
+
+        result = lmfit.minimize(
+            self._residual_lmfit,
+            params,
+            args=(self.coordinates, self.data, self.sigma),
+            method=method,
+            max_nfev=max_nfev,
+        )
+
+        # Extract best-fit values
+        self.popt = np.array([result.params[n].value for n in self.param_order], dtype=float)
+
+        # Build full covariance (if available, lmfit.covar is for varying params only)
+        if result.covar is not None and result.var_names is not None:
+            # Map var_names (only varied) into full square matrix
+            name_to_fit_idx = {n: i for i, n in enumerate(result.var_names)}
+            full_size = len(self.param_order)
+            full_pcov = np.full((full_size, full_size), np.nan, dtype=float)
+            for i_full, ni in enumerate(self.param_order):
+                if ni not in name_to_fit_idx:
+                    continue
+                ii = name_to_fit_idx[ni]
+                for j_full, nj in enumerate(self.param_order):
+                    if nj not in name_to_fit_idx:
+                        continue
+                    jj = name_to_fit_idx[nj]
+                    full_pcov[i_full, j_full] = result.covar[ii, jj]
+            self.pcov = full_pcov
+        else:
+            self.pcov = np.full((len(self.param_order), len(self.param_order)), np.nan, dtype=float)
+
+        self._backend_result = ("lmfit", result)
+
+    # ---------- post-processing ----------
     def _process_results(self):
-        """Process fit results into ufloat dictionary and compute residuals."""
         errs = (
             [np.nan] * len(self.popt)
             if self.pcov is None
             else np.sqrt(np.diag(self.pcov))
         )
         self.perr = errs
+        self.ufloat_results = {}
         for name, val, err in zip(self.param_order, self.popt, errs):
             self.ufloat_results[name] = ufloat(val, err)
 
         self.residuals = self.data - self.eval(self.coordinates)
-        self.r_squared = 1 - np.sum(self.residuals ** 2) / np.sum((self.data - np.mean(self.data)) ** 2)
+        denom = np.sum((self.data - np.mean(self.data)) ** 2)
+        self.r_squared = np.nan if denom == 0 else 1 - np.sum(self.residuals ** 2) / denom
         self.chi_squared = (
             np.sum(self.residuals ** 2 / self.sigma ** 2)
             if self.sigma is not None
             else np.sum(self.residuals ** 2)
         )
 
+        # Build the same printable summary string
         self.result_string = ""
         for k, v in self.ufloat_results.items():
             self.result_string += f"{k}: {v:.4g}\n"
         self.result_string = self.result_string[:-1]
 
-    def eval(self, coordinates: np.ndarray=None) -> np.ndarray:
-        """Evaluate the fitted model at given coordinates."""
+    # ---------- public helpers ----------
+    def eval(self, coordinates: np.ndarray = None) -> np.ndarray:
         if coordinates is None:
             coordinates = self.coordinates
         return self.model(coordinates, **dict(zip(self.param_order, self.popt)))
 
     def print(self):
-        """
-        print fitted result
-        """
         print(f"Fit result:")
         print(self.result_string)
 
     def plot(self, ax=None, oversample=5, data_kwargs=None, result_kwargs=None):
-        """
-        Plot the fitted model over a finer grid.
-
-        :param ax: Optional matplotlib axis. If None, creates a new figure.
-        :param oversample: Oversampling factor for fine plotting.
-        :param kwargs: Additional plot keyword args.
-        """
         if ax is None:
             fig, ax = plt.subplots(1, 1)
         else:
@@ -223,7 +326,7 @@ class FitterBase:
             ax.plot(self.coordinates, self.data, **data_kwargs_)
         else:
             ax.errorbar(self.coordinates, self.data, self.sigma, **data_kwargs_)
-        
+
         self.plot_fitted(ax=ax, oversample=oversample, **result_kwargs_)
         ax.legend()
         ax.grid(True)
@@ -231,13 +334,6 @@ class FitterBase:
         return fig, ax
 
     def plot_fitted(self, ax=None, oversample=5, **kwargs):
-        """
-        Plot the fitted model over a finer grid.
-
-        :param ax: Optional matplotlib axis. If None, creates a new figure.
-        :param oversample: Oversampling factor for fine plotting.
-        :param kwargs: Additional plot keyword args.
-        """
         if ax is None:
             fig, ax = plt.subplots(1, 1)
         else:
@@ -254,27 +350,9 @@ class FitterBase:
 class CompatResult:
     def __init__(self, fitter: FitterBase):
         """
-        Lightweight mock of lmfit's Result object to maintain compatibility
-        with older code expecting .eval() and .params.
-
-        :param fitter: A fitted FitterBase instance providing the needed methods/attributes.
+        Lightweight mock to keep old code working:
+        - .eval() -> uses fitter.eval
+        - .params -> dict of ufloat results
         """
         self.eval = fitter.eval
         self.params = fitter.ufloat_results
-
-
-if __name__ == "__main__":
-    from acadia_qmsmt.analysis.fitting import Cosine
-
-    # generate fake data
-    x = np.linspace(-0, 1, 100)
-    y_true = 1.5 * np.cos(20 * x + 5)
-    y_data = y_true + 0.1 * np.random.randn(len(x))
-
-    # do fit
-    # fit = Cosine(x, y_data)
-    # if want to adjust guess parameter
-    fit = Cosine(x, y_data, params={"f": {"value":5, "fixed": True}, "A": {"value": 2, "bounds":(1, np.inf)}})
-    fit.print()
-    fit.plot()
-    plt.show()

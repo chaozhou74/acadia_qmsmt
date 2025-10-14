@@ -24,6 +24,7 @@ class Lorentzian(FitterBase):
 
         max_mag = np.max(data) - np.min(data)
         A = {"value": A, "bounds":(-max_mag*2, max_mag*2)}
+        x0 = {"value": x0, "bounds": (np.min(coordinates), np.max(coordinates))}
 
 
         return dict(A=A, x0=x0, k=k, of=of)
