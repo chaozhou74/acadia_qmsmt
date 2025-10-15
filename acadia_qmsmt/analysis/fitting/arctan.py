@@ -19,13 +19,13 @@ class Arctan(FitterBase):
         offset_guess = np.median(smoothed_data[:5]) + scale_guess * np.pi/2
 
         if scale_guess < 0:
-            scale_bound = (scale_guess*2 ,0)
+            scale_min, scale_max = scale_guess*2 ,0
         else:
-            scale_bound = (0, scale_guess*2)
+            scale_min, scale_max = 0, scale_guess*2
         return {
-            "x0": {"value": x0_guess, "bounds": (coordinates[0], coordinates[-1])},
-            "A": {"value": scale_guess, "bounds": scale_bound},
-            "w": {"value": w_guess, "bounds": (coordinates[1] - coordinates[0], coordinates[-1] - coordinates[0])},
+            "x0": {"value": x0_guess, "min": coordinates[0], "max": coordinates[-1]},
+            "A": {"value": scale_guess, "min": scale_min, "max": scale_max},
+            "w": {"value": w_guess, "min": coordinates[1] - coordinates[0], "max": coordinates[-1] - coordinates[0]},
             "of": {"value": offset_guess},
         }
 
@@ -50,6 +50,7 @@ class ArctanTilt(FitterBase):
 
         # use same guess as a normal arctan with the slope part removed
         arctan_guesses = Arctan.guess(coordinates,  data - slope_guess * (coordinates - coordinates[0]))
-        arctan_guesses["slope"] = {"value": slope_guess, "bounds": (slope_guess- abs(slope_guess)*0.001, slope_guess + abs(slope_guess)*0.001)}
+        arctan_guesses["slope"] = {"value": slope_guess, "min": slope_guess- abs(slope_guess)*0.001,
+                                   "max":slope_guess + abs(slope_guess)*0.001}
         return arctan_guesses
 

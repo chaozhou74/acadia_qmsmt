@@ -15,5 +15,5 @@ class ExponentialKappa(FitterBase):
         of = data[-1]
         A = data[0] - data[-1]
         kappa_ = 4./(coordinates[-1] - coordinates[0])
-        kappa = {"value": kappa_, "bounds": (1e-10, np.inf)}
+        kappa = {"value": kappa_, "min": 1e-10}
         return dict(A=A, kappa=kappa, of=of)

@@ -15,5 +15,5 @@ class Exponential(FitterBase):
         of = data[-1]
         A = data[0] - data[-1]
         tau_ = (coordinates[-1] - coordinates[0])/3
-        tau = {"value": tau_, "bounds": (1e-10, np.inf)}
+        tau = {"value": tau_, "min": (coordinates[1]-coordinates[0])/10}
         return dict(A=A, tau=tau, of=of)

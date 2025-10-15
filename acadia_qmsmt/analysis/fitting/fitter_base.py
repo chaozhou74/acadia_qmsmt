@@ -142,13 +142,20 @@ class FitterBase:
             if name not in self.params_guess:
                 raise ValueError(f"Missing guess parameter {name}")
             self._parse_params(param, self.params_guess[name])
-            if name in self.params_supplied: # overwrite with supplied parameter
+            if name in self.params_supplied: # overwrite guess with supplied parameter
                 self._parse_params(param, self.params_supplied[name])
 
     def _parse_params(self, lmfit_param:lmfit.Parameter, param_spec):
         if isinstance(param_spec, dict):
             val = param_spec.get("value")
-            lo, hi = param_spec.get("bounds", [None, None])
+            if "bounds" in param_spec and ("min" in param_spec or "max" in param_spec):
+                # we really should just stick to min/max here but there are too many old codes that uses bounds.
+                logger.warning(f"Both 'bounds' and 'min'/'max' are provided in parameter, using min/max")
+            lo, hi = param_spec.get("min", None), param_spec.get("max", None)
+            bounds = param_spec.get("bounds", [None, None])
+            lo = bounds[0] if lo is None else lo # ignore bounds if min is set
+            hi = bounds[1] if hi is None else hi
+
             fixed = param_spec.get("fixed")
             lmfit_param.set(value=val, min=lo, max=hi, vary=None if fixed is None else not fixed)
         else:

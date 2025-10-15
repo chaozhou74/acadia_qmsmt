@@ -19,7 +19,7 @@ class DrivenDecoherence(FitterBase):
         phi = np.angle(fft_val[idx])
         tau_1 = (1 / 4.0) * (coordinates[-1] - coordinates[0])
         tau_phi = (1 / 2.0) * (coordinates[-1] - coordinates[0])
-        kappa_1 = {"value": 1./tau_1, "bounds": (1e-10, np.inf)}
-        kappa_phi = {"value": 1./tau_phi, "bounds": (1e-10, np.inf)}
+        kappa_1 = {"value": 1./tau_1, "min": 1e-10}
+        kappa_phi = {"value": 1./tau_phi, "min": 1e-10}
 
         return dict(A=A, f=f, phi=phi, kappa_1=kappa_1,kappa_phi=kappa_phi, of=of)

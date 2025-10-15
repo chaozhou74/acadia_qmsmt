@@ -28,5 +28,5 @@ class ExpCosine(FitterBase):
 
 
         tau_ = (1 / 4.0) * (coordinates[-1] - coordinates[0])
-        tau = {"value": tau_, "bounds": (1e-10, np.inf)}
+        tau = {"value": tau_, "min": (coordinates[1]-coordinates[0])/10}
         return dict(A=A, f=f, phi=phi, tau=tau, of=of)
