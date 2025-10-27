@@ -158,6 +158,10 @@ class BSChevronRuntime(QMsmtRuntime):
         # do fft on line cuts
         from acadia_qmsmt.analysis import fft
         self.fft_freqs, self.fft_data= fft(self.flat_length_list, self.avg, axis=1, remove_zero_freq=True)
+        
+        # for plot title
+        self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")    
+        self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")    
 
         return completed_iterations
 
@@ -170,6 +174,7 @@ class BSChevronRuntime(QMsmtRuntime):
         fig.colorbar(pcm, ax=axs, label="epop")
         axs.set_xlabel("BS freq (GHz)")
         axs.set_ylabel("Time (us)")
+        axs.set_title(f"bs_scale: {self.bs_scale:.4g}, VOP: {self.bs_vop}")
         fig.tight_layout()
         return fig, axs
 
