@@ -105,9 +105,6 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
     :return:
     """
     fig, ax = prepare_plot_axes(plot_ax, axs_shape=(1, 1), figsize=figsize)
-    pcm = ax.pcolormesh(sweep_freqs, fft_freqs, fft_data.T, cmap="inferno", shading="auto")
-    fig.colorbar(pcm, ax=ax)
-
     ax.set_ylabel("FFT Frequency")
     ax.set_title(f"FFT of time signal")
     if not root_quadratic_fit:
@@ -128,7 +125,11 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
     x_peak = sweep_freqs[peak_mask]
     freq_peak = fft_freqs[fft_max_idxes][peak_mask]
 
-    ax.plot(x_peak, freq_peak, 'w.', label="Peak Trace", linestyle='')
+
+    
+    pcm = ax.pcolormesh(sweep_freqs, fft_freqs, fft_data.T, cmap="inferno", shading="auto")
+    fig.colorbar(pcm, ax=ax)
+    # ax.plot(x_peak, freq_peak, 'w.', label="Peak Trace", linestyle='')
 
     # guess freq scale based on the relative values of x and y
     if freq_scale is None:
@@ -138,23 +139,34 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
     def _fit_model(f, f0, g):
         return np.sqrt(g**2 + (f-f0)**2 * freq_scale**2)
 
+    center_freq = None
+    swap_time = None
     if len(x_peak) >= 3:
         p0 = (x_peak[np.argmin(freq_peak)], np.min(freq_peak))
         bounds = ((np.min(x_peak), 0), (np.max(x_peak), np.max(freq_peak)))
         popt, pcov = curve_fit(_fit_model, x_peak, freq_peak, p0=p0, bounds=bounds)
 
 
-        title_text = f"On-resonance Freq: {popt[0]:.3e}   g: {popt[1] / 2:.3e}"
+        center_freq = popt[0]
+        swap_time = 1/(popt[1]*2) if popt[1] != 0 else np.inf
+        title_text = f"On-resonance Freq: {popt[0]:.5g} GHz   g: {popt[1] / 2:.5g} MHz, Tswap: {swap_time*1e3:.3g} ns"
         ax.set_title(f"FFT of time signal\n{title_text}")
 
         fine_x = np.linspace(sweep_freqs[0], sweep_freqs[-1], 200)
-        ax.plot(fine_x, _fit_model(fine_x, *popt), 'w--', label="Parabolic Fit")
+        ax.plot(fine_x, _fit_model(fine_x, *popt), 'w--', label="Parabolic Fit", linewidth=1)
         ax.axvline(popt[0], linestyle='dotted', color='w', label="On-Resonance")
     else:
         ax.set_title("FFT of time signal\n(Not enough peak data to fit parabola)")
     ax.set_ylim(min(fft_freqs), max(fft_freqs))
     fig.tight_layout()
 
+    params={
+        "center_freq": center_freq,
+        "swap_time": swap_time,
+    }
+
+
+    return fig, ax, params
     return fig, ax
 
 

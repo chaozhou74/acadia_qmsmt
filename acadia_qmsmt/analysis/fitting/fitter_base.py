@@ -1,29 +1,36 @@
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union, Literal
 import inspect
 import logging
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from uncertainties import ufloat
+import lmfit
 
 logger = logging.getLogger(__name__)
 
+
 class FitterBase:
     """
-    Base class for fitting data using scipy.optimize.curve_fit with named parameter support,
-    optional fixed parameters, uncertainty tracking, and plotting utilities.
+    Base class for fitting data using lmfit, with named parameter support, optional fixed parameters,
+    uncertainty tracking, and plotting utilities.
 
     Subclasses must implement:
     - `model(coordinates, **params)`: the model function to be fitted
     - `guess(coordinates, data)`: initial parameter guesses as a dict
     """
 
-    def __init__(self, coordinates: np.ndarray, data: np.ndarray,
-                 sigma: Optional[np.ndarray] = None,
-                 params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None, 
-                 dry: bool = False, absolute_sigma: bool = True, **fit_kwargs):
+    def __init__(
+        self,
+        coordinates: np.ndarray,
+        data: np.ndarray,
+        sigma: Optional[np.ndarray] = None,
+        params: Optional[Dict[str, Union[float, Dict[str, Any]]]] = None,
+        sigma_floor_frac: float = 0.01,
+        error_model: Literal["auto", "binomial", "wls"]="auto",
+        **fit_kwargs
+    ):
         """
-
         :param coordinates: Independent variable(s), passed to the model.
         :param data: Measured dependent data.
         :param sigma: Optional standard deviations of data for weighted fit.
@@ -33,182 +40,266 @@ class FitterBase:
                         - 'value': initial guess
                         - 'bounds': (lower, upper)
                         - 'fixed': True if parameter should not be varied
-        :param dry: If True, do not perform the fit; just use initial guesses.
-        :param absolute_sigma: If True, errors are treated as absolute in uncertainty calc.
-        :param fit_kwargs: Additional keyword arguments for `curve_fit`.
+        :param sigma_floor_frac:
+            Fractional floor applied to `sigma` values to avoid numerical instabilities.
+            Each `sigma` is clipped such that
+            `sigma >= max(mean(|sigma|) * sigma_floor_frac, eps)`.
+
+        :param error_model:
+            Specifies how measurement uncertainty is handled. Options are:
+                - **"wls"**: Weighted least squares. Uses `sigma` as absolute standard deviations
+                  (weights = 1/sigma).
+                - **"binomial"**: Binomial deviance model. Gives more robust fitting when the data are readout shots, in
+                  which case the distribution is Bernoulli, so the variance is largest at y=0.5
+                  If counts `k` and `N` are not provided, they will be inferred from the mean and `sigma`.
+                - **"auto"**: Automatically chooses `"binomial"` when all `|data| <= 1`, otherwise `"wls"`.
+            This choice affects both the residual definition and how uncertainties are propagated.
+
+        :param fit_kwargs:
+            Additional keyword arguments forwarded to the underlying optimizer (`lmfit.minimize`).
+            Common keys include:
+                - **method** (str): Optimization method (default `"least_squares"`).
+                - **max_nfev** (int): Maximum number of function evaluations (default 1000).
+                - **k**, **N**: Optional binomial counts per data point, used only when
+                  `error_model="binomial"`.
         """
         self.coordinates = np.array(coordinates)
         self.data = np.array(data)
         if sigma is not None:
-            sigma = np.clip(sigma, np.mean(sigma/1e10), np.inf) 
+            sigma = np.asarray(sigma, dtype=float)
+            floor = max(np.mean(np.abs(sigma)) * sigma_floor_frac, np.finfo(float).eps)
+            sigma = np.clip(sigma, floor, np.inf)
         self.sigma = sigma
-        self.absolute_sigma = absolute_sigma
 
-        self.param_order = self._extract_param_order()
-        params = {} if params is None else params
-        self.params_def = self.guess(self.coordinates, self.data)
-        self.params_def.update(params)
 
-        # Validate provided param keys match expected
-        provided_keys = set(self.params_def.keys())
-        expected_keys = set(self.param_order)
-        missing = expected_keys - provided_keys
-        extra = provided_keys - expected_keys
-        if missing:
-            raise ValueError(f"Missing parameters for model: {missing}")
-        if extra:
-            raise ValueError(f"Unexpected parameters not used by model: {extra}")
+        self.params_supplied = {} if params is None else params
+        self.params_guess = self.guess(self.coordinates, self.data)
+        self._lmfit_params:lmfit.Parameters = None
+        self._make_lmfit_params()
+        self.param_order = list(self._lmfit_params.keys())
 
-        self._parse_params()
 
         self.popt = None
         self.pcov = None
         self.perr = None
         self.ufloat_results = {}
 
-        # default settings
-        use_fit_kwargs = {"maxfev": 1000, "method": "dogbox"}  # trf or 'dogbox' for more robust fitting but slower
-        use_fit_kwargs.update(fit_kwargs)
+        # Default optimizer kwargs (used by whichever backend)
+        self._fit_kwargs = {"max_nfev": 1000}  # for lmfit least_squares; SciPy maps to maxfev
+        self._fit_kwargs.update(fit_kwargs)
 
-        if dry:
-            self.popt = self.initial_full
-            self.pcov = np.full((len(self.popt), len(self.popt)), np.nan)
+
+        self.error_model = self._decide_error_model() if error_model=="auto" else error_model
+        # optional counts for binomial model
+        self._binom_k = self._fit_kwargs.pop("k", None)
+        self._binom_N = self._fit_kwargs.pop("N", None)
+        self._last_residuals = None  # for diagnostics / chi2 reporting
+        if self.error_model == "binomial":
+            self.residual_fn = lambda p, x, y, s: self._residual_binomial_deviance(
+                p, x, y, s, k=self._binom_k, N=self._binom_N
+            )
         else:
-            try:
-                fit_popt, fit_pcov = curve_fit(self._fit_model, self.coordinates, self.data,
-                                                p0=self.initial, bounds=self.bounds, sigma=self.sigma,
-                                                absolute_sigma=self.absolute_sigma, **use_fit_kwargs)
-                self.popt = self._reinsert_fixed(fit_popt)
-                self.pcov = self._reconstruct_cov(fit_pcov)
-            except Exception as e:
-                self.popt = [np.nan] * len(expected_keys)
-                logger.error(e, exc_info=True)
+            self.residual_fn = self._residual_wls
+
+        try:
+            self._fit_with_lmfit()
+        except Exception as e:
+            logger.error("Fit failed", exc_info=True)
+            self.popt = np.array([np.nan] * len(self.param_order))
+            self.pcov = np.full((len(self.param_order), len(self.param_order)), np.nan)
+            self._backend_result = None
 
         self._process_results()
+        self.result = CompatResult(self)
 
-        self.result=CompatResult(self)
-
+    # ----- abstract API -----
     @staticmethod
     def model(coordinates: np.ndarray, **params) -> np.ndarray:
-        """The model function to fit. Must be overridden by subclass."""
         raise NotImplementedError
 
     @staticmethod
     def guess(coordinates, data) -> Dict[str, Union[float, Dict[str, Any]]]:
-        """Provide initial parameter guesses. Must be overridden by subclass."""
         raise NotImplementedError
 
-    def _extract_param_order(self):
-        """Extract parameter names from model signature."""
-        sig = inspect.signature(self.model)
-        names = list(sig.parameters.keys())
-        return names[1:] if names and names[0] in {"x", "coordinates"} else names
+    # ----- internals -----
+    def _decide_error_model(self)-> Literal["binomial", "wls"]:
+        """
+        decide the error model to use for the fitting based on the provided data
+        Currently just assumes if the abs value of data are <=1 then we are taking shots, so it is binomial.
+        Can be improved to smarter strategy later.
+        """
+        # If user passes k/N, or data are clearly proportions in (0,1), assume binomial.
+        if self._fit_kwargs.get("k") is not None or self._fit_kwargs.get("N") is not None:
+            return "binomial"
+        y = np.asarray(self.data)
+        if np.all(abs(y)<=1):
+            return "binomial"
+        return "wls"
 
-    def _parse_params(self):
-        """Parse parameter dictionary into internal fit structures."""
-        self.initial = []
-        self.bounds_lower = []
-        self.bounds_upper = []
-        self.fixed_mask = []
-        self.fit_order = []
-        self.initial_full = []
+    def _make_lmfit_params(self):
+        self._lmfit_params = lmfit.Model(self.model).make_params()
+        for name, param in self._lmfit_params.items():
+            if name not in self.params_guess:
+                raise ValueError(f"Missing guess parameter {name}")
+            self._parse_params(param, self.params_guess[name])
+            if name in self.params_supplied: # overwrite guess with supplied parameter
+                self._parse_params(param, self.params_supplied[name])
 
-        for name in self.param_order:
-            raw = self.params_def[name]
-            if isinstance(raw, dict):
-                val = raw.get("value", 0.0)
-                fixed = raw.get("fixed", False)
-                bounds = raw.get("bounds", (-np.inf, np.inf))
-            else:
-                val = raw
-                fixed = False
-                bounds = (-np.inf, np.inf)
+    def _parse_params(self, lmfit_param:lmfit.Parameter, param_spec):
+        if isinstance(param_spec, dict):
+            val = param_spec.get("value")
+            if "bounds" in param_spec and ("min" in param_spec or "max" in param_spec):
+                # we really should just stick to min/max here but there are too many old codes that uses bounds.
+                logger.warning(f"Both 'bounds' and 'min'/'max' are provided in parameter, using min/max")
+            lo, hi = param_spec.get("min", None), param_spec.get("max", None)
+            bounds = param_spec.get("bounds", [None, None])
+            lo = bounds[0] if lo is None else lo # ignore bounds if min is set
+            hi = bounds[1] if hi is None else hi
 
-            self.initial_full.append(val)
+            fixed = param_spec.get("fixed")
+            lmfit_param.set(value=val, min=lo, max=hi, vary=None if fixed is None else not fixed)
+        else:
+            lmfit_param.set(value=param_spec)
 
-            if fixed:
-                self.fixed_mask.append(True)
-            else:
-                self.fixed_mask.append(False)
-                self.initial.append(val)
-                self.bounds_lower.append(bounds[0])
-                self.bounds_upper.append(bounds[1])
-                self.fit_order.append(name)
+    # ------- residual functions --------------
+    def _clip_prob(self, p, eps=1e-12):
+        return np.clip(p, eps, 1 - eps)
 
-        self.bounds = (np.array(self.bounds_lower), np.array(self.bounds_upper))
+    def _residual_wls(self, params, coords, data, sigma):
+        vals = {name: params[name].value for name in self.param_order}
+        res = self.model(coords, **vals) - data
+        if sigma is not None:
+            res = res / sigma
+        return res
 
-    def _fit_model(self, coordinates, *fit_params):
-        """Internal callable passed to curve_fit."""
-        full_params = self._reinsert_fixed(fit_params)
-        return self.model(coordinates, **dict(zip(self.param_order, full_params)))
+    def _infer_counts_from_mean_sigma(self, y, sigma):
+        """
+        Infer effective counts (N_eff, k_eff) from mean y and its SE sigma.
+        Using sigma^2 ≈ y(1-y)/N  =>  N ≈ y(1-y)/sigma^2,  k = N*y.
+        Clipped to avoid pathologies near 0/1 and tiny sigmas.
+        """
+        y = np.asarray(y, float)
+        sigma = np.asarray(sigma, float)
+        y_c = np.clip(y, 1e-6, 1 - 1e-6)
+        var = np.maximum(sigma**2, 1e-24)
+        N_eff = y_c * (1.0 - y_c) / var
+        # Cap ridiculously large N from tiny sigma to stabilize logs:
+        N_eff = np.clip(N_eff, 1.0, 1e12)
+        k_eff = N_eff * y_c
+        return k_eff, N_eff
 
-    def _reinsert_fixed(self, fit_params):
-        """Reinsert fixed parameters into the full parameter list."""
-        full = []
-        idx = 0
-        for is_fixed, val in zip(self.fixed_mask, self.initial_full):
-            if is_fixed:
-                full.append(val)
-            else:
-                full.append(fit_params[idx])
-                idx += 1
-        return np.array(full)
+    def _residual_binomial_deviance(self, params, coords, data, sigma, k=None, N=None):
+        """
+        Binomial deviance residuals:
+        r_i = sign(k - N p) * sqrt( 2 [ k log(k/(N p)) + (N-k) log((N-k)/(N(1-p))) ] )
+        with 0*log(0)=0 and p clipped to (0,1).
+        If k,N not supplied, infer from (y=data, sigma).
+        """
+        theta = {name: params[name].value for name in self.param_order}
+        p = self._clip_prob(self.model(coords, **theta))
 
-    def _reconstruct_cov(self, fit_pcov):
-        """Reconstruct full covariance matrix including fixed parameters."""
-        full_size = len(self.param_order)
-        full_pcov = np.full((full_size, full_size), np.nan)
-        idxs = [i for i, fixed in enumerate(self.fixed_mask) if not fixed]
-        for i_full, i_fit in zip(idxs, range(len(idxs))):
-            for j_full, j_fit in zip(idxs, range(len(idxs))):
-                full_pcov[i_full, j_full] = fit_pcov[i_fit, j_fit]
-        return full_pcov
+        if k is None or N is None:
+            if sigma is None:
+                # no counts and no sigma -> fall back to WLS/unweighted
+                return self._residual_wls(params, coords, data, sigma=None)
+            k, N = self._infer_counts_from_mean_sigma(data, sigma)
 
+        k = np.asarray(k, float); N = np.asarray(N, float)
+        mu = N * p
+        # terms with safe 0*log(0) handling
+        t1 = np.where(k > 0, k * np.log(np.maximum(k, 1e-300) / np.maximum(mu, 1e-300)), 0.0)
+        t2 = np.where((N - k) > 0,
+                    (N - k) * np.log(np.maximum(N - k, 1e-300) / np.maximum(N - mu, 1e-300)),
+                    0.0)
+        dev = 2.0 * (t1 + t2)
+        res = np.sign(k - mu) * np.sqrt(np.maximum(dev, 0.0))
+        return res
+
+
+    # ---------- lmfit backend ----------
+    def _fit_with_lmfit(self):
+        params = self._lmfit_params
+        method = self._fit_kwargs.get("method", "least_squares")
+        max_nfev = self._fit_kwargs.get("max_nfev", 1000)
+
+        result = lmfit.minimize(
+            self.residual_fn,
+            params,
+            args=(self.coordinates, self.data, self.sigma),
+            method=method,
+            max_nfev=max_nfev,
+            scale_covar=(self.error_model != "wls" or self.sigma is None)
+        )
+
+        # save latest residuals for reporting
+        try:
+            self._last_residuals = self.residual_fn(
+                result.params, self.coordinates, self.data, self.sigma
+            )
+        except Exception:
+            self._last_residuals = None
+
+        # Extract best-fit values
+        self.popt = np.array([result.params[n].value for n in self.param_order], dtype=float)
+
+        # Expand covariance as before
+        if result.covar is not None and result.var_names is not None:
+            name_to_fit_idx = {n: i for i, n in enumerate(result.var_names)}
+            full_size = len(self.param_order)
+            full_pcov = np.full((full_size, full_size), np.nan, dtype=float)
+            for i_full, ni in enumerate(self.param_order):
+                ii = name_to_fit_idx.get(ni, None)
+                if ii is None:
+                    continue
+                for j_full, nj in enumerate(self.param_order):
+                    jj = name_to_fit_idx.get(nj, None)
+                    if jj is None:
+                        continue
+                    full_pcov[i_full, j_full] = result.covar[ii, jj]
+            self.pcov = full_pcov
+        else:
+            self.pcov = np.full((len(self.param_order), len(self.param_order)), np.nan, dtype=float)
+
+        self._backend_result = ("lmfit", result)
+
+
+    # ---------- post-processing ----------
     def _process_results(self):
-        """Process fit results into ufloat dictionary and compute residuals."""
-        errs = (
-            [np.nan] * len(self.popt)
-            if self.pcov is None
-            else np.sqrt(np.diag(self.pcov))
-        )
+        errs = ([np.nan] * len(self.popt) if self.pcov is None
+                else np.sqrt(np.diag(self.pcov)))
         self.perr = errs
-        for name, val, err in zip(self.param_order, self.popt, errs):
-            self.ufloat_results[name] = ufloat(val, err)
+        self.ufloat_results = {n: ufloat(v, e) for n, v, e in zip(self.param_order, self.popt, errs)}
 
-        self.residuals = self.data - self.eval(self.coordinates)
-        self.r_squared = 1 - np.sum(self.residuals ** 2) / np.sum((self.data - np.mean(self.data)) ** 2)
-        self.chi_squared = (
-            np.sum(self.residuals ** 2 / self.sigma ** 2)
-            if self.sigma is not None
-            else np.sum(self.residuals ** 2)
-        )
+        yfit = self.eval(self.coordinates)
+        self.residuals = self.data - yfit
+
+        denom = np.sum((self.data - np.mean(self.data)) ** 2)
+        self.r_squared = np.nan if denom == 0 else 1 - np.sum(self.residuals ** 2) / denom
+
+        if self.error_model == "binomial" and self._last_residuals is not None:
+            # Sum of squares of deviance residuals = model deviance
+            self.chi_squared = float(np.sum(self._last_residuals**2))
+        else:
+            self.chi_squared = (np.sum(self.residuals ** 2 / self.sigma ** 2)
+                                if self.sigma is not None else np.sum(self.residuals ** 2))
 
         self.result_string = ""
         for k, v in self.ufloat_results.items():
             self.result_string += f"{k}: {v:.4g}\n"
         self.result_string = self.result_string[:-1]
 
-    def eval(self, coordinates: np.ndarray=None) -> np.ndarray:
-        """Evaluate the fitted model at given coordinates."""
+
+    # ---------- public helpers ----------
+    def eval(self, coordinates: np.ndarray = None) -> np.ndarray:
         if coordinates is None:
             coordinates = self.coordinates
         return self.model(coordinates, **dict(zip(self.param_order, self.popt)))
 
     def print(self):
-        """
-        print fitted result
-        """
         print(f"Fit result:")
         print(self.result_string)
 
     def plot(self, ax=None, oversample=5, data_kwargs=None, result_kwargs=None):
-        """
-        Plot the fitted model over a finer grid.
-
-        :param ax: Optional matplotlib axis. If None, creates a new figure.
-        :param oversample: Oversampling factor for fine plotting.
-        :param kwargs: Additional plot keyword args.
-        """
         if ax is None:
             fig, ax = plt.subplots(1, 1)
         else:
@@ -223,7 +314,7 @@ class FitterBase:
             ax.plot(self.coordinates, self.data, **data_kwargs_)
         else:
             ax.errorbar(self.coordinates, self.data, self.sigma, **data_kwargs_)
-        
+
         self.plot_fitted(ax=ax, oversample=oversample, **result_kwargs_)
         ax.legend()
         ax.grid(True)
@@ -231,13 +322,6 @@ class FitterBase:
         return fig, ax
 
     def plot_fitted(self, ax=None, oversample=5, **kwargs):
-        """
-        Plot the fitted model over a finer grid.
-
-        :param ax: Optional matplotlib axis. If None, creates a new figure.
-        :param oversample: Oversampling factor for fine plotting.
-        :param kwargs: Additional plot keyword args.
-        """
         if ax is None:
             fig, ax = plt.subplots(1, 1)
         else:
@@ -254,27 +338,9 @@ class FitterBase:
 class CompatResult:
     def __init__(self, fitter: FitterBase):
         """
-        Lightweight mock of lmfit's Result object to maintain compatibility
-        with older code expecting .eval() and .params.
-
-        :param fitter: A fitted FitterBase instance providing the needed methods/attributes.
+        Lightweight mock to keep old code working:
+        - .eval() -> uses fitter.eval
+        - .params -> dict of ufloat results
         """
         self.eval = fitter.eval
         self.params = fitter.ufloat_results
-
-
-if __name__ == "__main__":
-    from acadia_qmsmt.analysis.fitting import Cosine
-
-    # generate fake data
-    x = np.linspace(-0, 1, 100)
-    y_true = 1.5 * np.cos(20 * x + 5)
-    y_data = y_true + 0.1 * np.random.randn(len(x))
-
-    # do fit
-    # fit = Cosine(x, y_data)
-    # if want to adjust guess parameter
-    fit = Cosine(x, y_data, params={"f": {"value":5, "fixed": True}, "A": {"value": 2, "bounds":(1, np.inf)}})
-    fit.print()
-    fit.plot()
-    plt.show()

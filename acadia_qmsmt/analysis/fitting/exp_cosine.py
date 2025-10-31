@@ -27,6 +27,6 @@ class ExpCosine(FitterBase):
         phi = np.arctan2(-C, B)  # minus sign to convert sin to cos form
 
 
-        tau_ = (1 / 4.0) * (coordinates[-1] - coordinates[0])
-        tau = {"value": tau_, "bounds": (1e-10, np.inf)}
+        tau_ = (1 / 3.0) * (coordinates[-1] - coordinates[0])
+        tau = {"value": tau_, "min": (coordinates[1]-coordinates[0])/10}
         return dict(A=A, f=f, phi=phi, tau=tau, of=of)
