@@ -3,6 +3,8 @@ import math
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axis import Axis
+import matplotlib.colors as mcolors
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -165,3 +167,151 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
 
 
     return fig, ax, params
+    return fig, ax
+
+
+def plot_histogram(val_dict, err_dict = None, plot_axs=None, add_labels=True):
+    """ Plot a histogram of values for a given set of measured value dict, with optional error bars.
+    """
+    fig, axs = prepare_plot_axes(plot_axs)
+
+    bar_xaxis = list(val_dict.keys())
+    vals =  list(val_dict.values())
+    errs = [err_dict[axis] for axis in bar_xaxis] if err_dict is not None else None
+
+    bars = axs.bar(bar_xaxis, vals, yerr=errs)
+    if add_labels:
+        for bar in bars:
+            height = np.round(bar.get_height(), 4)
+            va = 'bottom' if height > 0 else 'top'
+            axs.text(bar.get_x() + bar.get_width() / 2, height, f'{height}', ha='center', va=va)
+        
+    axs.grid(1)
+    return fig, axs
+
+
+# ----------------- for density matrix visualizaiton ----------------------------
+def cmap2d_hsv(w):
+    cmap = plt.get_cmap("hsv")
+    rgba = np.array(cmap((np.angle(w) / (2 * np.pi) + 0.5) % 1.0))
+    rgba[..., -1] = np.abs(w)
+    return rgba
+
+
+def cmap2d_balanced(z):
+    """
+    Map complex z -> RGBA; complex z should have amplitude between 0 and1
+    - RGB from custom balanced cyclic phase colormap
+    - alpha from |z| 
+    """
+    
+    # some anchor colors picked by gpt... suppose to be perceptually uniform to human eye
+    anchors = np.array([
+        [0.30, 0.35, 0.80],  # indigo / deep blue
+        [0.20, 0.65, 0.75],  # teal-cyan
+        [0.85, 0.70, 0.20],  # amber / goldenrod (not neon yellow)
+        [0.75, 0.30, 0.60],  # magenta/rose
+        [0.30, 0.35, 0.80],  # wrap back to deep blue
+    ])
+    
+    # Build a continuous colormap through these anchors
+    x = np.linspace(0, 1, len(anchors))
+    cdict = {
+        "red": [(x[i], anchors[i, 0], anchors[i, 0]) for i in range(len(anchors))],
+        "green": [(x[i], anchors[i, 1], anchors[i, 1]) for i in range(len(anchors))],
+        "blue": [(x[i], anchors[i, 2], anchors[i, 2]) for i in range(len(anchors))],
+    }
+    cmap = LinearSegmentedColormap("phase_balanced_cyclic", cdict)
+
+    z = np.asarray(z)
+    phase = np.angle(z)               
+    phase01 = (phase + np.pi) / (2*np.pi)
+
+    rgb = np.array(cmap(phase01))[..., :3]
+    alpha = np.clip(np.abs(z), 0.0, 1.0)[..., None]
+
+    rgba = np.concatenate([rgb, alpha], axis=-1)
+    return rgba
+
+def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max_amp=1, add_cbar=True):
+    """
+    Plot a density matrix `rho` on a 2D grid. Each matrix element is drawn as a square
+    and colored by `cmap_2d`.
+
+    :param rho: Density matrix to visualize. Expected shape (dim, dim), complex.
+    :param plot_ax: Axes to draw on. If None, a new figure/axes will be created.
+    :param cmap_2d: Function that maps a complex number (or array of complex numbers) to RGBA.
+    :param max_amp: Maximum amplitude of elements in the density matrix, for normalzing the max amplitude before color mapping
+    :param add_cbar:  when True, make a coloar bar based on `cmap`
+
+    """
+    from acadia_qmsmt.analysis.tomography import _digits_in_base
+    rho = np.array(rho)
+    dim = rho.shape[0]
+    n_qubits = int(np.sqrt(dim))
+    basis_labels = ["".join(row.astype(str)) for row in _digits_in_base(2, n_qubits)]
+    
+    cmap_2d = cmap2d_balanced if cmap_2d is None else cmap_2d
+    
+    fig, plot_ax = prepare_plot_axes(plot_ax)
+    
+    plot_ax.fill(np.array([0, dim, dim, 0]), np.array([0, 0, dim, dim]), color='white')
+    
+    def blob(x, y, z, ax):
+        hs = 1 / 2
+        xcorners = np.array([x - hs, x + hs, x + hs, x - hs])
+        ycorners = np.array([y - hs, y - hs, y + hs, y + hs])
+        ax.fill(xcorners, ycorners, color=cmap_2d(z / max_amp))
+    
+    def make_phase_cmap_from_cmap2d(cmap2d_func):
+        """
+        Take a complex->RGBA mapper (like cmap2d_hsv) and build
+        a phase-only ListedColormap over [-pi, pi].
+        """
+        phases = np.linspace(-np.pi, np.pi, 256)
+        rgba = cmap2d_func(np.exp(1j * phases))
+        # rgba is (256,4). ListedColormap accepts RGBA directly.
+        return mcolors.ListedColormap(rgba, name="test")
+    
+    for x in range(dim):
+        for y in range(dim):
+            _x = x + 1
+            _y = y + 1
+            blob(_x - 0.5, dim - _y + 0.5, rho[y, x], ax=plot_ax)
+            text = f"${abs(rho[y, x]):.2f} \\angle{int(np.angle(rho[y, x], deg=True))}^\circ$"
+            plot_ax.text(_x - 0.5, dim - _y + 0.5, text,
+                         ha='center', va='center')
+    
+    # Frame
+    plot_ax.set_aspect("equal")
+    plot_ax.set_frame_on(False)
+    
+    # Grid ticks
+    plot_ax.set_xlim(0, dim)
+    plot_ax.set_ylim(0, dim)
+    plot_ax.xaxis.set_major_locator(plt.IndexLocator(1, 0))
+    plot_ax.yaxis.set_major_locator(plt.IndexLocator(1, 0))
+    
+    # x/y axis
+    plot_ax.set_xticks(0.5 + np.arange(dim))
+    plot_ax.set_xticklabels(basis_labels)
+    plot_ax.xaxis.tick_top()
+    plot_ax.set_yticks(0.5 + np.arange(dim))
+    plot_ax.set_yticklabels(basis_labels[::-1])
+    
+    # color map
+    if add_cbar:
+        # build a dummy ScalarMappable: phase ∈ [-π, π] -> hsv colormap
+        phase_cmap = make_phase_cmap_from_cmap2d(cmap_2d)
+        norm = mcolors.Normalize(vmin=-np.pi, vmax=np.pi)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=phase_cmap)
+        sm.set_array([])
+        
+        cbar = plt.colorbar(sm, ax=plot_ax, pad=0.02)
+        cbar.set_label("phase [rad]")
+        cbar.set_ticks([-np.pi, 0, np.pi])
+        cbar.set_ticklabels([r"$-\pi$", "0", r"$\pi$"])
+    
+    fig.tight_layout()
+    
+    return fig, plot_ax
