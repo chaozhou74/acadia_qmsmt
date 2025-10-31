@@ -18,5 +18,5 @@ class GaussCosine(FitterBase):
         f = fft_frq[idx]
         phi = np.angle(fft_val[idx])
         tau_ = (1 / 4.0) * (coordinates[-1] - coordinates[0])
-        tau = {"value":tau_, "min":1e-10,  "max": coordinates[-1]*20}
+        tau = {"value":tau_, "min":1e-10,  "max": coordinates[-1]*50}
         return dict(A=A, f=f, phi=phi, tau=tau, of=of)
