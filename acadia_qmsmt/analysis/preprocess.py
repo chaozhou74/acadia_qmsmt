@@ -4,10 +4,6 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 from matplotlib import pyplot as plt
 
-from acadia_qmsmt.analysis import ComplexDataPointsType
-
-TwoPi = 2 * np.pi
-
 def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
     """
     Reshape IQ data (data with last axis of shape 2)  to match the shape defined by the sweep axes.
@@ -34,42 +30,6 @@ def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
 
     return data
 
-
-def find_iq_rotation(iq_pts:ComplexDataPointsType):
-    """
-    Find the rotation angle in radian that minimizes the 
-    variation of the q component.
-
-    :param iq_pts: Array of complex iq data points
-
-    :return: optimal angle in radians
-    """
-    def std_q(theta_):
-        iq_temp = iq_pts.ravel() * np.exp(1j * theta_)
-        return np.std(iq_temp.imag)
-
-    res = minimize_scalar(std_q, bounds=[0, TwoPi])
-    angle = res.x
-    
-    return angle
-
-
-def rotate_iq(iq_pts:ComplexDataPointsType, angle: float = None):
-    """
-    Rotate the iq data points on the complex plane.
-
-    :param iq_pts: Array of complex iq data points
-    :param angle: rotation angle in radian. When not provided, will search for the angle that
-        minimizes the variation of the q component.
-    :return:
-    """
-    iq_pts = np.array(iq_pts)
-    if angle is None:
-        angle = find_iq_rotation(iq_pts)
-
-    iq_new = iq_pts * np.exp(1j * angle)
-
-    return iq_new
 
 def to_complex(x, allow_1d_real: bool = False, flatten: bool = False) -> np.ndarray:
     """
@@ -102,7 +62,7 @@ def to_complex(x, allow_1d_real: bool = False, flatten: bool = False) -> np.ndar
     else:
         raise ValueError(f"Unsupported IQ format: shape={x.shape}, dtype={x.dtype}")
 
-def cut_peak(data, cut_factor=0.5, plot=True, debug=False):
+def cut_peak(data, cut_factor: float = 0.5, plot: bool = True, debug: bool = False):
     """
     find the highest peak of a given dataset, set the region around the peak to np.nan. Returns the
     new data, and the left and right index of the peak. The peak region is set by cut_factor, which

@@ -8,9 +8,6 @@ from acadia import Acadia, DataManager, Runtime, WaveformMemory
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
-def decay(t, A, tau, B):
-    return A*np.exp(-t/tau) + B
-
 class QubitRelaxationRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for measuring the relaxation time (T1) of a qubit.
@@ -27,7 +24,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
     qubit_pulse_name: str = "R_x_180"
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
-    capture_window_name: str = "boxcar"
+    capture_window_name: str = None
 
 
     figsize: tuple[int] = None
@@ -58,7 +55,7 @@ class QubitRelaxationRuntime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
                 qubit_stimulus_io.dwell(counter)
-                # a.barrier() # doesn't work as of June 26th, 2025 - JWOG
+
             with a.channel_synchronizer():
                 readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
 
@@ -104,35 +101,27 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import save_registered_plots
         save_registered_plots(self)
 
-
-
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, thresholded:bool=True):
+    def process_current_data(self, readout_classifier: str = None):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+        from acadia_qmsmt.analysis.fitting import Exponential
+
         data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
-        self.data_iq = data.astype(float).view(complex).squeeze()
-        self.avg_iq = np.mean(self.data_iq, axis=0)
-        self.shots = (1-np.sign(self.data_iq.real))/2
-        
 
-        if thresholded:
-            self.data_to_fit = np.mean(self.shots, axis=0)
-            self.data_sigma = np.std(self.shots, axis=0)/np.sqrt(completed_iterations)
-        else:
-            from acadia_qmsmt.analysis import rotate_iq, find_iq_rotation
-            rot_angle = find_iq_rotation(self.avg_iq)
-            self.data_to_fit = rotate_iq(self.avg_iq, rot_angle).real
-            self.data_sigma = np.std(rotate_iq(self.data_iq, rot_angle).real, axis=0)/np.sqrt(completed_iterations)
-        self.thresholded = thresholded
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
 
-        from acadia_qmsmt.analysis.fitting import Exponential
+        self.data_complex = data.astype(float).view(complex).reshape(completed_iterations, len(self.delay_times))
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
+        self.sigma = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
+
         self.delay_times_us = self.delay_times * 1e6
-        self.fit = Exponential(self.delay_times_us, self.data_to_fit, sigma=self.data_sigma)
+        self.fit = Exponential(self.delay_times_us, self.avg_shots, sigma=self.sigma)
         self.fitted_t1_us = self.fit.ufloat_results["tau"]
+
         return completed_iterations
     
 
@@ -144,13 +133,9 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         self.fit.plot(axs, oversample=5,
                             result_kwargs={"label": f"T1 (us): {self.fitted_t1_us:.4g}"})
         axs.set_title(f"T1: {self.fit.ufloat_results['tau']:.5g}")
-
         axs.set_xlabel("Time [us]")
-        if self.thresholded:
-            axs.set_ylabel("e pop")
-            axs.set_ylim(-0.02, 1.02)
-        else:
-            axs.set_ylabel("re(data) after rotation")
+        axs.set_ylabel("Average Measurement")
+        axs.set_ylim(-0.02, 1.02)
 
         axs.legend()
         return fig, axs
