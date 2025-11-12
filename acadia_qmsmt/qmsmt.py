@@ -276,7 +276,7 @@ class InputOutput:
                 current_level = next(iter(current_level.values()))
                 continue
             # raise when key is missing
-            if not k in current_level:
+            if k not in current_level:
                 raise KeyError(f"Missing key '{k}' in config dict under "
                                f"'{'.'.join([self._name] + list(cfg_path[:i]))}'")
             
@@ -349,6 +349,7 @@ class InputOutput:
             # Find the closest multiple of clock_sample_time to f
             stretch_factor = np.ceil(f / clock_sample_time)
             # Remember the stretch length
+            # TODO: document behavior of adding a flat cycle in the middle to guarantee proper behavior when stretching
             stretch_length = (stretch_factor -  1) * clock_sample_time
             # Passing 0 to the stretch_length variable causes errors
             stretch_length = stretch_length if stretch_length > 0 else None
@@ -360,6 +361,7 @@ class InputOutput:
 
         # If the pulse data is a string, we compute the ramp and flat fractions and         
         if isinstance(pulse_config["data"], str): 
+            # TODO: make it ok to accept "length"
             r = pulse_config["ramp"]
             memory_length = pulse_config.get("memory_length", None)
             ml = memory_length # Create new variable to be modified later
@@ -368,7 +370,7 @@ class InputOutput:
                 if r is None or r == 0:
                     logger.warning(f"Warning: {self._make_pulse_id_message(pulse_config)} ramp is None, and use_stretch = True."
                                    "Your pulse will be zero padded with 5 ns on either side")
-                    r = 1e-12
+                    r = 1e-12 # TODO: update flow to make resulting sizes clear
                 # Find the padding necessary to ensure that there is a flat cycle in the middle of the pulse
                 tau_pad = np.ceil(r / (2 * clock_sample_time)) * 2 * clock_sample_time - r
                 # Adjust memory length
@@ -900,7 +902,7 @@ class QMsmtRuntime(Runtime):
                 
                 # --- IOConfig is specified via a YAML key ---
                 if isinstance(value, (tuple, str)): 
-                    from acadia_qmsmt.helpers.yaml_editor import load_yaml
+                    from acadia_qmsmt.utils.yaml_editor import load_yaml
                     if isinstance(value, tuple):
                         yaml_key, yaml_path  = value
                     else:
@@ -1100,7 +1102,7 @@ class QMsmtRuntime(Runtime):
         """
         Update the value of a field in the yaml config file for the specified IOConfig.
         """
-        from acadia_qmsmt.helpers.yaml_editor import update_yaml
+        from acadia_qmsmt.utils.yaml_editor import update_yaml
         yaml_path = self._ios[ioconfig_name]._config["__yaml_path__"]
         yaml_key = self.get_io_yaml_key(ioconfig_name)
 
@@ -1114,7 +1116,7 @@ class QMsmtRuntime(Runtime):
         wait for the deployment to complete by joining the event loop.
         :param suppress_data_sync_warnings: If True, suppress warnings related to data synchronization.
         """
-        from acadia_qmsmt.helpers import suppress_data_sync_messages
+        from acadia_qmsmt.utils import suppress_data_sync_messages
         try:
             with suppress_data_sync_messages(suppress_data_sync_warnings):
                 self._event_loop.join()
@@ -1159,6 +1161,7 @@ class MeasurableResonator:
         self._capture = capture
         self._stream = None
         self._windows = {}
+        self._classifiers = {}
  
     def measure(self, 
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
@@ -1200,7 +1203,7 @@ class MeasurableResonator:
             kernel_arg = window_name
         
         if cmacc_offset is None:
-                cmacc_offset = self._capture.get_config("windows", window_name).get("offset", (0, 0))
+            cmacc_offset = self._capture.get_config("windows", window_name).get("offset", (0, 0))
 
         # ------------ schedule drive pulse ------------------------------
         self._stimulus.schedule_pulse(stimulus_waveform_memory)
@@ -1240,14 +1243,87 @@ class MeasurableResonator:
         self._capture.capture_trace(capture_waveform_memory)
 
 
-    def get_measurement(self) -> Operation:
+    def get_measurement(self, 
+                        format: Literal["quadrant", "re_sign", "im_sign"]) -> Union[int, Operation]:
         """
-        Blocks until the measurement is complete, as indicated by the CMACC
+        Retrieves a measurement from the CMACC in the given format.
+
+        The CMACC can provide its result in various formats, and it is up to the 
+        user to decide which format is most useful for a given sequence. For 
+        example, in some situations one might want to know which quadrant an 
+        accumulated point lies in, and in other situations, one might want to 
+        know simply whether a single quadrature is positive or negative. Alternatively,
+        one might want a full 32-bit accumulator quadrature value.
+        While these all may seem very similar, the hardware provides different ways 
+        of accessing these values in order to minimize latency, and this requires reading 
+        the result from different CMACC registers.
+
+        The argument ``format`` should specify the type of measurement data to retrieve 
+        to use. The allowed values for ``format`` are:
+
+        - ``"quadrant"``: This method will return one of Acadia.CMACC_QUADRANT_1/2/3/4 
+            depending on the quadrant of the integrated complex number.
+
+        - ``"re_sign"``: This method will return 0 when the value of the real quadrature 
+            is positive, and 0x80000000 when it's negative.
+
+        - ``"im_sign"``: This method will return 0 when the value of the imaginary
+            quadrature is positive, and 0x80000000 when it's negative.
+
+        This blocks until the measurement is complete, as indicated by the CMACC
         completion status bit.
         """
 
-        # `Acadia.cmacc_get_quadrant` will wait until cmacc is done
-        return self._capture._acadia.cmacc_get_quadrant(self._stream)
+        # All of the acadia methods here will wait until the CMACC is complete
+        if classifier == 'quadrant':
+            return self._capture._acadia.cmacc_get_quadrant(self._stream)
+        elif classifier == 're_sign':
+            return self._capture._acadia.cmacc_get_quadrature(self._stream) & 0x80000000
+        elif classifier == 'im_sign':
+            return self._capture._acadia.cmacc_get_quadrature(self._stream, imag=True) & 0x80000000
+        else:
+            raise ValueError(f"Unknown measurement classifier {classifier}")
+
+    def classify_measurement(self, data: NDArray, classifier_name: str = None) -> NDArray:
+        """
+        Classifies measurement data.
+
+        Classifiers are algorithms for converting analog measurements 
+        into discrete results. Unlike in the sequencer where the only available 
+        real-time classifiers are those implemented in the CMACC, offline classifiers 
+        may be arbitrarily complicated.
+
+        Each available classifier is specified as an element in the readout capture's 
+        "classifiers" section. If the provided classifier name is ``None``, the first 
+        available classifier is used. If there are no classifiers, a 
+        :class:`MaximalVarianceAxisClassifier` is created.
+        """
+
+        from acadia_qmsmt.analysis.measurement_classifiers import create_classifier_from_config
+
+        # First we'll check if we can just load a default
+        if classifier_name is None and "classifiers" in self._capture._config:
+            classifier_name = list(self._capture.get_config("classifiers").keys())[0]
+
+        if classifier_name in self._classifiers:
+            # If we already loaded this classifier, use it
+            classifier = self._classifiers[classifier_name]
+
+        elif "classifiers" in self._capture._config:
+            # We haven't loaded the classifier but there is a classifier configuration
+            classifier_config = self._capture.get_config("classifiers", classifier_name)
+            classifier = create_classifier_from_config(classifier_config)
+            self._classifiers[classifier_name] = classifier
+            
+        else:
+            # We haven't specified a classifier and there aren't any in the config
+            # By default we'll create a MaximalVarianceAxisClassifier, and we won't
+            # cache it because it's unsupervised so it needs to be retrained every
+            # time
+            classifier_config = {"type": "MaximalVarianceAxisClassifier"}
+            classifier = create_classifier_from_config(classifier_config)
+
+        return classifier.classify(data)
 
 
     def load_windows(self) -> None:

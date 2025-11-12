@@ -32,7 +32,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
-    capture_window_name: str = "boxcar"
+    capture_window_name: str = None
 
 
     figsize: tuple[int] = None
@@ -142,30 +142,23 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, thresholded:bool=True):
+    def process_current_data(self, readout_classifier: str = None):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+        from acadia_qmsmt.analysis.fitting import ExpCosine
+
         data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
-        self.data_iq = data.astype(float).view(complex).squeeze()
-        self.avg_iq = np.mean(self.data_iq, axis=0)
-        self.shots = (1-np.sign(self.data_iq.real))/2
 
-        if thresholded:
-            self.data_to_fit = np.mean(self.shots, axis=0)
-            self.data_sigma = np.std(self.shots, axis=0)/np.sqrt(completed_iterations)
-        else:
-            from acadia_qmsmt.analysis import rotate_iq, find_iq_rotation
-            rot_angle = find_iq_rotation(self.avg_iq)
-            self.data_to_fit = rotate_iq(self.avg_iq, rot_angle).real
-            self.data_sigma = np.std(rotate_iq(self.data_iq, rot_angle).real, axis=0)/np.sqrt(completed_iterations)
-        self.thresholded = thresholded
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
 
-        from acadia_qmsmt.analysis.fitting import ExpCosine
-        self.delay_times_us = self.delay_times * 1e6
-        self.fit = ExpCosine(self.delay_times_us, self.data_to_fit, sigma=self.data_sigma)
+        self.data_complex = data.astype(float).view(complex).reshape(completed_iterations, len(self.delay_times))
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
+        self.sigma = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
+        
+        self.fit = ExpCosine(self.delay_times*1e6, self.avg_shots, sigma=self.sigma)
         self.fitted_t2_us = self.fit.ufloat_results["tau"]
         self.fitted_detune_MHz = self.fit.ufloat_results["f"]
         return completed_iterations
@@ -181,11 +174,8 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         # self.fit.plot_fitted(axs, oversample=5, label=f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}")
 
         axs.set_xlabel("Time [us]")
-        if self.thresholded:
-            axs.set_ylabel("e pop")
-            axs.set_ylim(-0.02, 1.02)
-        else:
-            axs.set_ylabel("re(data) after rotation")
+        axs.set_ylabel("Average Measurement")
+        axs.set_ylim(-0.02, 1.02)
 
         axs.set_title(f"T2{'E' if self.do_echo else 'R'}: {self.fit.ufloat_results['tau']:.5g}")
 
@@ -197,7 +187,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes, plot_binaveraged
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        fig, axs = plot_binaveraged(self.delay_times_us, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
+        fig, axs = plot_binaveraged(self.delay_times*1e6, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
         axs.set_ylabel("Time [us]")
         return fig, axs
 

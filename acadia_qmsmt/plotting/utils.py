@@ -11,7 +11,7 @@ from matplotlib.widgets import Button
 import matplotlib.pyplot as plt
 
 from acadia import Runtime
-from acadia_qmsmt.helpers import get_registered_plot_methods, get_data_process_method, get_registered_customizer, sanitize_filename
+from acadia_qmsmt.utils import get_registered_plot_methods, get_data_process_method, get_registered_customizer, sanitize_filename
 
 logger = logging.getLogger(__name__)
 
