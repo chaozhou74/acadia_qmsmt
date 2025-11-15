@@ -1,3 +1,4 @@
+from typing import Union
 import importlib.util
 import inspect
 import sys
@@ -18,26 +19,55 @@ Compared to the existing `runtime.load()`, this provides two additional features
    without having to manually find and import the runtime class first, then do `Runtime.load(data_folder_path)`. 
 
 2. For qmsmt runtimes, this allows choosing whether to use the `acadia_qmsmt.py` module saved in the data folder 
-   (default behavior, realized by temporally changing cwd to data folder) or the global one in the Python environment.
+   (default behavior, realized by temporally adding data folder to the front of sys.path), or the global one 
+   in the Python environment.
 """
 
 DEFAULT_RUNTIME_MODULE = "runtime.py"  # module that contains the runtime class in the data folder
+SAVED_LOCAL_MODULES = ["acadia_qmsmt"]  # names of the modules that were saved in the data folder during runtime
+
 
 @contextmanager
-def change_dir(path):
+def local_modules(path: Union[str, Path],
+                  module_names: Union[str, list[str], None] = None):
     """
-    Context manager for changing the current working directory to the given path.
-    Useful for temporarily changing the current working directory to the data folder,
-    so saved acadia_qmsmt can be used.
+    Temporarily add `path` to the front of sys.path and remove the given module 
+    names from sys.modules, so that `import <module>` will resolve to the local 
+    copy in `path` if present. 
+    
+    On exit, sys.path and sys.modules are restored to a clean state.
     """
-    prev_dir = os.getcwd()
+    path = os.fspath(path)
+
+    # ensure list
+    if isinstance(module_names, str):
+        module_names = [module_names]
+    elif module_names is None:
+        module_names = []
+
+    # Put local path first in sys.path
+    sys.path.insert(0, path)
+
+    def _remove_modules():
+        # remove previously imported modules
+        for mod in module_names:
+            if mod in sys.modules:
+                logger.debug(f"Removing module from sys.modules: {sys.modules[mod]}")
+                del sys.modules[mod]
+
     try:
-        os.chdir(path)
-        logger.debug(f"Switching curren working directory to {path}")
+        # remove any existing modules (global or otherwise) to force re-import from local directory
+        _remove_modules()
         yield
     finally:
-        os.chdir(prev_dir)
-        logger.debug(f"Switching current working directory back to {prev_dir}")
+        # clear out whatever we imported while in the local context
+        _remove_modules()
+
+        # remove the temporary sys.path entry
+        try:
+            sys.path.remove(path)
+        except ValueError:
+            pass
 
 
 def _get_classes_in_module(module_path: str):
@@ -85,7 +115,7 @@ def get_saved_runtime_class(data_directory: str, use_saved_qmsmt: bool = True):
     runtime_module = data_path / DEFAULT_RUNTIME_MODULE
 
     if use_saved_qmsmt:
-        with change_dir(data_path):
+        with local_modules(data_path, module_names=SAVED_LOCAL_MODULES):
             runtime_classes = _get_classes_in_module(runtime_module)
     else:
         runtime_classes = _get_classes_in_module(runtime_module)
