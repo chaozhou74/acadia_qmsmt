@@ -170,7 +170,7 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
         self.fit.plot(axs, oversample=5, 
-                            result_kwargs={"label":f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}"})
+                            result_kwargs={"label":f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.6g}"})
         # self.fit.plot_fitted(axs, oversample=5, label=f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}")
 
         axs.set_xlabel("Time [us]")
@@ -191,3 +191,13 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         axs.set_ylabel("Time [us]")
         return fig, axs
 
+
+    @annotate_method(button_name="update qubit frequency (if Ramsey)")
+    def update_frequencies(self):
+        
+        if not self.do_echo:
+            if self.fit is not None:
+                self.qubit_freq = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
+                self.update_io_yaml_field("qubit_stimulus", f"channel_config.nco_frequency", 
+                                          np.round(self.qubit_freq - (self.fit.ufloat_results['f'].n*1e6 - self.virtual_detuning))
+                )

@@ -135,20 +135,20 @@ class QubitRpmRuntime(QMsmtRuntime):
         return completed_iterations
     
 
-    @annotate_method(plot_name="1 qubit power rabi", axs_shape=(1,1))
+    @annotate_method(plot_name="1 qubit power rabi", axs_shape=(2,1))
     def plot_data(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
-        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+        fig, axs = prepare_plot_axes(axs, axs_shape=(2,1), figsize=self.figsize)
 
-        self.fit_0.plot(axs, oversample=5, result_kwargs=dict(label=f"prep g, A: {self.fitted_A_0:.5g}"))
-        self.fit_1.plot(axs, oversample=5, result_kwargs=dict(label=f"prep e, A: {self.fitted_A_1:.5g}"))
+        self.fit_0.plot(axs[0], oversample=5, result_kwargs=dict(label=f"prep g, A: {self.fitted_A_0:.5g}"))
+        self.fit_1.plot(axs[1], oversample=5, result_kwargs=dict(label=f"prep e, A: {self.fitted_A_1:.5g}"))
 
-        axs.set_xlabel("Drive Amplitude [DAC]")
-        axs.set_ylabel("e pop")
-        axs.set_ylim(-0.02, 1.02)
+        axs[1].set_xlabel("Drive Amplitude [DAC]")
+        axs[1].set_ylabel("e pop")
+        axs[1].set_ylim(-0.02, 1.02)
 
-        axs.legend()
-        axs.set_title(f"Thermal pop: {(self.fitted_A_0/(self.fitted_A_0+self.fitted_A_1)*100):.5g} %")
+        axs[0].legend()
+        axs[0].set_title(f"Thermal pop: {(self.fitted_A_0/(self.fitted_A_0+self.fitted_A_1)*100):.5g} %")
         return fig, axs
 
 

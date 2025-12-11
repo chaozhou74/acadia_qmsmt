@@ -20,6 +20,8 @@ class Chevron:
 
         self.fitted_f0 = None
         self.fitted_g = None
+        self.fitted_g0 = None
+        self.fitted_t0 = None
 
         # self.fft_peak_threshold = fft_peak_threshold
         # self.fft_freq_min = 0 if fft_freq_min is None else fft_freq_min
@@ -33,7 +35,7 @@ class Chevron:
         try:
             self.fit_fft()
             self.fit_center_time_linecut()
-        except exception as e:
+        except Exception as e:
             pass
             # logger.warning(f"Failed to fit fft result, {e}")
 
@@ -68,30 +70,41 @@ class Chevron:
         return fig, axs
 
 
-    def fit_fft(self, peak_threshold=0.4, freq_min=None, freq_max=None):
-        freq_min = 0 if freq_min is None else freq_min
-        freq_max = np.inf if freq_max is None else freq_max
+    def fit_fft(self, peak_threshold=0.4, fft_freq_min=None, fft_freq_max=None, 
+                sweep_freq_min=None, sweep_freq_max=None, freq_scale:int=1):
+        fft_freq_min = min(self.fft_freqs) if fft_freq_min is None else fft_freq_min
+        fft_freq_max = max(self.fft_freqs) if fft_freq_max is None else fft_freq_max
+        sweep_freq_min = min(self.sweep_freqs_Hz) if sweep_freq_min is None else sweep_freq_min
+        sweep_freq_max = max(self.sweep_freqs_Hz) if sweep_freq_max is None else sweep_freq_max
 
-        freq_mask = np.where((self.fft_freqs > freq_min) & (self.fft_freqs < freq_max))[0]
-        fft_data = self.fft_data[:, freq_mask]
-        fft_freqs = self.fft_freqs[freq_mask]
+        fft_freq_mask = np.where((self.fft_freqs > fft_freq_min) & (self.fft_freqs < fft_freq_max))[0]
+        fft_data = self.fft_data[:, fft_freq_mask]
+        fft_freqs = self.fft_freqs[fft_freq_mask]
 
 
         fft_max_idxes = np.argmax(fft_data, axis=1)
         fft_maxes = np.max(fft_data, axis=1)
         peak_mask = fft_maxes > np.ptp(fft_maxes) * peak_threshold
+        sweep_freq_mask = (self.sweep_freqs_Hz >= sweep_freq_min) & (self.sweep_freqs_Hz <= sweep_freq_max)
+        peak_mask = peak_mask & sweep_freq_mask
 
         self.sweep_freq_fit = self.sweep_freqs_Hz[peak_mask]
         self.fft_freq_fit = fft_freqs[fft_max_idxes][peak_mask]
 
         def _fit_model(f, f0, g):
-            return np.sqrt(g ** 2 + (f - f0) ** 2) # we enforce proper unit at the input of the class
-
+            # apply freq scale for non-1st order processes
+            return np.sqrt(g ** 2 + (f - f0) ** 2 * freq_scale ** 2) # we enforce proper unit at the input of the class
+        
         p0 = (self.sweep_freq_fit[np.argmin(self.fft_freq_fit)], np.min(self.fft_freq_fit))
         bounds = ((np.min(self.sweep_freq_fit), 0), (np.max(self.sweep_freq_fit), np.max(self.fft_freq_fit)))
         popt, pcov = curve_fit(_fit_model, self.sweep_freq_fit, self.fft_freq_fit, p0=p0, bounds=bounds)
         self.fitted_f0 = popt[0]
         self.fitted_g = abs(popt[1] / 2)
+        self.fit_freq_scale = freq_scale
+        self.fit_fft_freq_min = fft_freq_min
+        self.fit_fft_freq_max = fft_freq_max
+        self.fit_sweep_freq_min = sweep_freq_min
+        self.fit_sweep_freq_max = sweep_freq_max
 
         return self.fitted_f0, self.fitted_g
 
@@ -110,7 +123,7 @@ class Chevron:
         return self.fitted_g0, self.fitted_t0
 
 
-    def plot_fft(self, ax:Axes=None, figsize=None, plot_fit:bool=True):
+    def plot_fft(self, ax:Axes=None, figsize=None):
         fig, ax = prepare_plot_axes(ax, axs_shape=(1, 1), figsize=figsize)
         pcm = ax.pcolormesh(self.sweep_freqs_Hz/1e9, self.fft_freqs/1e6, self.fft_data.T, cmap="inferno", shading="auto")
         fig.colorbar(pcm, ax=ax)
@@ -118,16 +131,19 @@ class Chevron:
 
         if self.fitted_f0 is not None:
             def _fit_model(f, f0, g):
-                return np.sqrt(g ** 2 + (f - f0) ** 2) # we enforce proper unit at the input of the class
+                return np.sqrt(g ** 2 + (f - f0) ** 2 * self.fit_freq_scale**2) # we enforce proper unit at the input of the class
 
             ax.plot(self.sweep_freq_fit/1e9, self.fft_freq_fit/1e6, 'w.', linestyle='')
-            title_text = f"On-resonance Freq: {self.fitted_f0:.5g}   g: {self.fitted_g:.4g}"
+            title_text = f"f0: {self.fitted_f0/1e9:.5g} [GHz],   g: {self.fitted_g/1e6:.4g} [MHz],  Drive order: {self.fit_freq_scale}"
             ax.set_title(f"FFT of time signal\n{title_text}")
             fine_x = np.linspace(min(self.sweep_freqs_Hz), max(self.sweep_freqs_Hz), len(self.sweep_freqs_Hz)*10)
-            ax.plot(fine_x/1e9, _fit_model(fine_x, self.fitted_f0, self.fitted_g0*2)/1e6, 'w--', label="Fit")
+            ax.plot(fine_x/1e9, _fit_model(fine_x, self.fitted_f0, self.fitted_g*2)/1e6, 'w--', label="Fit")
             ax.axvline(self.fitted_f0/1e9, linestyle='dotted', color='w', label="On-Resonance")
-
-        ax.set_ylim(min(self.fft_freqs)/1e6, max(self.fft_freqs)/1e6)
+            ax.set_ylim(self.fit_fft_freq_min/1e6, self.fit_fft_freq_max/1e6)
+            ax.set_xlim(self.fit_sweep_freq_min/1e9, self.fit_sweep_freq_max/1e9)
+        
+        ax.set_ylabel("FFT Frequency (MHz)")
+        ax.set_xlabel("Sweep Frequency (GHz)")
         fig.tight_layout()
 
         return fig, ax
