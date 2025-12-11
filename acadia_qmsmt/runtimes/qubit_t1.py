@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from numpy.typing import NDArray
@@ -102,24 +102,24 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         save_registered_plots(self)
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, readout_classifier: str = None):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
         from acadia_qmsmt.analysis.fitting import Exponential
 
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times, to_complex=True)
         if data is None:
             return
 
         completed_iterations = len(data)
         readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
 
-        self.data_complex = data.astype(float).view(complex).reshape(completed_iterations, len(self.delay_times))
+        self.data_complex = data
         self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
         self.avg_shots = np.mean(self.shots, axis=0)
-        self.sigma = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
+        self.sigma_shots = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
 
         self.delay_times_us = self.delay_times * 1e6
-        self.fit = Exponential(self.delay_times_us, self.avg_shots, sigma=self.sigma)
+        self.fit = Exponential(self.delay_times_us, self.avg_shots, sigma=self.sigma_shots)
         self.fitted_t1_us = self.fit.ufloat_results["tau"]
 
         return completed_iterations

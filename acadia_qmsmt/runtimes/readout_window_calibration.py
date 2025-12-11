@@ -162,11 +162,14 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         except Exception as e:
             logger.error(f"Error calculating kernel: {e}")
 
+        self.g_trace_pwr = np.mean(np.abs(self.g_traces_raw)**2, axis=0)
+        self.e_trace_pwr = np.mean(np.abs(self.e_traces_raw)**2, axis=0)
+
         return completed_iterations
 
 
-    @annotate_method(plot_name="kernel generation")
-    def plot_kernel_generation(self, fig=None, log_scale: bool = False, bins: int = None):
+    @annotate_method(plot_name="1. kernel generation")
+    def plot_kernel_generation(self, fig=None, log_scale: bool = True, bins: int = None):
         from matplotlib.colors import LogNorm
         from matplotlib.patches import Circle
 
@@ -236,7 +239,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
         return fig, axs
 
-    @annotate_method(plot_name="result kernel", axs_shape=(1,1))
+    @annotate_method(plot_name="3. result kernel", axs_shape=(1,1))
     def plot_calculated_kernel(self, axs=None, plot_uploaded: bool = True):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1, 1), figsize=self.figsize)
@@ -256,7 +259,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
         return fig, axs
 
-    @annotate_method(plot_name="raw data", axs_shape=(2,2))
+    @annotate_method(plot_name="2. raw data", axs_shape=(2,2))
     def plot_raw_data(self, axs=None, log_scale: bool = False):
         from acadia_qmsmt.plotting import prepare_plot_axes, plot_multiple_hist2d
         fig, axs = prepare_plot_axes(axs, axs_shape=(2, 2), figsize=self.figsize)
@@ -273,6 +276,40 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
             axs[i, 1].legend()
             axs[i, 1].grid(True)
             axs[i, 0].set_title(f"prep {prep}")
+        return fig, axs
+
+    
+    @annotate_method(plot_name = "4. capture power")
+    def plot_capture_amplitude_post_selected(self, axs=None, plot_decay_fit:bool=True, decay_start_time_us:float = None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, axs = prepare_plot_axes(axs, figsize=self.figsize)
+        axs.plot(self.t_data*1e6, self.g_trace_pwr, label="g trace")
+        axs.plot(self.t_data*1e6, self.e_trace_pwr, label="e trace")
+        axs.set_xlabel("Time (us)")
+        axs.grid()
+        axs.legend()
+        axs.set_title("Capture power post selected")
+
+        if plot_decay_fit:
+            from acadia_qmsmt.analysis.fitting import Exponential
+            decay_start_time = decay_start_time_us*1e-6 if decay_start_time_us is not None else 1.7e-6
+            decay_start_idx = np.argmin(np.abs(self.t_data - decay_start_time))
+
+            t_data_decay_us = self.t_data[decay_start_idx:] * 1e6
+            g_data_decay_us = self.g_trace_pwr[decay_start_idx:]
+            e_data_decay_us = self.e_trace_pwr[decay_start_idx:]
+
+            self.g_fit = Exponential(t_data_decay_us, g_data_decay_us)
+            self.e_fit = Exponential(t_data_decay_us, e_data_decay_us)
+
+            self.fitted_g_t1_us = self.g_fit.ufloat_results["tau"]
+            self.fitted_e_t1_us = self.e_fit.ufloat_results["tau"]
+
+            self.g_fit.plot_fitted(axs, oversample=5,
+                            **{"label": f"|g> $\kappa$/2$\pi$ (MHz): {1/2/np.pi/self.fitted_g_t1_us:.4g}"})
+            self.e_fit.plot_fitted(axs, oversample=5,
+                            **{"label": f"|e> $\kappa$/2$\pi$ (MHz): {1/2/np.pi/self.fitted_e_t1_us:.4g}"})
+
         return fig, axs
 
     @annotate_method(button_name="update window")

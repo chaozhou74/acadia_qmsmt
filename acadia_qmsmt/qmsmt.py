@@ -1042,6 +1042,8 @@ class QMsmtRuntime(Runtime):
                 self.acadia.update_nco_phase(io.channel, 0)
             if nco_update_event_source == "immediate":
                 io.channel.nco_immediate_update_event()
+                 # some how this is needed to ensure the update event
+                io.channel.nco_immediate_update_event()
 
         if nco_update_event_source == "sysref":
             self.acadia.update_ncos_synchronized()
@@ -1321,6 +1323,9 @@ class MeasurableResonator:
             # By default we'll create a MaximalVarianceAxisClassifier, and we won't
             # cache it because it's unsupervised so it needs to be retrained every
             # time
+            logger.warning(f"`classifiers` is not specified in either MeasurableResonator or"
+                           f" the config of capture channel `{self._capture._name}`. "
+                           f"Using `MaximalVarianceAxisClassifier`")
             classifier_config = {"type": "MaximalVarianceAxisClassifier"}
             classifier = create_classifier_from_config(classifier_config)
 

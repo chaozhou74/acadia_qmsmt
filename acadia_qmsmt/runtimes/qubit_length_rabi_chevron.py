@@ -12,15 +12,16 @@ from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
 
-class QubitLengthRabiRuntime(QMsmtRuntime):
+class QubitLengthRabiChevronRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the rabi time
+    A :class:`Runtime` subclass for sweeping the rabi time and qubit frequency
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig
     readout_capture: IOConfig
 
     flat_length_list: Union[list, np.ndarray]
+    qubit_frequencies: Union[list, np.ndarray]
 
     iterations: int
     run_delay: int
@@ -29,6 +30,8 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = None
+
+    qubit_amp: float = None
 
     figsize: tuple[int] = None
     yaml_path: str = None
@@ -75,23 +78,26 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
 
         readout_resonator.load_windows()
         readout_stimulus_io.load_pulse(self.readout_pulse_name)
-        qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
+        qubit_stimulus_io.load_pulse(self.qubit_pulse_name, scale=self.qubit_amp)
 
 
         # Determine how many cycles each delay interval should be
         dsp_count_values = self.acadia.seconds_to_cycles(self.flat_length_list)
 
+        
         for i in range(self.iterations):
-            for wf_idx, stretch_len in enumerate(dsp_count_values):
-                cache[0] = stretch_len
-                # capture data and put in the corresponding group
-                self.acadia.run(minimum_delay=self.run_delay)
-                wf = readout_capture_io.get_waveform_memory("readout_accumulated")
-                self.data[f"points"].write(wf.array)
+            for freq in self.qubit_frequencies:
+                qubit.set_frequency(freq)
+                for wf_idx, stretch_len in enumerate(dsp_count_values):
+                    cache[0] = stretch_len
+                    # capture data and put in the corresponding group
+                    self.acadia.run(minimum_delay=self.run_delay)
+                    wf = readout_capture_io.get_waveform_memory("readout_accumulated")
+                    self.data[f"points"].write(wf.array)
 
-            if self.data.serve() == DataManager.serve_hangup():
-                self.data.disconnect()
-                return
+                if self.data.serve() == DataManager.serve_hangup():
+                    self.data.disconnect()
+                    return
 
         self.final_serve()
 
@@ -114,7 +120,7 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
     def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
 
-        data = reshape_iq_data_by_axes(self.data["points"].records(),  self.flat_length_list, to_complex=True)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_frequencies,  self.flat_length_list, to_complex=True)
         if data is None:
             return
 
@@ -126,25 +132,23 @@ class QubitLengthRabiRuntime(QMsmtRuntime):
         self.avg_shots = np.mean(self.shots, axis=0)
         self.sigma_shots = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
 
-        from acadia_qmsmt.analysis.fitting import ExpCosine
-        self.fit = ExpCosine(self.flat_length_list, self.avg_shots)
-        self.fitted_pi_length = abs(1/self.fit.ufloat_results["f"]/2)
-        self.fitted_driven_tau = abs(self.fit.ufloat_results["tau"])
         return completed_iterations
     
 
-    @annotate_method(plot_name="1 qubit length rabi", axs_shape=(1,1))
+    @annotate_method(plot_name="1 qubit length rabi chevron", axs_shape=(1,1))
     def plot_data(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.flat_length_list, self.avg_shots, "o-")
-        self.fit.plot_fitted(axs, oversample=5, label=f"pi_length: {self.fitted_pi_length:.5g}, driven tau: {self.fitted_driven_tau:.5g}")
+        vmin = np.min(self.avg_shots)
+        vmax = np.max(self.avg_shots)
 
-        axs.set_xlabel("flat part length [s]")
-        axs.set_ylabel("Average Measurement")
-        axs.set_ylim(-0.02, 1.02)
+        pcm = axs.pcolormesh(self.qubit_frequencies/1e6, self.flat_length_list*1e6, self.avg_shots.T, vmin=vmin, vmax=vmax, cmap="bwr")
+        fig.colorbar(pcm, ax=axs)
 
-        axs.legend()
+        axs.set_xlabel("Qubit Frequency [MHz]")
+        axs.set_ylabel("Pulse Flat Time [us]")
+
+        fig.tight_layout()
         return fig, axs
     

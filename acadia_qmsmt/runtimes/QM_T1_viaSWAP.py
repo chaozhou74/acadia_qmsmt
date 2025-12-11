@@ -86,10 +86,10 @@ class QMT1Runtime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit_stimulus_io.dwell(counter)
 
-            with a.channel_synchronizer():
-                if self.do_not_swap_back:
+            if self.do_not_swap_back:
                     logger.warning("NOTE: I'M NOT SWAPPING BACK!!!! YOU SHOULD SEE A FLAT LINE!!!!")
-                else:
+            else:
+                with a.channel_synchronizer():
                     bs_stimulus_io.schedule_pulse(self.bs_pulse_name)
                        
             with a.channel_synchronizer():

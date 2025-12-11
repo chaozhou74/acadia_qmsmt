@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from numpy.typing import NDArray
@@ -96,33 +96,23 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, thresholded:bool=True):
-        from acadia_qmsmt.analysis import reshape_iq_data_by_axes, find_iq_rotation, rotate_iq
-        data_spec = reshape_iq_data_by_axes(self.data["points"].records(), self.detune_frequencies)
-        if data_spec is None:
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
+        from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.detune_frequencies, to_complex=True)
+        if data is None:
             return
-        else:
-            completed_iterations = len(data_spec)
-        self.data_iq = data_spec.astype(float).view(complex).squeeze()
-        self.avg_iq = np.mean(self.data_iq, axis=0)
-        self.shots = (1-np.sign(self.data_iq.real))/2
+
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
         self.avg_shots = np.mean(self.shots, axis=0)
 
-        # for non thresholded data, find the best rotation angle that
-        # puts all the information on the I quadrature 
-        rot_angle = find_iq_rotation(self.avg_iq)
-        self.data_iq_rot = rotate_iq(self.data_iq, rot_angle)
-        self.avg_iq_rot = rotate_iq(self.avg_iq, rot_angle)
-
-        if thresholded:
-            self.data_to_fit = self.avg_shots
-        else:
-            from acadia_qmsmt.analysis import rotate_iq
-            self.data_to_fit = self.avg_iq_rot.real
-        self.thresholded = thresholded
 
         from acadia_qmsmt.analysis.fitting import Lorentzian
-        self.fit = Lorentzian(self.detune_frequencies, self.data_to_fit)
+        self.fit = Lorentzian(self.detune_frequencies, self.avg_shots)
         self.fitted_f0_MHz = self.fit.ufloat_results["x0"]/1e6
         self.qubit_nco = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
         return completed_iterations
@@ -137,31 +127,18 @@ class QubitAnharmonicityRuntime(QMsmtRuntime):
                       result_kwargs=dict(label=f"{self.fitted_f0_MHz:.5g} MHz"))
 
         axs.set_xlabel("Detuning [Hz]")
-        if self.thresholded:
-            axs.set_ylabel("e pop")
-            axs.set_ylim(-0.02, 1.02)
-        else:
-            axs.set_ylabel("re(data) after rotation")
-
+        axs.set_ylabel("shots")
         axs.legend()
-        axs.grid(True)
         axs.set_title(f"NCO: {self.qubit_nco/1e9} GHz, fitted_deune: {self.fitted_f0_MHz} MHz")
         return fig, axs
+
 
     @annotate_method(plot_name="2 bin averaged", axs_shape=(1,1))
     def plot_bin_avg(self, axs=None, n_avg=1):
         from acadia_qmsmt.plotting import prepare_plot_axes, plot_binaveraged
-        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
-        if self.thresholded:
-            axs.set_ylabel("e pop")
-            fig, axs = plot_binaveraged(self.detune_frequencies, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1)
-        else:
-            axs.set_ylabel("re(data) after rotation")
-            fig, axs = plot_binaveraged(self.detune_frequencies, self.data_iq_rot.real, axs, n_avg=n_avg)
-        axs.set_ylabel("Probe freq [Hz]")
+        fig, axs = plot_binaveraged(self.detune_frequencies/1e6, self.shots.real, axs, n_avg=n_avg)
+        axs.set_ylabel("Detuning [MHz]")
         return fig, axs
-
-
 
 
     @annotate_method(button_name="update ef frequency")

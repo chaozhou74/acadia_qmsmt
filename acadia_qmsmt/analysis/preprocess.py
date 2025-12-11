@@ -4,13 +4,14 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 from matplotlib import pyplot as plt
 
-def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
+def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray], to_complex:bool=False):
     """
     Reshape IQ data (data with last axis of shape 2)  to match the shape defined by the sweep axes.
     Truncates the data to exclude any incomplete iterations.
 
     :param raw_data: np.ndarray, assumed to have shape (..., 2).
     :param axes: sweep axes, provided from outermost to innermost. Each axis should be a list or np.ndarray.
+    :param to_complex:  when True, return data in `complex128`, the last axis (I, Q) will be removed.
 
     :return : np.ndarray of shape (completed_iterations, *len(axes), 2), or None if not enough data.
     """
@@ -27,8 +28,10 @@ def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray]):
     valid_points = completed_iterations * points_per_iter
     data = raw_data[:valid_points, ...]
     data = data.reshape(completed_iterations, *ax_shapes, 2)
-
-    return data
+    if not to_complex:
+        return data
+    
+    return data.astype(float).view(complex).reshape(data.shape[:-1])
 
 
 def to_complex(x, allow_1d_real: bool = False, flatten: bool = False) -> np.ndarray:

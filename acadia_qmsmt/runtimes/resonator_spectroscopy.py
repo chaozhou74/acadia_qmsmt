@@ -145,9 +145,9 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(2,1), figsize=self.figsize)
 
-        axs[0].plot(self.frequencies, np.abs(self.avg_iq_corrected), "o")
+        axs[0].plot(self.frequencies/1e9, np.abs(self.avg_iq_corrected), "o")
         phases = self.phase_corrected if unwrap_phase else self.phase_corrected % (2*np.pi)
-        axs[1].plot(self.frequencies, phases/np.pi*180, ".-")
+        axs[1].plot(self.frequencies/1e9, phases/np.pi*180, ".-")
 
         if self.fit is not None:
             plot_fit_ax = axs[0] if self.fit_type == "magnitude" else axs[1]
@@ -155,7 +155,7 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
             plot_fit_ax.legend()
 
 
-        axs[1].set_xlabel("Frequency [Hz]")
+        axs[1].set_xlabel("Frequency [GHz]")
         axs[1].set_ylabel("Phase (deg)")
         axs[0].set_ylabel("Magnitude (a.u.)")
         title = f"electrical delay: {self.electrical_delay_applied:.6g} s"

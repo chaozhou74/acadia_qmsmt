@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from numpy.typing import NDArray
@@ -94,25 +94,23 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, thresholded:bool=True):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"] = None):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_amplitudes)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_amplitudes, to_complex=True)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
-        self.data_iq = data.astype(float).view(complex).squeeze()
-        self.avg_iq = np.mean(self.data_iq, axis=0)
 
-        if thresholded:
-            self.data_to_fit = np.mean((1-np.sign(self.data_iq.real))/2, axis=0)
-        else:
-            from acadia_qmsmt.analysis import rotate_iq
-            self.data_to_fit = rotate_iq(self.avg_iq).real
-        self.thresholded = thresholded
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
+
+
 
         from acadia_qmsmt.analysis.fitting import Cosine
-        self.fit = Cosine(self.qubit_amplitudes, self.data_to_fit)
+        self.fit = Cosine(self.qubit_amplitudes, self.avg_shots)
         self.fitted_pi_amp = abs(1/self.fit.ufloat_results["f"]/2)
         return completed_iterations
     
@@ -122,16 +120,11 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.plot(self.qubit_amplitudes, self.data_to_fit, "o")
+        axs.plot(self.qubit_amplitudes, self.avg_shots, "o")
         self.fit.plot_fitted(axs, oversample=5, label=f"pi_amp: {self.fitted_pi_amp:.5g}")
 
         axs.set_xlabel("Drive Amplitude [DAC]")
-        if self.thresholded:
-            axs.set_ylabel("e pop")
-            axs.set_ylim(-0.02, 1.02)
-        else:
-            axs.set_ylabel("re(data) after rotation")
-
+        axs.set_ylabel("Average Measurement")
         axs.legend()
         return fig, axs
 
@@ -141,9 +134,9 @@ class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes, plot_multiple_hist2d
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,2))
 
-        data_g = self.data_iq[:, np.argmin(abs(self.qubit_amplitudes))]
+        data_g = self.data_complex[:, np.argmin(abs(self.qubit_amplitudes))]
         closet_pi_amp_idx = np.argmin(abs(self.qubit_amplitudes-self.fitted_pi_amp))
-        data_e = self.data_iq[:, closet_pi_amp_idx]
+        data_e = self.data_complex[:, closet_pi_amp_idx]
 
         plot_multiple_hist2d(data_g, data_e, plot_ax=axs, bins=bins, log_scale=log_scale)
         axs[0].set_title("amp 0")

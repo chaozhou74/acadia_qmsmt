@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from numpy.typing import NDArray
@@ -98,22 +98,23 @@ class QubitRpmRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), (0, 1), self.qubit_amplitudes)
+
+        data = reshape_iq_data_by_axes(self.data["points"].records(), (0, 1), self.qubit_amplitudes, to_complex=True)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
-        self.data_iq = data.astype(float).view(complex).squeeze()
 
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
 
-        self.data_to_fit = np.mean((1-np.sign(self.data_iq.real))/2, axis=0)
-        self.data_sigma = np.std((1-np.sign(self.data_iq.real))/2, axis=0)/np.sqrt(len(self.data_iq))
-
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
+        self.sigma_shots = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
 
         from acadia_qmsmt.analysis.fitting import Cosine
-        self.fit_1 = Cosine(self.qubit_amplitudes, self.data_to_fit[1], sigma=self.data_sigma[1],
+        self.fit_1 = Cosine(self.qubit_amplitudes, self.avg_shots[1], sigma=self.sigma_shots[1],
                             params={"phi":{"value": np.pi,
                                          "fixed": True}
                                     })
@@ -121,7 +122,7 @@ class QubitRpmRuntime(QMsmtRuntime):
         fitted_f_1 = self.fit_1.ufloat_results["f"].n
 
         # use the period of the high contrast one as fixed parameter for the low contrast one
-        self.fit_0 = Cosine(self.qubit_amplitudes, self.data_to_fit[0], sigma=self.data_sigma[0],
+        self.fit_0 = Cosine(self.qubit_amplitudes, self.avg_shots[0], sigma=self.sigma_shots[0],
                             params={"f":{"value":fitted_f_1,
                                          "fixed": True},
                                     "phi":{"value": np.pi,

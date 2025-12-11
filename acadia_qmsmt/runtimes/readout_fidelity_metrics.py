@@ -7,7 +7,7 @@ from acadia.runtime import annotate_method
 
 class ReadoutFidelityRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the rabi time
+    A :class:`Runtime` subclass for readout fidelity metrics
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig

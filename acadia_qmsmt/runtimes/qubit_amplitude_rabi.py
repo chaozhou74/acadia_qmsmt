@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from numpy.typing import NDArray
@@ -97,18 +97,21 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         save_registered_plots(self)
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, readout_classifier: str = None):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"] = None):
+        """
+        Process the currently acquired readout data.
+        """
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
         from acadia_qmsmt.analysis.fitting import Cosine
 
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_amplitudes)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.qubit_amplitudes, to_complex=True)
         if data is None:
             return
 
         completed_iterations = len(data)
         readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
 
-        self.data_complex = data.astype(float).view(complex).reshape(completed_iterations, len(self.qubit_amplitudes))
+        self.data_complex = data
         self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
         self.avg_shots = np.mean(self.shots, axis=0)
         
