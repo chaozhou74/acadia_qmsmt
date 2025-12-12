@@ -1,10 +1,8 @@
 from typing import Union, Literal
 
 import numpy as np
-from numpy.typing import NDArray
-from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime
+from acadia import Acadia, DataManager
 from acadia.sample_arithmetic import sample_to_complex
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig, Qubit
 from acadia.runtime import annotate_method

@@ -1,10 +1,9 @@
-from typing import Union, Literal
+from typing import Union
 
 import numpy as np
-from scipy.optimize import curve_fit
 
 from acadia import Acadia, DataManager
-from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig, QubitQmCooler
+from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
 def esplit(s, sep=','):
