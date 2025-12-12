@@ -1,5 +1,6 @@
 from typing import Union, Literal, List
 import math
+import warnings
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axis import Axis
@@ -104,6 +105,7 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
     fft_peak_threshold: Relative threshold (0–1) to mask out low FFT peaks.
     :return:
     """
+    warnings.warn(f"`plot_pcolormesh_fft` is deprecated, use `analysis.chevron` instead.", category=DeprecationWarning)
     fig, ax = prepare_plot_axes(plot_ax, axs_shape=(1, 1), figsize=figsize)
     ax.set_ylabel("FFT Frequency")
     ax.set_title(f"FFT of time signal")
@@ -125,8 +127,6 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
     x_peak = sweep_freqs[peak_mask]
     freq_peak = fft_freqs[fft_max_idxes][peak_mask]
 
-
-    
     pcm = ax.pcolormesh(sweep_freqs, fft_freqs, fft_data.T, cmap="inferno", shading="auto")
     fig.colorbar(pcm, ax=ax)
     # ax.plot(x_peak, freq_peak, 'w.', label="Peak Trace", linestyle='')
@@ -165,9 +165,7 @@ def plot_pcolormesh_fft(sweep_freqs, fft_freqs, fft_data, plot_ax=None, figsize=
         "swap_time": swap_time,
     }
 
-
     return fig, ax, params
-    return fig, ax
 
 
 def plot_histogram(val_dict, err_dict = None, plot_axs=None, add_labels=True):

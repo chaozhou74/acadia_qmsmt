@@ -194,10 +194,13 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
     @annotate_method(button_name="update qubit frequency (if Ramsey)")
     def update_frequencies(self):
-        
+
         if not self.do_echo:
             if self.fit is not None:
                 self.qubit_freq = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
+                # we assume the virtual detuning is large enough that the apparent detuning always has the same sign
+                # as the virtual detuning
+                detuning = self.virtual_detuning - abs(self.fit.ufloat_results['f'].n*1e6) * np.sign(self.virtual_detuning)
                 self.update_io_yaml_field("qubit_stimulus", f"channel_config.nco_frequency", 
-                                          np.round(self.qubit_freq - (self.fit.ufloat_results['f'].n*1e6 - self.virtual_detuning))
+                                          np.round(self.qubit_freq + detuning)
                 )

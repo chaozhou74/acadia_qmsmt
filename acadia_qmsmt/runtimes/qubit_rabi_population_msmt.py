@@ -9,7 +9,7 @@ from acadia.runtime import annotate_method
 
 class QubitRpmRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.plot_pcolormesh_fft
+    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig

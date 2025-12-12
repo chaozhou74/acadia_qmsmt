@@ -1,4 +1,4 @@
-from typing import Union, Literal
+from typing import Union, Annotated
 
 import numpy as np
 
@@ -128,18 +128,19 @@ class BSAmpFreqSweepPulseSSBRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
         # First make sure that we actually have new data to process
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.bs_detunes, self.bs_amplitudes)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.bs_detunes, self.bs_amplitudes, to_complex=True)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
 
-        # Threshold the data according to the I quadrature
-        shots = (1 - np.sign(data[..., 0], dtype=np.int32))/2
-        self.avg = np.mean(shots, axis=0)
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
 
         return completed_iterations
 
@@ -149,7 +150,7 @@ class BSAmpFreqSweepPulseSSBRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, ax = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        pcm = ax.pcolormesh(self.bs_detunes/1e6, self.bs_amplitudes, self.avg.T, vmin=0, vmax=1, cmap="bwr")
+        pcm = ax.pcolormesh(self.bs_detunes/1e6, self.bs_amplitudes, self.avg_shots.T, vmin=0, vmax=1, cmap="bwr")
         fig.colorbar(pcm, ax=ax, label="epop")
 
         ax.set_xlabel("BS freq (MHz)")

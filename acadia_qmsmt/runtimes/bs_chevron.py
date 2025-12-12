@@ -1,10 +1,12 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 
 from acadia import Acadia, DataManager
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig, QubitQmCooler
 from acadia.runtime import annotate_method
+import logging
+logger = logging.getLogger("acadia")
 
 
 class BSChevronRuntime(QMsmtRuntime):
@@ -76,6 +78,7 @@ class BSChevronRuntime(QMsmtRuntime):
                 a.barrier()
                 bs_stimulus_io.schedule_pulse(self.bs_pulse_name, stretch_length=bs_length_reg)
 
+
             with a.channel_synchronizer():
                 readout_resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
 
@@ -138,67 +141,56 @@ class BSChevronRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self):
+    def process_current_data(self, sweep_freq_min_GHz=None, sweep_freq_max_GHz=None,
+                             fft_freq_min_MHz=None, fft_freq_max_MHz=None, 
+                             fft_peak_threshold=0.4, fit_freq_scale:int=1,
+                             readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
         # First make sure that we actually have new data to process
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.bs_frequencies, self.flat_length_list)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.bs_frequencies, self.flat_length_list, to_complex=True)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
-
+        completed_iterations = len(data)
+        
         if self.cool_qm_rounds > 0:
             # merge all sweep axes
             self.prep_data = reshape_iq_data_by_axes(self.data["prep"].records())
 
-        # Threshold the data according to the I quadrature
-        shots = (1 - np.sign(data[..., 0], dtype=np.int32))/2
-        self.avg = np.mean(shots, axis=0)
+        # Threshold the data
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
 
-        # do fft on line cuts
-        from acadia_qmsmt.analysis import fft
-        self.fft_freqs, self.fft_data= fft(self.flat_length_list, self.avg, axis=1, remove_zero_freq=True)
+        from acadia_qmsmt.analysis.chevron import Chevron
+        self.chevron_analysis = Chevron(self.bs_frequencies, self.flat_length_list, self.avg_shots)
+        try:
+            self.chevron_analysis.fit_fft(peak_threshold=fft_peak_threshold,
+                                        sweep_freq_min=sweep_freq_min_GHz*1e9 if sweep_freq_min_GHz is not None else None,
+                                        sweep_freq_max=sweep_freq_max_GHz*1e9 if sweep_freq_max_GHz is not None else None,
+                                        fft_freq_min=fft_freq_min_MHz*1e6 if fft_freq_min_MHz is not None else None,
+                                        fft_freq_max=fft_freq_max_MHz*1e6 if fft_freq_max_MHz is not None else None,
+                                        freq_scale=fit_freq_scale)
+        except Exception as e:
+            logger.warning(f"Failed to fit chevron fft result, {e}", exc_info=True)
         
-        # for plot title
         self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")    
         self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")    
-
         return completed_iterations
 
 
     @annotate_method(plot_name="chevron", axs_shape=(1,1))
     def plot_chevron(self, axs=None):
-        from acadia_qmsmt.plotting import prepare_plot_axes
-        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
-        pcm = axs.pcolormesh(self.bs_frequencies/1e9, self.flat_length_list*1e6, self.avg.T, vmin=0, vmax=1, cmap="bwr")
-        fig.colorbar(pcm, ax=axs, label="epop")
-        axs.set_xlabel("BS freq (GHz)")
-        axs.set_ylabel("Time (us)")
+        fig, axs = self.chevron_analysis.plot_chevron(ax=axs, figsize=self.figsize)
         axs.set_title(f"bs_scale: {self.bs_scale:.4g}, VOP: {self.bs_vop}")
         fig.tight_layout()
         return fig, axs
 
 
     @annotate_method(plot_name="fft", axs_shape=(1,1))
-    def plot_fft(self, axs=None, fft_peak_threshold=0.4, root_quadratic_fit:bool=True, 
-                 fit_freq_min=None, fit_freq_max=None):
-        from acadia_qmsmt.plotting import prepare_plot_axes
-        from acadia_qmsmt.plotting.plotters import plot_pcolormesh_fft
-        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
-        plot_pcolormesh_fft(self.bs_frequencies/1e9, self.fft_freqs/1e6, self.fft_data, plot_ax=axs,
-                            root_quadratic_fit=root_quadratic_fit, fft_peak_threshold=fft_peak_threshold,
-                            fit_freq_min=fit_freq_min, fit_freq_max=fit_freq_max)
-
-        axs.set_xlabel("BS freq (GHz)")
-        axs.set_ylabel("FFT freq (MHz)")
-
-        fig.tight_layout()
+    def plot_fft(self, axs=None):
+        fig, axs = self.chevron_analysis.plot_fft(ax=axs, figsize=self.figsize)
         return fig, axs
-
-
-    # @annotate_method(button_name="update_NCO")
-    # def update_NCO(self, NCO_Hz:float=None):
-    #     self.update_io_yaml_field("bs_stimulus", "channel_config.nco_frequency", np.round(self.fitted_f0.n))
 
     
     # generate plots for each prep dynamically
@@ -215,6 +207,20 @@ class BSChevronRuntime(QMsmtRuntime):
                 return fig, axs
             return plot
 
-        # generate plotter functions and add them to class attributes 
+        # generate plotter functions and add them to class attributes
         if self.cool_qm_rounds>0:
             setattr(self, "plot_prep_msmts", plot_factory("prep msmts"))
+
+    
+    @annotate_method(button_name="coarse_swap_update")
+    def update_coarse_swap_time(self):
+        
+        # Find the center frequency from the FFT data, use that for frequency
+        if (self.chevron_analysis.fitted_f0 is not None) and (self.chevron_analysis.fitted_t0 is not None) and (self.chevron_analysis.fitted_t0>0):
+            best_swap_scale = self.bs_amp
+            best_swap_time = round(self.chevron_analysis.fitted_t0*1e9 / 5) * 5e-9  # sec to ns
+            best_swap_freq = self.chevron_analysis.fitted_f0  # GHz to Hz
+
+            self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", best_swap_freq)
+            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.scale", best_swap_scale)
+            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.flat", best_swap_time)

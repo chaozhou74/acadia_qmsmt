@@ -3,14 +3,14 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 from acadia_qmsmt.plotting import prepare_plot_axes
-from acadia_qmsmt.analysis import fft
+from acadia_qmsmt.utils.fourier_transform import fft_mag
 
 class Chevron:
     def __init__(self, sweep_freqs_Hz:np.ndarray, t_list_sec:np.ndarray, data:np.ndarray):
         self.sweep_freqs_Hz = sweep_freqs_Hz
         self.t_list_sec = t_list_sec
         self.data = data
-        self.fft_freqs, self.fft_data = fft(self.t_list_sec, self.data, axis=1, remove_zero_freq=True)
+        self.fft_freqs, self.fft_data = fft_mag(self.t_list_sec, self.data, axis=1, remove_zero_freq=True)
 
         self.fitted_f0 = None
         self.fitted_g = None
@@ -22,8 +22,6 @@ class Chevron:
             self.fit_center_time_linecut()
         except Exception as e:
             pass
-            # logger.warning(f"Failed to fit fft result, {e}")
-
 
     def plot_chevron(self, ax:Axes=None, figsize=None):
         fig, axs = prepare_plot_axes(ax, axs_shape=(1,1), figsize=figsize)

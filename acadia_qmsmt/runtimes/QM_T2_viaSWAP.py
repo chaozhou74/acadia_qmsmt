@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -99,11 +99,6 @@ class QMT2Runtime(QMsmtRuntime):
                     qubit.schedule_pulse(self.qubit_pi_pulse_name)
                     a.barrier()
                     bs_stimulus_io.schedule_pulse(self.bs_pulse_name)
-                    
-            # Start the counter for the 2nd half wait and wait until it reaches zero
-            # counter_2.start_count(inc=int(np.int32(-1).astype(np.uint32)))
-            # with a.sequencer().repeat_until(counter_2 == 0):
-            #     pass
 
             with a.channel_synchronizer():
                 qubit_stimulus_io.dwell(counter_2)
@@ -179,22 +174,23 @@ class QMT2Runtime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self):
-        from acadia_qmsmt.analysis import FFT, reshape_iq_data_by_axes
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
+        # First make sure that we actually have new data to process
+        from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+        from acadia_qmsmt.utils.fourier_transform import fft_mag
         
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times, to_complex=True)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
 
-        self.data_iq = data.astype(float).view(complex).squeeze()
-        self.avg_iq = np.mean(self.data_iq, axis=0)
-        self.shots = (1-np.sign(self.data_iq.real))/2
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
 
-        # Threshold the data according to the I quadrature
-        self.data_to_fit = np.mean(self.shots, axis=0)
-        self.data_sigma = np.std(self.shots, axis=0)/np.sqrt(completed_iterations)
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
+        self.sigma_shots = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
+
 
         if self.cool_qm_rounds > 0:
             # merge all sweep axes
@@ -202,11 +198,11 @@ class QMT2Runtime(QMsmtRuntime):
 
         from acadia_qmsmt.analysis.fitting import ExpCosine
         self.delay_times_us = self.delay_times * 1e6
-        self.fit = ExpCosine(self.delay_times_us, self.data_to_fit, self.data_sigma)
+        self.fit = ExpCosine(self.delay_times_us, self.avg_shots, self.sigma_shots)
         self.fitted_t2_us = self.fit.ufloat_results["tau"]
         self.fitted_detune_MHz = self.fit.ufloat_results["f"]
 
-        self.fft = FFT(self.delay_times*1e6, self.data_to_fit)
+        self.fft_freq, self.fft_data = fft_mag(self.delay_times*1e6, self.avg_shots)
         return completed_iterations
 
 
@@ -229,7 +225,12 @@ class QMT2Runtime(QMsmtRuntime):
 
     @annotate_method(plot_name="2: T2 fft", axs_shape=(1,1))
     def plot1_T2_fft(self, axs=None):
-        fig, axs = self.fft.plot_1d(axs, t_unit="us")
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
+        axs.plot(self.fft_freq, self.fft_data)
+        axs.set_yscale("log")
+        axs.grid(True)
+        axs.set_xlabel("Frequency (MHz)")
         return fig, axs
 
     @annotate_method(plot_name="3: T2_bin_averaged", axs_shape=(1,1))
