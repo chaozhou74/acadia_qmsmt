@@ -1,9 +1,8 @@
 from typing import Union, Annotated
 
 import numpy as np
-from numpy.typing import NDArray
 
-from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia import Acadia, DataManager
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 

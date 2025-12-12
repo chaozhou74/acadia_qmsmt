@@ -1,17 +1,15 @@
 from typing import Union, Annotated
 
 import numpy as np
-from numpy.typing import NDArray
-from scipy.optimize import curve_fit
 
-from acadia import Acadia, DataManager, Runtime, WaveformMemory
+from acadia import Acadia, DataManager
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
 
 class QubitEFPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.plot_pcolormesh_fft
+    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig

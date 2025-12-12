@@ -15,7 +15,7 @@ from scipy.signal.windows import hann as scipy_hann
 from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Operation
 from acadia.compiler import ManagedResource, Symbol
 from acadia.sample_arithmetic import complex_to_sample
-from acadia.utils import clock_monotonic_ns
+
 
 ##############################################################
 # Todo: IN ACADIA_QMSMT
@@ -42,7 +42,7 @@ logger = logging.getLogger("acadia_qmsmt")
 # This is for handling floating point tolerance when computing waveforms
 TOLERANCE = 1e-15
 # This is the list of kwargs which aren't passed to waveform shape functions (hann etc) defined in InputOutputWaveforms.
-KWARG_EXCLUDE_LIST = ["data", "scale", "detune", "ramp", "flat", "use_stretch", "memory_length", "name"]
+KWARG_EXCLUDE_LIST = ["data", "scale", "phase", "detune", "ramp", "flat", "use_stretch", "memory_length", "name"]
 
 def make_hash(val):
     '''Converts a dict/list/tuple to a hashable type'''
@@ -101,6 +101,13 @@ class InputOutputWaveforms:
         Calculate a Hann (or raised-cosine) function for a given list of times
         """
         return 0.5 * (1 - np.cos(2 * np.pi * t))
+    
+    @staticmethod
+    def hann_drag(t: NDArray, rel_drag: float) -> NDArray:
+        """
+        Calculate a DRAG pulse with a Hann base pulse for a given list of times
+        """
+        return 0.5 * (1 - np.cos(2 * np.pi * t)) + (rel_drag * np.pi * np.sin(2 * np.pi * t) * 1j)
 
     @staticmethod
     def hamming(t: NDArray) -> NDArray:
@@ -211,31 +218,40 @@ class InputOutputWaveforms:
         output[cond4] = func((t[cond4] - 0.5*(1 - ramp + flat))/ramp, **kwargs)
 
     @staticmethod
-    def scale_detune_pulse(pulse: NDArray, scale: Union[complex, list, tuple, NDArray] = None,
+    def scale_detune_pulse(pulse: NDArray, scale: Union[complex, list, tuple, NDArray] = None, phase: Union[complex, list, tuple, NDArray] = None,
                            detune: Union[float, list, tuple, NDArray] = None, sample_frequency: float = 8e8) -> NDArray:
         ''' 
         Scale and detune a pulse. Multichromatic pulses are implemented by 
         providing tuples, lists or NDarrays of scale and detune values, which must have the
-        same length.
+        same length. :phase: can also be passed as an alternative to giving a complex scale.
         '''
         if isinstance(scale, (list, tuple, np.ndarray)) and isinstance(detune, (list, tuple, np.ndarray)):
             if len(scale) != len(detune):
                 raise ValueError("If scale and detune are tuples or lists, they must have the same length.")
+            if phase is not None:
+                if len(phase) != len(scale): # NOTE: currently not accounting for case where you want multiple scales and detunes, but single phase
+                    raise ValueError("If phase is a tuple or list, it must have the same length as scale and detune.")
+                    
         else:
             if isinstance(scale, (tuple, list, np.ndarray)):
                 detune = tuple(detune for _ in scale)
+                phase = tuple(phase for _ in scale)
             elif isinstance(detune, (tuple, list, np.ndarray)):
                 scale = tuple(scale for _ in detune) 
+                phase = tuple(phase for _ in detune)
             else:
                 scale = (scale,)
                 detune = (detune,)
+                phase = (phase,)
         pulse_out = np.zeros_like(pulse, dtype=np.complex128)
-        for s, d in zip(scale, detune):
+        for s, d, p in zip(scale, detune, phase):
             if s is None:
                 s = 1
             if d is not None:
                 t = np.arange(pulse.size, dtype=np.float64) / sample_frequency
                 s = np.multiply(s, np.exp(2 * np.pi * 1j * d * t))
+            if p is not None:
+                s = np.multiply(s, np.exp(1j * p)) # NOTE: phase in radians
             pulse_out = np.add(pulse_out, np.multiply(pulse, s))
         if (np.abs(pulse_out) > 1).any():
             raise ValueError("The scaled pulse exceeds the maximum value of 1. ")
@@ -517,6 +533,7 @@ class InputOutput:
         pulse_config = self.get_pulse_config(pulse).copy()
         pulse_config.update(kwargs)
         scale = pulse_config.get("scale", None)
+        phase = pulse_config.get("phase", None)
         detune = pulse_config.get("detune", None)
         use_stretch = pulse_config.get("use_stretch", False)
         if use_stretch and detune is not None:
@@ -538,6 +555,7 @@ class InputOutput:
                     # when changing just scale and detuning
                     waveform_0_config = pulse_config.copy()
                     waveform_0_config["scale"] = None
+                    waveform_0_config["phase"] = None
                     waveform_0_config["detune"] = None
                     complex_samples = self.compute_pulse(waveform_0_config, return_raw=False)
             
@@ -553,7 +571,7 @@ class InputOutput:
                 else: # we just use the data directly
                     complex_samples = pulse_config["data"]
                 
-                complex_samples = InputOutputWaveforms.scale_detune_pulse(complex_samples, scale, detune, self._channel.interface_sample_frequency)
+                complex_samples = InputOutputWaveforms.scale_detune_pulse(complex_samples, scale, phase, detune, self._channel.interface_sample_frequency)
                 # cache complex samples for scaling and detuning
                 self._pulse_cache[pulse_config["name"]]['waveforms'][pulse_hash]["complex_samples"] = complex_samples
 
@@ -565,7 +583,7 @@ class InputOutput:
         else:
             # Pulse without name will not be cached
             complex_samples = pulse_config["data"]
-            complex_samples = InputOutputWaveforms.scale_detune_pulse(complex_samples, scale, detune, self._channel.interface_sample_frequency)
+            complex_samples = InputOutputWaveforms.scale_detune_pulse(complex_samples, scale, phase, detune, self._channel.interface_sample_frequency)
             raw_samples = complex_to_sample(complex_samples)
         
         if return_raw:
@@ -1523,6 +1541,73 @@ class Qubit:
 
             reg.load(measurement_resonator.get_measurement())
         
+        return reg
+    
+    def conditional_pulse(self, 
+            state_quadrant: Literal[1,2,3,4],
+            measurement_resonator: MeasurableResonator = None,
+            qubit_pulse_if_true: Union[str, Dict, WaveformMemory] = None,
+            qubit_pulse_if_false: Union[str, Dict, WaveformMemory] = None,
+            measurement_pulse: Union[str, Dict, WaveformMemory] = None,
+            measurement_capture_waveform_memory: str = None,
+            measurement_cmacc_window: str = None,
+            measurement_post_delay: float = 2e-6,
+            state_register = None) -> None:
+        
+        """
+        A subsequence that applies a pulse on the qubit conditional on a measurement
+
+        :param state_quadrant: The quadrant (in [1,2,3,4]) where the target state blob falls in.
+            If it falls in the target quadrant, no pulse is applied.
+        :param measurement_resonator: The resonator to be used for measurement
+            and conditional operations.
+        :param qubit_pulse_if_true: The pulse to be played on the qubit when the measurement
+            is in the target quadrant.
+        :param qubit_pulse_if_false: The pulse to be played on the qubit when the measurement
+            is not in the target quadrant.
+        :param measurement_pulse: The pulse to be played on the measurement resonator.
+        :param measurement_capture_waveform_memory: The name of the measurement
+            resonator capture waveform. Note that the result of the measurement
+            can be obtained from here for further processing.
+        :param measurement_cmacc_window: CMACC window for the measuremnt 
+        :param measurement_post_delay: delay after measurement before starting the next pulse sequnece, in seconds
+        :param state_register: The register to store the measurement result. If None, a new register will be created.
+
+        returns: The register containing the final measurement result.
+        """
+
+        measurement_resonator = measurement_resonator or self.readout_resonator
+        if measurement_resonator is None:
+            raise ValueError("measurement resonator must be provided for qubit.prepare")
+
+        a = self._stimulus._acadia
+        quadrant_reg_value = getattr(a, f"CMACC_QUADRANT_{state_quadrant}")
+        reg = a.sequencer().Register() if state_register is None else state_register
+
+        # do an initial msmt
+        with a.channel_synchronizer():
+            measurement_resonator.measure(measurement_pulse,
+                                        measurement_capture_waveform_memory,
+                                        measurement_cmacc_window)
+        
+        reg.load(measurement_resonator.get_measurement())
+
+        # wait for readout to empty
+        with a.channel_synchronizer():
+            self._stimulus.dwell(measurement_post_delay)
+    
+        # Apply no pulse if in specified quadrant
+        # Note that both the speculations are set to True
+        # This can help ensure that both branches take similar time
+        with a.sequencer().test(reg == quadrant_reg_value):
+            with a.channel_synchronizer():
+                self._stimulus.schedule_pulse(qubit_pulse_if_true)
+                
+        # Apply pulse if not in specified quadrant
+        with a.sequencer().test(reg != quadrant_reg_value):
+            with a.channel_synchronizer():
+                self._stimulus.schedule_pulse(qubit_pulse_if_false)
+
         return reg
 
     def schedule_pulse(self, waveform_memory: Union[str, WaveformMemory] = None,

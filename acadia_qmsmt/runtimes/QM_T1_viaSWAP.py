@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Union, Annotated
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -32,8 +32,7 @@ class QMT1Runtime(QMsmtRuntime):
     capture_window_name: str = "matched"
 
     cool_swap_pulse_name: str = "swap"
-    cool_qm_rounds: int = 2
-
+    cool_qm_rounds: int = 0
 
     plot: bool = True
     figsize: tuple[int] = None
@@ -152,20 +151,22 @@ class QMT1Runtime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
         # First make sure that we actually have new data to process
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times)
+        
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times, to_complex=True)
         if data is None:
             return
-        else:
-            completed_iterations = len(data)
 
-        self.data_iq = data.astype(float).view(complex).squeeze()
-        self.avg_iq = np.mean(self.data_iq, axis=0)
-        self.shots = (1-np.sign(self.data_iq.real))/2
-        self.data_to_fit = np.mean(self.shots, axis=0)
-        self.data_sigma = np.std(self.shots, axis=0)/np.sqrt(completed_iterations)
+        completed_iterations = len(data)
+        readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+
+        self.data_complex = data
+        self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
+        self.avg_shots = np.mean(self.shots, axis=0)
+        self.sigma_shots = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
+
 
         if self.cool_qm_rounds > 0:
             # merge all sweep axes
@@ -173,7 +174,7 @@ class QMT1Runtime(QMsmtRuntime):
 
         from acadia_qmsmt.analysis.fitting import Exponential
         self.delay_times_us = self.delay_times * 1e6
-        self.fit = Exponential(self.delay_times_us, self.data_to_fit, sigma=self.data_sigma)
+        self.fit = Exponential(self.delay_times_us, self.avg_shots, sigma=self.sigma_shots)
         self.fitted_t1_us = self.fit.ufloat_results["tau"]
 
         return completed_iterations

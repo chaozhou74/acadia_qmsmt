@@ -3,7 +3,7 @@ qb_stimulus:
   channel_config:
     vop: 30000 # Gain of the DAC, ~ 2000-40000
     mix_reconstruction: true # flase # for scope check # Set to falso for zero order hold (ZOH) reconstruction
-    nco_frequency: 8.0477e+9      # 50e6 # for scope check
+    nco_frequency: 8.047785109e+9 # 50e6 # for scope check
   pulses:
     R_x_180:
       data: hann
@@ -42,7 +42,7 @@ ro_stimulus:
   channel_config:
     vop: 35000
     mix_reconstruction: true
-    nco_frequency: 9.309049799e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
+    nco_frequency: 9.309035232e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
   pulses:
     readout:
       data: hann
@@ -54,7 +54,7 @@ ro_stimulus:
 ro_capture:
   channel: ADC0
   channel_config:
-    nco_frequency: 9.309049799e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
+    nco_frequency: 9.309035232e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
   memories:
     readout_trace:
       length: 3e-6
@@ -70,10 +70,10 @@ ro_capture:
       offset: [0, 0]
     matched:
       data: 0.1
-      offset: [90, 3887]
+      offset: [61, 3638]
     matched_biased_g:
       data: 0.1
-      offset: [-910, 3887]
+      offset: [-939, 3638]
   classifiers:
     default:
       type: RealQuadratureClassifier
@@ -86,14 +86,20 @@ qb_alice_bs_stimulus:
   channel_config:
     vop: 30000
     mix_reconstruction: false
-    nco_frequency: 2.64131e9 # 20e6 # for scope check
+    nco_frequency: 1.84396931e+9  # 20e6 # for scope check
   pulses:
-    swap:
+    swap_stretchable:
       data: hann
       scale: 0.036
       ramp: 120e-9
       flat: 100e-9
       use_stretch: true
+    swap:
+      data: hann
+      scale: 0.1
+      ramp: 120e-9
+      flat: 3.5e-8
+      use_stretch: false
     bs_50_50:
       data: hann
       scale: 0.036

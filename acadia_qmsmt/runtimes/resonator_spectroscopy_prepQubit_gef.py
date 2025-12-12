@@ -7,7 +7,7 @@ from acadia.sample_arithmetic import sample_to_complex
 from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, IOConfig, Qubit
 from acadia.runtime import annotate_method
 
-class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
+class ResonatorSpectroscopyPrepQubitGEFRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for readout spectroscopy
     """
@@ -21,7 +21,8 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    qubit_pulse_name: str = "R_x_180"
+    qubit_ge_pulse_name: str = "R_x_180"
+    qubit_gf_pulse_name: str = "R_x_180_gf"
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
     capture_window_name: str = None
@@ -43,11 +44,27 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         self.data.add_group(f"points", uniform=True)
 
         # Create a sequence for the sequencer to generate the pulse and capture it
+        prep_selection_cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
+
         def sequence(a: Acadia):
-            with a.channel_synchronizer():
-                qubit_stimulus_io.schedule_pulse(self.qubit_pulse_name)
-                a.barrier()
-                resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
+            prep_selection_reg = a.sequencer().Register()
+            prep_selection_reg.load(prep_selection_cache[0])
+            
+            with a.sequencer().test(prep_selection_reg == 0):
+                with a.channel_synchronizer():
+                    resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
+
+            with a.sequencer().test(prep_selection_reg == 1):
+                with a.channel_synchronizer():
+                    qubit_stimulus_io.schedule_pulse(self.qubit_ge_pulse_name)
+                    a.barrier()
+                    resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
+            
+            with a.sequencer().test(prep_selection_reg == 2):
+                with a.channel_synchronizer():
+                    qubit_stimulus_io.schedule_pulse(self.qubit_gf_pulse_name)
+                    a.barrier()
+                    resonator.measure(self.readout_pulse_name, self.capture_memory_name, self.capture_window_name)
 
         # Compile the sequence
         self.acadia.compile(sequence)
@@ -63,13 +80,14 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         resonator.load_windows()
         # Load the stimulus waveform named "readout" with the specified signal
         stimulus_io.load_pulse(self.readout_pulse_name)
-        qubit_pipulse_scale = qubit_stimulus_io.get_config("pulses", self.qubit_pulse_name, "scale")
+        qubit_stimulus_io.load_pulse(self.qubit_ge_pulse_name)
+        qubit_stimulus_io.load_pulse(self.qubit_gf_pulse_name)
 
         for i in range(self.iterations):
             for frequency in self.frequencies:
                 resonator.set_frequency(frequency)
-                for prep in [0,1]:
-                    qubit_stimulus_io.load_pulse(self.qubit_pulse_name, scale=qubit_pipulse_scale*prep)
+                for prep in [0,1,2]:
+                    prep_selection_cache[0] = prep
                     # capture data and put in the corresponding group
                     self.acadia.run(minimum_delay=self.run_delay)
                     wf = capture_io.get_waveform_memory(self.capture_memory_name)
@@ -98,7 +116,7 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
     @annotate_method(is_data_processor=True)
     def process_current_data(self, e_delay:Union[float, str]="auto", fit_type:Literal["mag", "phase"]="phase"):
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        data = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies, [0, 1])
+        data = reshape_iq_data_by_axes(self.data["points"].records(), self.frequencies, [0, 1, 2])
         if data is None:
             return
         else:
@@ -106,7 +124,6 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         self.data_iq = data.astype(float).view(complex).squeeze()
         self.avg_iq = np.mean(self.data_iq, axis=0)
         self.fit_type = fit_type
-
 
         if e_delay == "auto":
             # find edelay
@@ -123,14 +140,17 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
             from acadia_qmsmt.analysis.fitting import Lorentzian
             self.fit_g = Lorentzian(self.frequencies, np.abs(self.avg_iq[:, 0]))
             self.fit_e = Lorentzian(self.frequencies, np.abs(self.avg_iq[:, 1]))
+            self.fit_f = Lorentzian(self.frequencies, np.abs(self.avg_iq[:, 2]))
             
         elif fit_type == "phase":
             from acadia_qmsmt.analysis.fitting import Arctan
             self.fit_g = Arctan(self.frequencies, self.phase_corrected[:, 0]/np.pi*180)
             self.fit_e = Arctan(self.frequencies, self.phase_corrected[:, 1]/np.pi*180)
+            self.fit_f = Arctan(self.frequencies, self.phase_corrected[:, 2]/np.pi*180)
 
         self.fitted_f0_g = self.fit_g.ufloat_results["x0"]
         self.fitted_f0_e = self.fit_e.ufloat_results["x0"]
+        self.fitted_f0_f = self.fit_f.ufloat_results["x0"]
 
         return completed_iterations
     
@@ -140,7 +160,7 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(2,1), figsize=self.figsize)
 
-        for i in range(2):
+        for i in range(3):
             axs[0].plot(self.frequencies, np.abs(self.avg_iq_corrected[:, i]), "o")
             phases = self.phase_corrected # if unwrap_phase else self.phase_corrected % (2*np.pi)
             axs[1].plot(self.frequencies, phases[:, i]/np.pi*180, ".-")
@@ -148,6 +168,7 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         plot_fit_ax = axs[0] if self.fit_type == "mag" else axs[1]
         self.fit_g.plot_fitted(plot_fit_ax, label=f"prep g f0: {self.fitted_f0_g}")
         self.fit_e.plot_fitted(plot_fit_ax, label=f"prep e f0: {self.fitted_f0_e}")
+        self.fit_f.plot_fitted(plot_fit_ax, label=f"prep f f0: {self.fitted_f0_f}")
         plot_fit_ax.legend()
 
         axs[1].set_xlabel("Frequency [Hz]")
