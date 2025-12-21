@@ -128,35 +128,52 @@ class LoopbackAmpSweepRuntime(QMsmtRuntime):
         # gather time and IQ trace data
         self.t_data = np.array(self.data["t_data"].records()).astype(float).squeeze()
 
-        self.traces = reshape_iq_data_by_axes(self.data["traces"].records(), self.amp_list, self.t_data)
+        self.traces_iq = reshape_iq_data_by_axes(self.data["traces"].records(), self.amp_list, self.t_data)
+        self.traces_pwr = self.traces_iq[...,0]**2 + self.traces_iq[...,1]**2
         
 
-        if self.traces is None:
+        if self.traces_iq is None:
             return
         else:
-            completed_iterations = len(self.traces)
+            completed_iterations = len(self.traces_iq)
 
-
-        self.traces_avg = np.mean(self.traces, axis=0)
+        self.avg_trace_iq = np.mean(self.traces_iq, axis=0)
+        self.avg_trace_pwr = np.mean(self.traces_pwr, axis=0)
 
         return  completed_iterations
 
 
-    @annotate_method(plot_name="1 all traces", axs_shape=(1,1))
-    def plot_all_traces(self, axs=None, ):
+    @annotate_method(plot_name="1 all traces, iq", axs_shape=(1,1))
+    def plot_all_traces_iq(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1, 1), figsize=self.figsize)
         
         for i, amp in enumerate(self.amp_list):
-            axs.plot(self.t_data, self.traces_avg[i, :, 0], label=f"Amp: {amp:.2f}", color=f"C{i}")
-            axs.plot(self.t_data, self.traces_avg[i, :, 1], linestyle='--', color=f"C{i}")
+            axs.plot(self.t_data, self.avg_trace_iq[i, :, 0], label=f"Amp: {amp:.2f}", color=f"C{i}")
+            axs.plot(self.t_data, self.avg_trace_iq[i, :, 1], linestyle='--', color=f"C{i}")
         axs.set_xlabel("Time (ns)")
+        axs.set_ylabel("Voltage [a.u.]")
         axs.legend()
         axs.grid(True)
+        fig.tight_layout()
         return fig, axs
 
-    @annotate_method(plot_name="2 individual traces", axs_shape=(1,1))
-    def plot_ind_traces(self, axs=None, sel_amp:Annotated[float, "slider", "self.amp_list"]=None):
+    @annotate_method(plot_name="2 all traces, pwr", axs_shape=(1,1))
+    def plot_all_traces_pwr(self, axs=None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1, 1), figsize=self.figsize)
+        
+        for i, amp in enumerate(self.amp_list):
+            axs.plot(self.t_data, self.avg_trace_pwr[i], label=f"Amp: {amp:.2f}", color=f"C{i}")
+        axs.set_xlabel("Time (ns)")
+        axs.set_ylabel("Power [a.u.]")
+        axs.legend()
+        axs.grid(True)
+        fig.tight_layout()
+        return fig, axs
+
+    @annotate_method(plot_name="3 individual traces, iq", axs_shape=(1,1))
+    def plot_ind_traces_iq(self, axs=None, sel_amp:Annotated[float, "slider", "self.amp_list"]=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1, 1), figsize=self.figsize)
 
@@ -165,9 +182,28 @@ class LoopbackAmpSweepRuntime(QMsmtRuntime):
         
         amp_index = np.argmin(np.abs(np.array(self.amp_list) - sel_amp))
         amp = self.amp_list[amp_index]
-        axs.plot(self.t_data, self.traces_avg[amp_index, :, 0], label=f"Amp: {amp:.2f}, real")
-        axs.plot(self.t_data, self.traces_avg[amp_index, :, 1], linestyle='--', label=f"Amp: {amp:.2f}, imag")
+        axs.plot(self.t_data, self.avg_trace_iq[amp_index, :, 0], label=f"Amp: {amp:.2f}, real")
+        axs.plot(self.t_data, self.avg_trace_iq[amp_index, :, 1], linestyle='--', label=f"Amp: {amp:.2f}, imag")
         axs.set_xlabel("Time (ns)")
+        axs.set_ylabel("Voltage [a.u.]")
+        axs.legend()
+        axs.grid(True)
+        return fig, axs
+
+
+    @annotate_method(plot_name="4 individual traces, pwr", axs_shape=(1,1))
+    def plot_ind_traces_pwr(self, axs=None, sel_amp:Annotated[float, "slider", "self.amp_list"]=None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, axs = prepare_plot_axes(axs, axs_shape=(1, 1), figsize=self.figsize)
+
+        if sel_amp is None:
+            sel_amp = self.amp_list[0]
+        
+        amp_index = np.argmin(np.abs(np.array(self.amp_list) - sel_amp))
+        amp = self.amp_list[amp_index]
+        axs.plot(self.t_data, self.avg_trace_pwr[amp_index], label=f"Amp: {amp:.2f}, real")
+        axs.set_xlabel("Time (ns)")
+        axs.set_ylabel("Power [a.u.]")
         axs.legend()
         axs.grid(True)
         return fig, axs

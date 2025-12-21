@@ -1265,7 +1265,7 @@ class MeasurableResonator:
 
 
     def get_measurement(self, 
-                        format: Literal["quadrant", "re_sign", "im_sign"]) -> Union[int, Operation]:
+                        classifier: Literal["quadrant", "re_sign", "im_sign"]="quadrant") -> Union[int, Operation]:
         """
         Retrieves a measurement from the CMACC in the given format.
 
