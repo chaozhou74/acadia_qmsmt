@@ -26,16 +26,13 @@ from acadia.sample_arithmetic import complex_to_sample
 # Todo: Should we allow get_waveform_memory to take a dictionary? 
 
 ##############################################################
-# Todo: IN RUNTIMES
-# Todo: Avoid hardcoding the pulse/memory names in the runtimes
-##############################################################
 # Todo: LOW PRIORITY
 # Todo: Cleanup functions which aren't needed
 # Todo: Adjust the imports in the __init__ file of acadia_qmsmt
 # Todo: load_chromatic_waveform need not interact with the waveform memory
 # Todo: Giving samples whose maximum value is 1 is causing overflow in the DAC
 # Todo: Have type checking for all values read from a config file
-# Todo: Do users even check logger warnings? Is there a better way to raise them?
+
 
 __all__ = ["InputOutput", "InputOutputWaveforms", "QMsmtRuntime", "MeasurableResonator"]
 logger = logging.getLogger("acadia_qmsmt")
@@ -225,25 +222,45 @@ class InputOutputWaveforms:
         providing tuples, lists or NDarrays of scale and detune values, which must have the
         same length. :phase: can also be passed as an alternative to giving a complex scale.
         '''
-        if isinstance(scale, (list, tuple, np.ndarray)) and isinstance(detune, (list, tuple, np.ndarray)):
-            if len(scale) != len(detune):
-                raise ValueError("If scale and detune are tuples or lists, they must have the same length.")
-            if phase is not None:
-                if len(phase) != len(scale): # NOTE: currently not accounting for case where you want multiple scales and detunes, but single phase
-                    raise ValueError("If phase is a tuple or list, it must have the same length as scale and detune.")
-                    
+
+        # --- normalize (scale, phase, detune) into tuples of equal length ---
+        def _is_seq(x) -> bool:
+            return isinstance(x, (list, tuple, np.ndarray))
+
+        vals = {"scale": scale, "phase": phase, "detune": detune}
+        seq_names = [k for k, v in vals.items() if _is_seq(v)]
+
+        # If more than two are sequences, ensure they have the same length
+        if len(seq_names) >= 2:
+            lengths = {k: len(vals[k]) for k in seq_names}
+            # Conversion to a set will highlight non-matching lengths
+            if len(set(lengths.values())) != 1:
+                raise ValueError(
+                    "If two or more of scale/phase/detune are lists/tuples/arrays, "
+                    f"they must have the same length. Got lengths: {lengths}"
+                )
+            # Use that common length
+            N = list(lengths.values())[0]
+        # If only one is a sequence, use its length
+        elif len(seq_names) == 1:
+            N = len(vals[seq_names[0]])
+        # If none are sequences, use length 1
         else:
-            if isinstance(scale, (tuple, list, np.ndarray)):
-                detune = tuple(detune for _ in scale)
-                phase = tuple(phase for _ in scale)
-            elif isinstance(detune, (tuple, list, np.ndarray)):
-                scale = tuple(scale for _ in detune) 
-                phase = tuple(phase for _ in detune)
-            else:
-                scale = (scale,)
-                detune = (detune,)
-                phase = (phase,)
+            N = 1
+
+        def _to_tuple(x, N: int):
+            if _is_seq(x):
+                return tuple(x)
+            return (x,) * N
+
+        scale  = _to_tuple(scale,  N)
+        phase  = _to_tuple(phase,  N)
+        detune = _to_tuple(detune, N)
+        # --- end normalize ---
+
+        
         pulse_out = np.zeros_like(pulse, dtype=np.complex128)
+        logger.info(f"Scale: {scale}, Detune: {detune}, Phase: {phase}")
         for s, d, p in zip(scale, detune, phase):
             if s is None:
                 s = 1
@@ -651,7 +668,7 @@ class InputOutput:
         else:
             use_stretch = self.get_pulse_config(pulse).get("use_stretch", False)
             if not use_stretch and stretch_length != 0:
-                logger.warning(f"{self._make_pulse_id_message(pulse)} had 'use_stretch = True' in the configuration, "
+                logger.warning(f"{self._make_pulse_id_message(pulse)} had 'use_stretch = False' in the configuration, "
                                f"but a non-zero stretch length: '{stretch_length}' is used in `schedule_pulse`."
                                 "This may lead to unexpected results.")
       
@@ -1501,6 +1518,7 @@ class Qubit:
         :param measurement_cmacc_window: CMACC window for the measuremnt 
         :param measurement_post_delay: delay after measurement before starting the next pulse sequnece, in seconds
 
+        returns: The register containing the final measurement result.
         """
         # raise NotImplementedError("This function currently appears to be buggy. To avoid unexpected behavior, use a long `run_delay` for now")
         
@@ -1650,7 +1668,7 @@ class QubitQmCooler:
                 ro_pulse_name: str = None,
                 ro_capture_mem: str = None,
                 ro_cmacc_window: str = None,
-                bs_pulse_name: str = None,
+                bs_pulse_name: Union[str, Dict, WaveformMemory] = None,
                 qm_cooling_rounds=1,
                 measurement_post_delay: float = 100e-9,
                 state_register = None) -> None:
