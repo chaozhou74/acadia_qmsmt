@@ -260,7 +260,6 @@ class InputOutputWaveforms:
 
         
         pulse_out = np.zeros_like(pulse, dtype=np.complex128)
-        logger.info(f"Scale: {scale}, Detune: {detune}, Phase: {phase}")
         for s, d, p in zip(scale, detune, phase):
             if s is None:
                 s = 1
