@@ -1,7 +1,7 @@
 # Setting up a New SSD in WSL/Linux
 
 ## Prerequisites
-- New SSD physically installed in the PC.
+- New SSD physically installed in the PC (NVMe is preferred if available).
 - (Optional) Note down the **serial number** so you can identify it for sure later.
 
 ---
@@ -275,6 +275,9 @@ sudo chown -R $USER:$USER /mnt/Data
 
 ## Step 4. (Optional) Setup NFS Share
 
+This allows you to share the new drive over the local network to other PCs running WSL/Linux, so you can process data 
+on a separate computer or running experiments there while still saving data to the same physical drive.
+
 ### 4A. Pre-setup when using WSL: Configure WSL to Use Bridged Networking
 > Skip this step if you are using a native Linux PC.
 
@@ -312,22 +315,22 @@ We need to set up WSL to use a bridged network connection, so it is exposed to t
    In **PowerShell (Admin)**, run:
    ```powershell
    # Generate a unique MAC using Hyper-V OUI (00-15-5D) + random tail
-   $rand = Get-Random -Maximum 0xFFFFFF
-   $mac  = "00-15-5D-{0:X2}-{1:X2}-{2:X2}" -f (($rand -shr 16) -band 0xFF), (($rand -shr 8) -band 0xFF), ($rand -band 0xFF)
-
-   # Path to .wslconfig
-   $wslconfig = "$env:USERPROFILE\.wslconfig"
-
-   # Write config (overwrite if exists)
-   @"
-   [wsl2]
-   networkingMode=bridged
-   vmSwitch=WSLBridge
-   macAddress=$mac
-   "@ | Set-Content -Encoding ASCII $wslconfig
-
-   Write-Host "Generated MAC: $mac"
-   Write-Host "Saved to $wslconfig"
+    $rand = Get-Random -Maximum 0xFFFFFF
+    $mac  = "00-15-5D-{0:X2}-{1:X2}-{2:X2}" -f (($rand -shr 16) -band 0xFF), (($rand -shr 8) -band 0xFF), ($rand -band 0xFF)
+    
+    # Path to .wslconfig
+    $wslconfig = "$env:USERPROFILE\.wslconfig"
+    
+    # Write config (overwrite if exists)
+    @"
+    [wsl2]
+    networkingMode=bridged
+    vmSwitch=WSLBridge
+    macAddress=$mac
+    "@ | Set-Content -Encoding ASCII $wslconfig
+    
+    Write-Host "Generated MAC: $mac"
+    Write-Host "Saved to $wslconfig"
    ```
    > The random MAC address generation is kind of a hack to ensure WSL gets a unique MAC address, so that the WSL instance can get a fixed and unique IP address from the DHCP server of the bridged network.
    
@@ -355,14 +358,25 @@ In **WSL** (or native  **Linux**) terminal, set up the NFS server to share the m
    ```bash
    sudo apt install nfs-kernel-server
    ```
-2. Export the local mount directory by adding it to `/etc/exports`:
+2. Export the local mount directory:
    ```bash
-   echo "<MOUNTDIR> *(rw,sync,no_subtree_check,no_root_squash)" | sudo tee -a /etc/exports
+   sudo nano /etc/exports
+   ```
+   add
+   ```bash
+   <MOUNTDIR> \
+     <client_ip_1>(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000) \
+     <client_ip_2>(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)
    ```
 
    Replace `<MOUNTDIR>` with the actual mount path where your new drive is mounted (e.g., `/mnt/data`).
-
+   
+   Replace `<client_ip_1>` and `<client_ip_2>` with the IP addresses of the client machines that should have access.
+   
    > The option `rw` allows read-write access, if you want read-only access for safety, use `ro` instead.
+   
+   > If the client is WSL, make sure to do step 4A on the client computer, and use the **IP address shown inside WSL**, 
+   > not the Windows host IP.
 
 3. Restart NFS:
    ```bash
@@ -372,7 +386,7 @@ In **WSL** (or native  **Linux**) terminal, set up the NFS server to share the m
 ### 4C. Mount from Client Linux PC (on clinet WSL or Linux PC)
 
 In the **remote** WSL or Linux terminal:
-
+> On WSL, step 4A must be performed first on the client PC as well. 
 
 1. Install NFS tools on the client:
    ```bash

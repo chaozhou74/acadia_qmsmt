@@ -162,3 +162,14 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         return fig, axs
 
 
+    @annotate_method(button_name="update readout freq")
+    def update_amp(self, ro_freq:Literal["ge center", "f_ro^g", "f_ro^e"]="ge center"):
+        if ro_freq == "ge center":
+            f0 = (self.fitted_f0_g + self.fitted_f0_e)/2
+        elif ro_freq == "f_ro^g":
+            f0 = self.fitted_f0_g
+        elif ro_freq == "f_ro^e":
+            f0 = self.fitted_f0_e
+        self.update_io_yaml_field("stimulus", f"channel_config.nco_frequency", f0.n)
+        self.update_io_yaml_field("capture", f"channel_config.nco_frequency", f0.n)
+

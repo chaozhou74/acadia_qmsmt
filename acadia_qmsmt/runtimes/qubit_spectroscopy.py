@@ -142,7 +142,8 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
         axs.set_xlabel("Probe Frequency [Hz]")
         axs.set_ylabel("Average Measurement")
-        axs.set_ylim(-0.02, 1.02)
+        if np.ptp(self.avg_shots) > 0.5 and np.ptp(self.avg_shots) < 1.0:
+            axs.set_ylim(-0.02, 1.02)
 
         axs.legend()
         axs.grid(True)

@@ -175,7 +175,8 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
         axs.set_xlabel("Time [us]")
         axs.set_ylabel("Average Measurement")
-        axs.set_ylim(-0.02, 1.02)
+        if np.ptp(self.avg_shots) > 0.5 and np.ptp(self.avg_shots) < 1.0:
+            axs.set_ylim(-0.02, 1.02)
 
         axs.set_title(f"T2{'E' if self.do_echo else 'R'}: {self.fit.ufloat_results['tau']:.5g}")
 

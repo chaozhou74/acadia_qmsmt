@@ -123,13 +123,18 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
+        vop = self._ios["qubit_stimulus"].get_config("channel_config", "vop")
+        ramp = self._ios["qubit_stimulus"].get_config("pulses", self.qubit_pulse_name, "ramp")
+        flat = self._ios["qubit_stimulus"].get_config("pulses", self.qubit_pulse_name, "flat")
+
         axs.plot(self.qubit_amplitudes, self.avg_shots, "o")
         self.fit.plot_fitted(axs, oversample=5, label=f"pi_amp: {self.fitted_pi_amp:.5g}")
 
         axs.set_xlabel("Drive Amplitude [DAC full-scale]")
         axs.set_ylabel("Average Measurement")
-        axs.set_ylim(-0.02, 1.02)
-
+        if np.ptp(self.avg_shots) > 0.5 and np.ptp(self.avg_shots) < 1.0:
+            axs.set_ylim(-0.02, 1.02)
+        axs.set_title(f"VOP: {vop:.5g}, ramp: {ramp:.5g}, flat: {flat:.5g}")
         axs.legend()
         return fig, axs
 

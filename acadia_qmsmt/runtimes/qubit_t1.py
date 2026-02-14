@@ -133,7 +133,8 @@ class QubitRelaxationRuntime(QMsmtRuntime):
         axs.set_title(f"T1: {self.fit.ufloat_results['tau']:.5g}")
         axs.set_xlabel("Time [us]")
         axs.set_ylabel("Average Measurement")
-        axs.set_ylim(-0.02, 1.02)
+        if np.ptp(self.avg_shots) > 0.5 and np.ptp(self.avg_shots) < 1.0:
+            axs.set_ylim(-0.02, 1.02)
 
         axs.legend()
         return fig, axs
