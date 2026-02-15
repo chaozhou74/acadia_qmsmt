@@ -102,5 +102,7 @@ class MaximalVarianceAxisClassifier(RealQuadratureClassifier):
         res = minimize_scalar(std_q, bounds=[0, 2*np.pi])
         angle = res.x
         data_rotated = data * np.exp(1j * angle)
-        data_centered = data_rotated - np.mean(data_rotated)
+        # guess I component center based on min and max of rotated blobs
+        i_center = (np.min(data_rotated.real) + np.max(data_rotated.real)) / 2
+        data_centered = data_rotated - i_center
         return super().classify(data_centered)
