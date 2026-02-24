@@ -1,7 +1,7 @@
 import os
 import time
 from itertools import product
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Literal
 from pathlib import Path
 from datetime import datetime
 
@@ -280,11 +280,16 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
     
     @annotate_method(plot_name = "4. capture power")
-    def plot_capture_amplitude_post_selected(self, axs=None, plot_decay_fit:bool=True, decay_start_time_us:float = None):
+    def plot_capture_amplitude_post_selected(self, axs=None, plot_decay_fit:bool=True, decay_start_time_us:float = None, fit_type:Literal['<power>', '<voltage>^2'] = '<voltage>^2'):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, figsize=self.figsize)
-        axs.plot(self.t_data*1e6, self.g_trace_pwr, label="g trace")
-        axs.plot(self.t_data*1e6, self.e_trace_pwr, label="e trace")
+        if fit_type=='<power>': 
+            axs.plot(self.t_data*1e6, self.g_trace_pwr, label="g trace")
+            axs.plot(self.t_data*1e6, self.e_trace_pwr, label="e trace")
+        elif fit_type=='<voltage>^2': 
+            axs.plot(self.t_data*1e6, np.abs(self.g_trace_avg)**2, label="g trace")
+            axs.plot(self.t_data*1e6, np.abs(self.e_trace_avg)**2, label="e trace")
+            
         axs.set_xlabel("Time (us)")
         axs.grid()
         axs.legend()
@@ -296,8 +301,14 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
             decay_start_idx = np.argmin(np.abs(self.t_data - decay_start_time))
 
             t_data_decay_us = self.t_data[decay_start_idx:] * 1e6
-            g_data_decay_us = self.g_trace_pwr[decay_start_idx:]
-            e_data_decay_us = self.e_trace_pwr[decay_start_idx:]
+            if fit_type=='<power>': 
+                g_data_decay_us = self.g_trace_pwr[decay_start_idx:]
+                e_data_decay_us = self.e_trace_pwr[decay_start_idx:]
+            elif fit_type=='<voltage>^2': 
+                g_data_decay_us = np.abs(self.g_trace_avg[decay_start_idx:])**2
+                e_data_decay_us = np.abs(self.e_trace_avg[decay_start_idx:])**2
+            else: 
+                raise NameError('Please use <power> or <voltage>^2 as `fit_type`.')
 
             self.g_fit = Exponential(t_data_decay_us, g_data_decay_us)
             self.e_fit = Exponential(t_data_decay_us, e_data_decay_us)

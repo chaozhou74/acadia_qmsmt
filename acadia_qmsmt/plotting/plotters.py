@@ -246,7 +246,7 @@ def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max
     from acadia_qmsmt.analysis.tomography import _digits_in_base
     rho = np.array(rho)
     dim = rho.shape[0]
-    n_qubits = int(np.sqrt(dim))
+    n_qubits = int(np.log2(dim))
     basis_labels = ["".join(row.astype(str)) for row in _digits_in_base(2, n_qubits)]
     
     cmap_2d = cmap2d_balanced if cmap_2d is None else cmap_2d

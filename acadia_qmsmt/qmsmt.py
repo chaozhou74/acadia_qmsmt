@@ -16,6 +16,7 @@ from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Ope
 from acadia.compiler import ManagedResource, Symbol
 from acadia.sample_arithmetic import complex_to_sample
 
+from itertools import product
 
 ##############################################################
 # Todo: IN ACADIA_QMSMT
@@ -1417,6 +1418,7 @@ class Qubit:
         """
         self._stimulus = stimulus
         self.readout_resonator = readout_resonator
+        self._acadia = self._stimulus._acadia
 
     def set_frequency(self, frequency: float, sync: bool = True):
         """
@@ -1635,17 +1637,170 @@ class Qubit:
 
         self._stimulus.schedule_pulse(waveform_memory, stretch_length, **kwargs)
 
-    def load_pulse(self, pulse_name:str, **kwargs):
+    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None, **kwargs):
         """
         Load a pulse into the stimulus.
         """
-        self._stimulus.load_pulse(pulse_name, **kwargs)
+        self._stimulus.load_pulse(pulse_name, pulse, **kwargs)
 
     def dwell(self, length: float):
         """
         Dwell for a specified duration.
         """
         self._stimulus.dwell(length)
+
+
+    def tomo_with_pulse(self, pulse:str, readout_pulse_name:str, capture_memory_name:str, capture_window_name:str):
+        """
+        Schedule tomography along a single "direction". Must be called inside a sequencer.
+
+        This:
+        - schedules ``pulse`` on ``qubit``
+        - idles each readout pulse+capture for the qubit pulse duration of the corresponding qubit
+        - plays the readout pulses and start capture
+        """
+        pulse_config = self._stimulus.get_pulse_config(pulse)
+        pulse_len = pulse_config['flat'] + pulse_config['ramp']
+        self._stimulus.schedule_pulse(pulse)
+
+        # `dwell` rather than `a.barrier()` so that tomography can be scheduled on n qubits simultaneously
+        # if :meth: `tomo_with_pulse` is used in a `for` loop.
+        self.readout_resonator._stimulus.dwell(pulse_len)
+        self.readout_resonator._capture.dwell(pulse_len)
+        self.readout_resonator.measure(readout_pulse_name, capture_memory_name, capture_window_name)
+            
+
+
+    def _make_tomo_pulses(self, qubit_pi_pulse_name:str, symmetrize:bool=True):
+        """
+        Precompute and cache the single-qubit tomography rotation pulses used for 
+        measurement along different Pauli axes, based on the reference pi pulse.
+
+        For unsymmetrized measurements, only the ``*p`` (positive) pulses are used.  
+        For symmetrized measurements, each tomography direction is measured along both the 
+        nominal axis and its anti-parallel counterpart (``*m``), with the latter's data 
+        weighted by a negative sign to symmetrize measurement errors.
+
+        The "Zp" tomography case effectively corresponds to an empty pulse.
+        Here it is implemented as a 0-amplitude pulse of the same nominal length as the other
+        tomography pulses for simplicity. In principle, this could be replaced
+        with a dwell to save memory, but the current way just makes programming easier...
+
+        """
+
+        msmt_bases = {'X': -90, 'Y': 0, 'Z': 0} # holds azimuthal angle info
+        signs = {'p': 90, 'm': -90} if symmetrize else {'p': 90} # holds polar angle info
+        msmt_dirs = ["".join(p) for p in product(msmt_bases, signs)] # create pulse names
+
+        # populate pulse dict
+        tomo_pulse_dict = {}
+        for dir in msmt_dirs:
+            azim = msmt_bases[dir[0]]
+            pol = signs[dir[1]]
+            if dir[0] == 'Z': pol -= 90 # polar angles for Z are 0 and -180
+
+            tomo_pulse_dict[dir] = self.make_rotation_pulse(pol, azim, qubit_pi_pulse_name)
+
+        self.tomo_pulse_dict = tomo_pulse_dict
+        return tomo_pulse_dict
+    
+
+    def full_1q_tomo(self, tomo_cache, core:callable, qubit_pi_pulse_name:str,
+                    readout_pulse_name:str, capture_memory_name:str, capture_window_name:str,
+                    tomo_reg=None, symmetrize=True):
+        '''
+        Runs n-qubit tomograpy for the specific case of a single qubit.
+        '''
+        n_qubit_tomo([self], tomo_cache, core, [qubit_pi_pulse_name], 
+                    [readout_pulse_name], [capture_memory_name], [capture_window_name],
+                    tomo_reg, symmetrize)
+    
+
+
+    def load_tomo_pulses(self):
+        '''
+        Loads tomography pulses for a single qubit.
+        NOTE: this is kept only for backwards compatibility.
+        '''
+        load_tomo_pulses([self])
+
+
+
+    def n_mode_tomo(self, tomo_cache, state_mapping_fns:List[callable], qubit_pi_pulse_name:str,
+                    readout_pulse_name:str, capture_memory_names:List[str], capture_window_name:str, 
+                    tomo_reg=None, symmetrize:bool=True):
+        """
+        Build a full n-mode tomography program on the sequencer which will perform tomography on n modes via
+        a single qubit.
+
+        High-level idea:
+        - We create tomography rotation pulses for the qubit.
+        - For each tomography "direction" (XX, XY, ..., ZZ, plus sign flips if
+          ``symmetrize=True``) on the n modes, we:
+          1. iterate through the n modes to do the following:
+          2. run the user's `core(a)` sequence (to prepare the n-mode state),
+          3. map the chosen ith mode back to the qubit using ``state_mapping_fns[i]``
+          4. apply the appropriate tomography rotations on the qubit,
+          5. measure the qubit
+          6. repeat this for all n modes in a row.
+
+        The directions are indexed and wrapped in
+        ``with a.sequencer().test(tomo_reg == direction_idx):``
+        so the hardware can branch per-iteration.
+
+        ``symmetrize=True`` means we also flip +/- signs on each axis so you can
+        do simple sign-averaging of readout bias. That turns 3^n Pauli axes
+        into 6^n runs (each axis with 2^n sign combos like ``pp, pm, mp, mm`` etc.).
+
+
+        :param tomo_cache:
+            Pre-built sequencer program/data to load into ``tomo_reg`` before branching.
+            ``tomo_cache[0]`` is loaded into the register at the start. User need to define
+            and sweep over the cache value to perform the tomography in `main()`
+
+
+        :param state_mapping_fns:
+            List of callables for each of the n modes which will map the mode state
+            onto the qubit being used to perform tomography.    
+            Core preparation should be in `state_mapping_fns[0]`
+        
+        :param tomo_reg:
+            Optional sequencer register. If ``None``, a fresh register is created.
+
+        :param bool symmetrize:
+            If ``True``, include +/- axis flips for both qubits, giving 6^n total
+            branches instead of 3^n. If ``False``, only the normal +axes are used.
+        """
+
+        num_modes = len(state_mapping_fns)
+        all_msmt_dirs = define_msmt_dirs(num_modes, symmetrize)
+
+        a = self._acadia # grab instance of acadia
+        if tomo_reg is None:
+            tomo_reg = a.sequencer().Register()
+        tomo_reg.load(tomo_cache[0])
+
+        self._make_tomo_pulses(qubit_pi_pulse_name, symmetrize)
+
+        for dir_idx, msmt_dir in enumerate(all_msmt_dirs):
+
+            for i in range(num_modes):
+
+                # pull msmt operator name from the n-operator string which is
+                # specific to the ith mode
+                state_mapping_fn = state_mapping_fns[i]
+                capt_mem = capture_memory_names[i]
+                msmt_dir_1qb = msmt_dir[2*i:2*i+2]
+                tomo_pulse_1qb = self.tomo_pulse_dict[msmt_dir_1qb]
+
+
+                with a.sequencer().test(tomo_reg == dir_idx):
+                    state_mapping_fn(a) # map mode i to the qubit
+
+                    with a.channel_synchronizer():
+                        self.tomo_with_pulse(tomo_pulse_1qb, readout_pulse_name, capt_mem, capture_window_name)
+
+
 
 class QubitQmCooler:
     """
@@ -1701,100 +1856,90 @@ class TwoQubit:
         """
         self.qubit1 = qubit1
         self.qubit2 = qubit2
-        self._acadia = self.qubit1._stimulus._acadia
 
-    def _tomo_with_pulse(self, pulse1:str, pulse2:str, readout1_pulse_name:str, capture1_memory_name:str, capture1_window_name:str,
-                        readout2_pulse_name:str, capture2_memory_name:str, capture2_window_name:str):
-
-        """
-        Schedule two-qubit tomography along a single "direction".
-
-        This:
-        - schedules ``pulse1`` on ``qubit1`` and ``pulse2`` on ``qubit2``
-        - idles each readout pulse+capture for the qubit pulse duration of the corresponding qubit
-        - plays the readout pulses and start capture
-
-        """
-
-        a = self._acadia
-        with a.channel_synchronizer():
-            pulse1_config = self.qubit1._stimulus.get_pulse_config(pulse1)
-            pulse1_len = pulse1_config['flat'] + pulse1_config['ramp']
-            self.qubit1._stimulus.schedule_pulse(pulse1)
-            self.qubit1.readout_resonator._stimulus.dwell(pulse1_len)
-            self.qubit1.readout_resonator._capture.dwell(pulse1_len)
-            self.qubit1.readout_resonator.measure(readout1_pulse_name, capture1_memory_name, capture1_window_name)
-            
-            pulse2_config = self.qubit2._stimulus.get_pulse_config(pulse2)
-            pulse2_len = pulse2_config['flat'] + pulse2_config['ramp']
-            self.qubit2._stimulus.schedule_pulse(pulse2)
-            self.qubit2.readout_resonator._stimulus.dwell(pulse2_len)
-            self.qubit2.readout_resonator._capture.dwell(pulse2_len)
-            self.qubit2.readout_resonator.measure(readout2_pulse_name, capture2_memory_name, capture2_window_name)
-
-    def _make_tomo_pulses(self, qubit1_pi_pulse_name, qubit2_pi_pulse_name):
-        """
-        Precompute and cache the single-qubit tomography rotation pulses used for 
-        measurement along different Pauli axes, based on the reference pi pulses.
-
-        For unsymmetrized measurements, only the ``*p`` (positive) pulses are used.  
-        For symmetrized measurements, each tomography direction is measured along both the 
-        nominal axis and its anti-parallel counterpart (``*m``), with the latter's data 
-        weighted by a negative sign to symmetrize measurement errors.
-
-        The "Zp" tomography case effectively corresponds to an empty pulse.
-        Here it is implemented as a 0-amplitude pulse of the same nominal length as the other
-        tomography pulses for simplicity. In principle, this could be replaced
-        with a dwell to save memory, but the current way just makes programming easier...
-
-        """
-        X1p_tomo_pulse = self.qubit1.make_rotation_pulse(-90, 90, qubit1_pi_pulse_name)
-        X1m_tomo_pulse = self.qubit1.make_rotation_pulse(90, 90, qubit1_pi_pulse_name)
-        Y1p_tomo_pulse = self.qubit1.make_rotation_pulse(90, 0, qubit1_pi_pulse_name)
-        Y1m_tomo_pulse = self.qubit1.make_rotation_pulse(-90, 0, qubit1_pi_pulse_name)
-        Z1p_tomo_pulse = self.qubit1.make_rotation_pulse(0, 0, qubit1_pi_pulse_name)
-        Z1m_tomo_pulse = self.qubit1.make_rotation_pulse(180, 0, qubit1_pi_pulse_name)
-        
-        X2p_tomo_pulse = self.qubit2.make_rotation_pulse(-90, 90, qubit2_pi_pulse_name)
-        X2m_tomo_pulse = self.qubit2.make_rotation_pulse(90, 90, qubit2_pi_pulse_name)
-        Y2p_tomo_pulse = self.qubit2.make_rotation_pulse(90, 0, qubit2_pi_pulse_name)
-        Y2m_tomo_pulse = self.qubit2.make_rotation_pulse(-90, 0, qubit2_pi_pulse_name)
-        Z2p_tomo_pulse = self.qubit2.make_rotation_pulse(0, 0, qubit2_pi_pulse_name)
-        Z2m_tomo_pulse = self.qubit2.make_rotation_pulse(180, 0, qubit2_pi_pulse_name)
-        
-        tomo_pulse_dict = { "X1p": X1p_tomo_pulse, "X1m": X1m_tomo_pulse, 
-                            "Y1p": Y1p_tomo_pulse, "Y1m": Y1m_tomo_pulse,
-                            "Z1p": Z1p_tomo_pulse, "Z1m": Z1m_tomo_pulse,
-                            "X2p": X2p_tomo_pulse, "X2m": X2m_tomo_pulse, 
-                            "Y2p": Y2p_tomo_pulse, "Y2m": Y2m_tomo_pulse,
-                            "Z2p": Z2p_tomo_pulse, "Z2m": Z2m_tomo_pulse}
-        self.tomo_pulse_dict = tomo_pulse_dict
-        return tomo_pulse_dict
 
 
     def full_2q_tomo(self, tomo_cache, core:callable, qubit1_pi_pulse_name:str, qubit2_pi_pulse_name:str,
                     readout1_pulse_name:str, capture1_memory_name:str, capture1_window_name:str,
                     readout2_pulse_name:str, capture2_memory_name:str, capture2_window_name:str,
                     tomo_reg=None, symmetrize=True):
-        """
-        Build a full 2-qubit tomography program on the sequencer.
+        
+        '''
+        Runs n-qubit tomograpy for the specific case of two qubits.
+        '''
+        
+        n_qubit_tomo([self.qubit1, self.qubit2], tomo_cache, core, [qubit1_pi_pulse_name, qubit2_pi_pulse_name], 
+                    [readout1_pulse_name, readout2_pulse_name], [capture1_memory_name, capture2_memory_name], 
+                    [capture1_window_name, capture2_window_name], tomo_reg, symmetrize)
+
+
+    def load_tomo_pulses(self):
+        '''
+        Loads tomography pulses for two qubits.
+        NOTE: this is kept only for backwards compatibility.
+        '''
+        load_tomo_pulses([self.qubit1, self.qubit2])
+
+
+# ----------------------  helper functions -----------------------------
+
+def load_tomo_pulses(qubits:List[Qubit]):
+    """
+    Load tomography pulses that were generated by :meth:`qubit._make_tomo_pulses` 
+    into each qubit's stimulus memory.
+    """
+    for qubit in qubits:
+        for v in qubit.tomo_pulse_dict.values():
+            qubit.load_pulse(v)
+
+
+def define_msmt_dirs(num_qubits:int, symmetrize:bool):
+    '''
+    Construct names of msmt bases as strings of n-qubit operators ex. XpYm.
+    The ordering first cycles through all sign combos for a given n-qubit operator,
+    then moves onto the next operator.
+    '''
+     
+    msmt_bases = ['X', 'Y', 'Z']
+    signs = ['p', 'm'] if symmetrize else ['p']
+    
+    n_qb_bases = ["".join(p) for p in product(msmt_bases, repeat=num_qubits)]
+    n_qb_signs = ["".join(p) for p in product(signs, repeat=num_qubits)]
+
+    all_msmt_dirs = []
+    for n_qb_basis in n_qb_bases:
+        for n_qb_sign in n_qb_signs:
+            intleave = "".join(a + b for a, b in zip(n_qb_basis, n_qb_sign))
+            all_msmt_dirs.append(intleave)
+
+    return all_msmt_dirs
+
+
+
+def n_qubit_tomo(qubits: List[Qubit], tomo_cache, core:callable, qubit_pi_pulse_names:List[str], 
+                 readout_pulse_names:List[str], capture_memory_names:List[str], capture_window_names:List[str],
+                 tomo_reg=None, symmetrize:bool=True):
+    
+    """
+        Build a full n-qubit tomography program on the sequencer which will apply tomo pulses and measure qubits 
+        in the order provided. 
 
         High-level idea:
-        - We create / reuse tomography rotation pulses for each qubit.
+        - We create tomography rotation pulses for each qubit.
         - For each tomography "direction" (XX, XY, ..., ZZ, plus sign flips if
           ``symmetrize=True``), we:
           1. run the user's `core(a)` sequence (to prepare the 2q state),
           2. apply the appropriate tomography rotations on each qubit,
-          3. measure both qubits.
+          3. measure all qubits.
 
         The directions are indexed and wrapped in
         ``with a.sequencer().test(tomo_reg == direction_idx):``
         so the hardware can branch per-iteration.
 
         ``symmetrize=True`` means we also flip +/- signs on each axis so you can
-        do simple sign-averaging of readout bias. That turns 9 Pauli axes
-        into 36 runs (each axis with four sign combos ``pp, pm, mp, mm``).
-        
+        do simple sign-averaging of readout bias. That turns 3^n Pauli axes
+        into 6^n runs (each axis with 2^n sign combos like ``pp, pm, mp, mm`` etc.).
+
 
         :param tomo_cache:
             Pre-built sequencer program/data to load into ``tomo_reg`` before branching.
@@ -1806,70 +1951,46 @@ class TwoQubit:
             want to tomography after. It will be called once per tomography
             direction inside the branching block.
         
-            
         :param tomo_reg:
             Optional sequencer register. If ``None``, a fresh register is created.
+
         :param bool symmetrize:
-            If ``True``, include +/- axis flips for both qubits, giving 36 total
-            branches instead of 9. If ``False``, only the normal +axes are used.
+            If ``True``, include +/- axis flips for both qubits, giving 6^n total
+            branches instead of 3^n. If ``False``, only the normal +axes are used.
         """
+
+    
+    num_qubits = len(qubits)
+    all_msmt_dirs = define_msmt_dirs(num_qubits, symmetrize)
+
+    a = qubits[0]._acadia # grab instance of acadia
+    if tomo_reg is None:
+        tomo_reg = a.sequencer().Register()
+    tomo_reg.load(tomo_cache[0])
+
+    # first load all tomo pulses into memory
+    for i in range(num_qubits):
+        qubits[i]._make_tomo_pulses(qubit_pi_pulse_names[i], symmetrize)
+
+    for dir_idx, msmt_dir in enumerate(all_msmt_dirs):
+
+        for i in range(num_qubits):
         
-        a = self._acadia
-        tomo_pulse_dict = self._make_tomo_pulses(qubit1_pi_pulse_name, qubit2_pi_pulse_name)
+            qubit = qubits[i]
+            ro_pulse = readout_pulse_names[i]
+            capt_mem = capture_memory_names[i]
+            capt_window = capture_window_names[i]
 
-        if tomo_reg is None:
-                tomo_reg = a.sequencer().Register()
+            # pull msmt operator name from the n-operator string which is
+            # specific to the ith qubit, then retrieve corresponding tomo pulse
+            msmt_dir_1qb = msmt_dir[2*i:2*i+2]
+            tomo_pulse_1qb = qubit.tomo_pulse_dict[msmt_dir_1qb]
 
-        tomo_reg.load(tomo_cache[0])
-        
-        num_runs = 36 if symmetrize else 9
-
-        for direction_idx in range(num_runs):
-            if symmetrize:
-                pauli_str = _idx_to_pauli_str(direction_idx//4, 2)
-                direction_sign1 = ['p', 'm'][(direction_idx % 4) // 2]
-                direction_sign2 = ['p', 'm'][(direction_idx % 4) % 2]
-            else:
-                pauli_str = _idx_to_pauli_str(direction_idx, 2)
-                direction_sign1 = direction_sign2 = "p"
-
-            with a.sequencer().test(tomo_reg == direction_idx):
+            with a.sequencer().test(tomo_reg == dir_idx):
                 core(a) # run the core part, then do tomo among one direction.
-                self._tomo_with_pulse(tomo_pulse_dict[pauli_str[0] + f"1{direction_sign1}"], 
-                                    tomo_pulse_dict[pauli_str[1] + f"2{direction_sign2}"],
-                                    readout1_pulse_name, capture1_memory_name, capture1_window_name,
-                                    readout2_pulse_name, capture2_memory_name, capture2_window_name)
 
-
-    def load_tomo_pulses(self, symmetrize=True):
-        """
-        Load the tomography rotation pulses that were generated by
-        :meth:`_make_tomo_pulses` into each qubit's stimulus memory.
-
-        ** Remember to call this before calling `acadia.run()` **
-
-        """
-        for k, v in self.tomo_pulse_dict.items():
-            if k[1] == '1' and (symmetrize or k.endswith("p")):
-                self.qubit1._stimulus.load_pulse(v)
-            elif k[1] == '2' and (symmetrize or k.endswith("p")):
-                self.qubit2._stimulus.load_pulse(v)
-
-
-
-
-# ----------- generic helper functions -----------------------------
-@functools.cache
-def _idx_to_pauli_str(index:int, n_qubits:int) -> str:
-    """
-    Convert an integer index to an N-qubit Pauli string, using base-3 encoding.
-
-    Examples
-    --------
-    >>> idx_to_pauli_str(0, 3)
-    'XXX'
-    >>> idx_to_pauli_str(5, 3)  # 5 in base 3 → '012'
-    'XYZ'
-    """
-    base3 = np.base_repr(index, base=3).zfill(n_qubits)
-    return ''.join('XYZ'[int(d)] for d in base3)
+                # if there are multiple qubits, tomography will be scheduled 
+                # simultaneously on all of them
+                with a.channel_synchronizer():
+                    qubit.tomo_with_pulse(tomo_pulse_1qb, ro_pulse, capt_mem, capt_window)
+                                
