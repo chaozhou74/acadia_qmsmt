@@ -73,7 +73,11 @@ class FitterBase:
 
 
         self.params_supplied = {} if params is None else params
-        self.params_guess = self.guess(self.coordinates, self.data)
+        try:
+            self.params_guess = self.guess(self.coordinates, self.data)
+        except Exception as e:
+            logger.warning(f"Failed to guess parameters, {e}", exc_info=True)
+            self.params_guess = {}
         self._lmfit_params:lmfit.Parameters = None
         self._make_lmfit_params()
         self.param_order = list(self._lmfit_params.keys())
@@ -140,8 +144,8 @@ class FitterBase:
         self._lmfit_params = lmfit.Model(self.model).make_params()
         for name, param in self._lmfit_params.items():
             if name not in self.params_guess:
-                raise ValueError(f"Missing guess parameter {name}")
-            self._parse_params(param, self.params_guess[name])
+                raise logger.error(f"Missing guess parameter {name}")
+            self._parse_params(param, self.params_guess.get(name, {}))
             if name in self.params_supplied: # overwrite guess with supplied parameter
                 self._parse_params(param, self.params_supplied[name])
 

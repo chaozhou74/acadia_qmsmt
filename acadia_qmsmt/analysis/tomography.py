@@ -41,7 +41,10 @@ def parse_symmetrized_data(*shots_arr):
     n_qubits = len(shots_arr)
 
     # shots_arr below has shape (n_qubits, num_iterations, 3^n_qubits OR 6^n_qubits)
-    shots_arr = np.array(shots_arr)
+    if type(shots_arr[0]) == np.ma.masked_array:
+        shots_arr = np.ma.masked_array(shots_arr)
+    else:
+        shots_arr = np.array(shots_arr)
     
     # if trailing dim is 3^n_qubits, symmetrized data was not taken so we just return the shots_arr
     if np.shape(shots_arr)[-1] == 3**n_qubits:

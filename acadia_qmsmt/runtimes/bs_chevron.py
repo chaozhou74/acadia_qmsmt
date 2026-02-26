@@ -171,8 +171,13 @@ class BSChevronRuntime(QMsmtRuntime):
                                         fft_freq_min=fft_freq_min_MHz*1e6 if fft_freq_min_MHz is not None else None,
                                         fft_freq_max=fft_freq_max_MHz*1e6 if fft_freq_max_MHz is not None else None,
                                         freq_scale=fit_freq_scale)
+            self.best_swap_time = self.chevron_analysis.best_swap_time
+            self.best_swap_freq = self.chevron_analysis.best_swap_freq  # GHz to Hz
+
         except Exception as e:
             logger.warning(f"Failed to fit chevron fft result, {e}", exc_info=True)
+            self.best_swap_time = None
+            self.best_swap_freq = None
         
         self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")    
         self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")    
@@ -182,7 +187,7 @@ class BSChevronRuntime(QMsmtRuntime):
     @annotate_method(plot_name="chevron", axs_shape=(1,1))
     def plot_chevron(self, axs=None):
         fig, axs = self.chevron_analysis.plot_chevron(ax=axs, figsize=self.figsize)
-        axs.set_title(f"bs_scale: {self.bs_scale:.4g}, VOP: {self.bs_vop}")
+        axs.set_title(f"bs_scale: {self.bs_scale:.4g}, VOP: {self.bs_vop}\n {self.chevron_analysis.best_swap_str}")
         fig.tight_layout()
         return fig, axs
 
@@ -216,11 +221,7 @@ class BSChevronRuntime(QMsmtRuntime):
     def update_coarse_swap_time(self):
         
         # Find the center frequency from the FFT data, use that for frequency
-        if (self.chevron_analysis.fitted_f0 is not None) and (self.chevron_analysis.fitted_t0 is not None) and (self.chevron_analysis.fitted_t0>0):
-            best_swap_scale = self.bs_amp
-            best_swap_time = round(self.chevron_analysis.fitted_t0*1e9 / 5) * 5e-9  # sec to ns
-            best_swap_freq = self.chevron_analysis.fitted_f0  # GHz to Hz
-
-            self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", best_swap_freq)
-            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.scale", best_swap_scale)
-            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.flat", best_swap_time)
+        if (self.best_swap_freq is not None) and (self.best_swap_time is not None) and (self.best_swap_time>0):
+            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.scale", self.bs_scale)
+            self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", self.best_swap_freq)
+            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.flat", self.best_swap_time)

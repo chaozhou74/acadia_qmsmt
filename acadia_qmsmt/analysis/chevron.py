@@ -16,6 +16,8 @@ class Chevron:
         self.fitted_g = None
         self.fitted_g0 = None
         self.fitted_t0 = None
+        self.best_swap_freq = None
+        self.best_swap_time = None
 
         try:
             self.fit_fft()
@@ -31,6 +33,10 @@ class Chevron:
         axs.set_ylabel("Time (us)")
         axs.set_xlim(min(self.sweep_freqs_Hz)/1e9, max(self.sweep_freqs_Hz)/1e9)
         axs.set_ylim(min(self.t_list_sec)*1e6, max(self.t_list_sec)*1e6)
+        if (self.best_swap_freq is not None) and (self.best_swap_time is not None):
+            self.best_swap_str = f"Best SWAP freq: {self.best_swap_freq/1e9:.6g} GHz, time: {self.best_swap_time*1e9:.3g} ns"
+        else:
+            self.best_swap_str = ''
         if self.fitted_t0 is not None and self.fitted_f0 is not None:
 
             axs.plot(
@@ -89,6 +95,8 @@ class Chevron:
         self.fit_sweep_freq_min = sweep_freq_min
         self.fit_sweep_freq_max = sweep_freq_max
 
+        self.best_swap_freq = self.fitted_f0
+
         return self.fitted_f0, self.fitted_g
 
 
@@ -96,13 +104,19 @@ class Chevron:
         center_freq_idx = np.argmin(np.abs(self.sweep_freqs_Hz - self.fitted_f0))
         time_linecut = self.data[center_freq_idx, :]
 
-        def _fit_model(t, A, g0,t0):
-            return A * (1 - np.cos(2 * np.pi * 2 * g0 * (t-t0)))
-        p0 = (np.max(time_linecut), self.fitted_g, 1./(4*self.fitted_g))
-        bounds = ((0, 0, -np.inf), (1.0, np.inf, np.inf))
+        if time_linecut[0] < 0.5:# determine the sign of oscillation based on 1st data point
+            def _fit_model(t, A, g0, t0):
+                return A * (1 + np.cos(2 * np.pi * 2 * g0 * (t - t0)))
+        else:
+            def _fit_model(t, A, g0, t0):
+                return A * (1 - np.cos(2 * np.pi * 2 * g0 * (t - t0)))
+
+        p0 = (np.max(time_linecut), self.fitted_g, 1. / (4 * self.fitted_g))
+        bounds = ((0, 0, 0), (1.0, np.inf, np.inf))
         popt, pcov = curve_fit(_fit_model, self.t_list_sec, time_linecut, p0=p0, bounds=bounds)
         self.fitted_g0 = abs(popt[1])
         self.fitted_t0 = popt[2]
+        self.best_swap_time = round(self.fitted_t0 * 1e9 / 5) * 5e-9
         return self.fitted_g0, self.fitted_t0
 
 

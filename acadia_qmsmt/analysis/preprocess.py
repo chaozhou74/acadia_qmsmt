@@ -4,7 +4,7 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 from matplotlib import pyplot as plt
 
-def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray], to_complex:bool=False):
+def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray, tuple], to_complex:bool=False):
     """
     Reshape IQ data (data with last axis of shape 2)  to match the shape defined by the sweep axes.
     Truncates the data to exclude any incomplete iterations.

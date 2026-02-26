@@ -1973,24 +1973,20 @@ def n_qubit_tomo(qubits: List[Qubit], tomo_cache, core:callable, qubit_pi_pulse_
         qubits[i]._make_tomo_pulses(qubit_pi_pulse_names[i], symmetrize)
 
     for dir_idx, msmt_dir in enumerate(all_msmt_dirs):
+        with a.sequencer().test(tomo_reg == dir_idx):
+            core(a) # run the core part, then do tomo among one direction.
+            with a.channel_synchronizer():
+                for i in range(num_qubits):
+                    qubit = qubits[i]
+                    ro_pulse = readout_pulse_names[i]
+                    capt_mem = capture_memory_names[i]
+                    capt_window = capture_window_names[i]
 
-        for i in range(num_qubits):
-        
-            qubit = qubits[i]
-            ro_pulse = readout_pulse_names[i]
-            capt_mem = capture_memory_names[i]
-            capt_window = capture_window_names[i]
-
-            # pull msmt operator name from the n-operator string which is
-            # specific to the ith qubit, then retrieve corresponding tomo pulse
-            msmt_dir_1qb = msmt_dir[2*i:2*i+2]
-            tomo_pulse_1qb = qubit.tomo_pulse_dict[msmt_dir_1qb]
-
-            with a.sequencer().test(tomo_reg == dir_idx):
-                core(a) # run the core part, then do tomo among one direction.
-
-                # if there are multiple qubits, tomography will be scheduled 
-                # simultaneously on all of them
-                with a.channel_synchronizer():
+                    # pull msmt operator name from the n-operator string which is
+                    # specific to the ith qubit, then retrieve corresponding tomo pulse
+                    msmt_dir_1qb = msmt_dir[2 * i:2 * i + 2]
+                    tomo_pulse_1qb = qubit.tomo_pulse_dict[msmt_dir_1qb]
+                    # if there are multiple qubits, tomography will be scheduled
+                    # simultaneously on all of them
                     qubit.tomo_with_pulse(tomo_pulse_1qb, ro_pulse, capt_mem, capt_window)
                                 

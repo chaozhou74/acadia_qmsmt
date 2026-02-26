@@ -163,7 +163,7 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
 
 
     @annotate_method(button_name="update readout freq")
-    def update_amp(self, ro_freq:Literal["ge center", "f_ro^g", "f_ro^e"]="ge center"):
+    def update_freq(self, ro_freq:Literal["ge center", "f_ro^g", "f_ro^e"]="ge center"):
         if ro_freq == "ge center":
             f0 = (self.fitted_f0_g + self.fitted_f0_e)/2
         elif ro_freq == "f_ro^g":

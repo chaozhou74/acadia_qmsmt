@@ -128,6 +128,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
                                 e_radius: float = None,
                                 i_threshold = None, 
                                 q_threshold = None, 
+                                mask_with_pre_kernel: bool = True,
                                 bins: int = 50):
 
         # gather time and IQ trace data
@@ -142,7 +143,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         self.g_pts_raw = np.sum(self.g_traces_raw, axis=1)
         self.e_pts_raw = np.sum(self.e_traces_raw, axis=1)
         self.bins = bins
-        self.mask_with_pre_kernel = False
+        self.mask_with_pre_kernel = mask_with_pre_kernel
         
         completed_iterations = len(self.g_traces_raw)
         decimation_used = self.io("readout_capture").get_config("memories", self.capture_memory_name, "decimation")

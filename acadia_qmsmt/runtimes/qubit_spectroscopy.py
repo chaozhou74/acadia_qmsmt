@@ -136,7 +136,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        axs.errorbar(self.qubit_frequencies, self.avg_shots, yerr=self.sigma_shots, fmt="o")
+        axs.errorbar(self.qubit_frequencies, self.avg_shots, yerr=self.sigma_shots, fmt="-o")
         if self.fit is not None:
             self.fit.plot_fitted(axs, oversample=5, label=f"{self.fitted_f0:.5g}")
 
