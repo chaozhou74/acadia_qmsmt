@@ -104,7 +104,7 @@ class Chevron:
         center_freq_idx = np.argmin(np.abs(self.sweep_freqs_Hz - self.fitted_f0))
         time_linecut = self.data[center_freq_idx, :]
 
-        if time_linecut[0] < 0.5:# determine the sign of oscillation based on 1st data point
+        if np.mean(self.data[:, 0]) < 0.5:# determine the sign of oscillation based on 1st data point
             def _fit_model(t, A, g0, t0):
                 return A * (1 + np.cos(2 * np.pi * 2 * g0 * (t - t0)))
         else:
@@ -131,7 +131,7 @@ class Chevron:
                 return np.sqrt(g ** 2 + (f - f0) ** 2 * self.fit_freq_scale**2) # we enforce proper unit at the input of the class
 
             ax.plot(self.sweep_freq_fit/1e9, self.fft_freq_fit/1e6, 'w.', linestyle='')
-            title_text = f"f0: {self.fitted_f0/1e9:.5g} [GHz],   g: {self.fitted_g/1e6:.4g} [MHz],  Drive order: {self.fit_freq_scale}"
+            title_text = f"f0: {self.fitted_f0/1e9:.6g} [GHz],   g: {self.fitted_g/1e6:.4g} [MHz],  Drive order: {self.fit_freq_scale}"
             ax.set_title(f"FFT of time signal\n{title_text}")
             fine_x = np.linspace(min(self.sweep_freqs_Hz), max(self.sweep_freqs_Hz), len(self.sweep_freqs_Hz)*10)
             ax.plot(fine_x/1e9, _fit_model(fine_x, self.fitted_f0, self.fitted_g*2)/1e6, 'w--', label="Fit")
