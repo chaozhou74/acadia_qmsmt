@@ -4,13 +4,15 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 from matplotlib import pyplot as plt
 
-def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray, tuple], to_complex:bool=False):
+def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray, tuple, int], to_complex:bool=False):
     """
     Reshape IQ data (data with last axis of shape 2)  to match the shape defined by the sweep axes.
     Truncates the data to exclude any incomplete iterations.
 
     :param raw_data: np.ndarray, assumed to have shape (..., 2).
-    :param axes: sweep axes, provided from outermost to innermost. Each axis should be a list or np.ndarray.
+    :param axes: sweep axes, provided from outermost to innermost.
+        Each axis should be either a list, a np.ndarray or an int (length of the axis).
+         The product of the axis lengths determines how many points are in one iteration.
     :param to_complex:  when True, return data in `complex128`, the last axis (I, Q) will be removed.
 
     :return : np.ndarray of shape (completed_iterations, *len(axes), 2), or None if not enough data.
@@ -18,7 +20,10 @@ def reshape_iq_data_by_axes(raw_data, *axes: Union[list, np.ndarray, tuple], to_
 
     ax_shapes = []
     for ax in axes:
-        ax_shapes.append(len(ax))
+        if type(ax) is int:
+            ax_shapes.append(ax)
+        else:
+            ax_shapes.append(len(ax))
     raw_data = np.array(raw_data).reshape(-1, 2)
     points_per_iter = math.prod(ax_shapes)
     completed_iterations = len(raw_data) // points_per_iter

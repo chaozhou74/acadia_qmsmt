@@ -610,7 +610,7 @@ class InputOutput:
     
 
     def duplicate_pulse(self, old_pulse:Union[str, dict], new_pulse_name:str=None, 
-                        create_memory:bool=False, duplicate_waveforms:bool=False):
+                        create_memory:bool=False, duplicate_waveforms:bool=False, **new_pulse_kwargs) -> str:
         """
         Duplicate an existing pulse configuration and its waveform memory.
 
@@ -619,6 +619,9 @@ class InputOutput:
         :param duplicate_waveforms: If True, create the waveform memory for this pulse. 
             Usually this can be False, and `create_waveform_memory` will be called at the compile time.
         :param duplicate_waveforms: If True, duplicate the cached waveform data as well.
+        :param new_pulse_kwargs: Optional additional keyword arguments to override in the new pulse config,
+            e.g. for changing the ramp/flat lengths or scale/detune parameters.
+        :return: The name of the new duplicated pulse.
         """
         new_config = self.get_pulse_config(old_pulse).copy()
         old_name = new_config.get("name")
@@ -634,6 +637,7 @@ class InputOutput:
                 new_pulse_name = f"{base_name}{i}"
                 i += 1
         new_config["name"] = new_pulse_name
+        new_config.update(new_pulse_kwargs)
 
         # Insert into config tree (modifies in-place)
         if "pulses" not in self._config:

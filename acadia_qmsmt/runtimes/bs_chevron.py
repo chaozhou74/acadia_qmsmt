@@ -218,10 +218,12 @@ class BSChevronRuntime(QMsmtRuntime):
 
     
     @annotate_method(button_name="coarse_swap_update")
-    def update_coarse_swap_time(self):
-        
+    def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable")):
         # Find the center frequency from the FFT data, use that for frequency
-        if (self.best_swap_freq is not None) and (self.best_swap_time is not None) and (self.best_swap_time>0):
-            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.scale", self.bs_scale)
+        if (self.best_swap_freq is not None) and (self.best_swap_time is not None):
             self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", self.best_swap_freq)
-            self.update_io_yaml_field("bs_stimulus", f"pulses.swap.flat", self.best_swap_time)
+            if type(pulses)==str:
+                pulses = [pulses]
+            for pulse in pulses:
+                self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.scale", self.bs_scale)
+                self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.flat", self.best_swap_time)
