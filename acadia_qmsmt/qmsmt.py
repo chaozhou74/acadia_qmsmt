@@ -1885,6 +1885,233 @@ class TwoQubit:
         load_tomo_pulses([self.qubit1, self.qubit2])
 
 
+
+
+class DRCavity:
+
+    def __init__(self, stimulus:InputOutput, qubits:Union[Qubit, List[Qubit]]=None,
+                 qubit_cav_stimuli:Union[Qubit, List[InputOutput]]=None, qubit_cav_swap_pulse_names:str='swap', 
+                 swap_pulse_name:str='swap', bs50_pulse_name:str='bs50'):
+
+        self._stimulus = stimulus
+        self._acadia = stimulus._acadia
+
+        if type(qubits) is Qubit:
+            self.qubit1 = qubits
+            num_qubits = 1
+
+        else:
+            num_qubits = len(qubits)
+
+            if num_qubits in [1, 2]:
+                self.qubit1 = qubits[0]
+                self.qubit1_cav1_stimulus = qubit_cav_stimuli[0]
+                self.qubit1_cav1_swap_pulse_name = qubit_cav_swap_pulse_names[0]
+
+            if num_qubits == 2:
+                self.qubit2 = qubits[1]
+                self.qubit2_cav2_stimulus = qubit_cav_stimuli[1]
+                self.qubit2_cav2_swap_pulse_name = qubit_cav_swap_pulse_names[1]
+
+            else: 
+               raise ValueError('More than 2 qubits not supported.')
+
+        self.swap_pulse_name = swap_pulse_name
+        self.bs50_pulse_name = bs50_pulse_name
+
+
+
+
+    
+    def measure_via_swap_1qb(self, readout_pulse_name:str, capture_memory_names:Union[str, List[str]], capture_window_name:str, 
+                            qubit:Qubit=None, qubit_swap_stimulus:InputOutput=None, qubit_swap_pulse_name:str=None,
+                            reset_stimulus:InputOutput=None, reset_pulse_name:str=None, logical_swap_pulse_name:str=None):
+
+        qubit = qubit or self.qubit1
+        qubit_swap_stimulus = qubit_swap_stimulus or self.qubit1_cav1_stimulus
+        qubit_swap_pulse_name = qubit_swap_pulse_name or self.qubit1_cav1_swap_pulse_name
+        logical_swap_pulse_name = logical_swap_pulse_name or self.swap_pulse_name
+        resonator = qubit.readout_resonator
+
+        if type(capture_memory_names) is str:
+            capture_memory_2 = resonator._stimulus.get_waveform_memory(capture_memory_names).duplicate()
+            capture_memory_names = [capture_memory_names, capture_memory_2]
+
+        if qubit is None: 
+                raise ValueError('Please provide `Qubit` object for measurement.')
+        if resonator is None:
+                raise ValueError('`Qubit` must have attached readout.')
+        
+        qubit_swap_pulse_dict = qubit_swap_stimulus.get_pulse_config(qubit_swap_pulse_name)
+        qubit_swap_pulse_len = qubit_swap_pulse_dict['flat'] + qubit_swap_pulse_dict['ramp']
+        ro_pulse_dict = qubit.readout_resonator._stimulus.get_pulse_config(readout_pulse_name)
+        ro_pulse_len = ro_pulse_dict['flat'] + ro_pulse_dict['ramp']
+        logical_swap_pulse_dict = self._stimulus.get_pulse_config(logical_swap_pulse_name)
+        logical_swap_pulse_len = logical_swap_pulse_dict['flat'] + logical_swap_pulse_dict['ramp']
+        
+        if reset_pulse_name is None and reset_pulse_name is not None:
+            wait_len = logical_swap_pulse_len
+
+        else:
+            reset_pulse_dict = reset_stimulus.get_pulse_config(reset_pulse_name)
+            reset_pulse_len = reset_pulse_dict['flat'] + reset_pulse_dict['ramp']
+            wait_len = max(reset_pulse_len, logical_swap_pulse_len)
+        
+
+        def state_map_and_msmt(a: Acadia):
+
+            qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
+            resonator._stimulus.dwell(qubit_swap_pulse_len)
+            resonator.measure(readout_pulse_name, capture_memory_names[0], capture_window_name)
+            
+            # with a.channel_synchronizer():
+            #     qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
+            #     a.barrier()
+            #     qubit.readout_resonator.measure(readout_pulse_name, capture_memory_names[0], capture_window_name)
+
+            if reset_stimulus is not None and reset_pulse_name is not None: 
+                reset_stimulus.dwell(qubit_swap_pulse_len + ro_pulse_len)
+                reset_stimulus.schedule_pulse(reset_pulse_name)
+
+            self._stimulus.dwell(qubit_swap_pulse_len + ro_pulse_len)
+            self._stimulus.schedule_pulse(logical_swap_pulse_name)
+
+            
+            # if reset_stimulus is not None and reset_pulse_name is not None:
+            #     with a.channel_synchronizer():
+            #         reset_stimulus.schedule_pulse(reset_pulse_name)
+            #         self._stimulus.schedule_pulse(logical_swap_pulse_name)
+
+            # else:
+            #     with a.channel_synchronizer():
+            #         self._stimulus.schedule_pulse(logical_swap_pulse_name)
+
+            qubit_swap_stimulus.dwell(ro_pulse_len + wait_len)
+            qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
+            resonator._stimulus.dwell(wait_len + qubit_swap_pulse_len)
+            resonator.measure(readout_pulse_name, capture_memory_names[1], capture_window_name)
+
+            # with a.channel_synchronizer():
+            #     qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
+            #     a.barrier()
+            #     resonator.measure(readout_pulse_name, capture_memory_names[1], capture_window_name)
+
+        return state_map_and_msmt
+    
+
+    def measure_via_swap_2qb(self, readout_pulse_names:Union[str, List[str]], capture_memory_names:Union[str, List[str]], capture_window_names:Union[str, List[str]], 
+                            qubits:List[Qubit]=None, qubit_swap_stimuli:List[InputOutput]=None, qubit_swap_pulse_names:List[str]=None,
+                            logical_swap_pulse_name:str=None):
+
+
+        qubits = qubits or [self.qubit1, self.qubit2]
+        qubit_swap_stimuli = qubit_swap_stimuli or [self.qubit1_cav1_stimulus, self.qubit2_cav2_stimulus]
+        qubit_swap_pulse_names = qubit_swap_pulse_names or [self.qubit1_cav1_swap_pulse_name, self.qubit2_cav2_swap_pulse_name]
+        logical_swap_pulse_name = logical_swap_pulse_name or self.swap_pulse_name
+        resonators = [qubit.readout_resonator for qubit in qubits]
+
+        if type(readout_pulse_names) is str:
+            readout_pulse_names = [readout_pulse_names, readout_pulse_names]
+
+        if type(capture_memory_names) is str:
+            capture_memory_names = [capture_memory_names, capture_memory_names]
+
+        if type(capture_window_names) is str:
+            capture_window_names = [capture_window_names, capture_window_names]
+
+        for qubit, resonator in zip(qubits, resonators):
+            if qubit is None: 
+                raise ValueError('Please provide `Qubit` object for measurement.')
+            if resonator is None:
+                raise ValueError('`Qubit` must have attached readout.')
+            
+
+        qubit1_swap_pulse_dict = qubit_swap_stimuli[0].get_pulse_config(qubit_swap_pulse_names[0])
+        qubit1_swap_pulse_len = qubit1_swap_pulse_dict['flat'] + qubit1_swap_pulse_dict['ramp']
+        qubit2_swap_pulse_dict = qubit_swap_stimuli[1].get_pulse_config(qubit_swap_pulse_names[1])
+        qubit2_swap_pulse_len = qubit2_swap_pulse_dict['flat'] + qubit2_swap_pulse_dict['ramp']           
+        
+
+        def state_map_and_msmt(a: Acadia):
+
+            qubit_swap_stimuli[0].schedule_pulse(qubit_swap_pulse_names[0])
+            qubit_swap_stimuli[1].schedule_pulse(qubit_swap_pulse_names[1])
+
+            # with a.channel_synchronizer():
+            #     qubit_swap_stimuli[0].schedule_pulse(qubit_swap_pulse_names[0])
+            #     qubit_swap_stimuli[1].schedule_pulse(qubit_swap_pulse_names[1])
+
+            resonators[0]._stimulus.dwell(qubit1_swap_pulse_len)
+            resonators[1]._stimulus.dwell(qubit2_swap_pulse_len)
+            resonators[0].measure(readout_pulse_names[0], capture_memory_names[0], capture_window_names[0])
+            resonators[1].measure(readout_pulse_names[1], capture_memory_names[1], capture_window_names[1])
+
+            # with a.channel_synchronizer():
+            #     qubits[0].readout_resonator.measure(readout_pulse_names[0], capture_memory_names[0], capture_window_names[0])
+            #     qubits[1].readout_resonator.measure(readout_pulse_names[1], capture_memory_names[1], capture_window_names[1])
+
+        return state_map_and_msmt
+
+
+    def tomo_with_pulse(self, pulse:str, msmt_method:callable, **msmt_kwargs):
+        
+        a = self._acadia
+
+        with a.channel_synchronizer():
+            self._stimulus.schedule_pulse(pulse)
+        
+        msmt_method(msmt_kwargs)(a)
+
+    
+    def make_tomo_pulses(self, swap_pulse_name:str, bs50_pulse_name:str, symmetrize:bool=True):
+        '''
+        Tomo pulses follow the convention in Teoh 2023 where |01> = +Z logical state. 
+        '''
+
+        msmt_bases = {'X': bs50_pulse_name, 'Y': bs50_pulse_name, 'Z': swap_pulse_name} # holds pulse name for each tomo dir
+        phases = {'X': -90, 'Y': 0}
+        signs = {'p': -1, 'm': 1} if symmetrize else {'p': -1} # holds scaling the bs50 pulse info for X and Y
+        msmt_dirs = ["".join(p) for p in product(msmt_bases, signs)] # create pulse names
+
+        # populate pulse dict
+        tomo_pulse_dict = {}
+        for dir in msmt_dirs:
+        
+            tomo_pulse = msmt_bases[dir[0]]
+            sign = signs[dir[1]]
+            phase = phases[dir[0]]
+
+            if dir == 'Zm': 
+                pulse_to_add = tomo_pulse
+
+            elif dir == 'Zp':
+                pulse_to_add = self.scale_pulse(tomo_pulse, scale=0.0, phase=0.0)
+
+            else: 
+                pulse_to_add = self.scale_pulse(tomo_pulse, scale=sign, phase=phase)
+
+            tomo_pulse_dict[dir] = pulse_to_add
+
+        self.tomo_pulse_dict = tomo_pulse_dict
+        return tomo_pulse_dict
+
+
+
+    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None, **kwargs):
+        """
+        Load a pulse into the stimulus.
+        """
+        self._stimulus.load_pulse(pulse_name, pulse, **kwargs)
+
+
+    def scale_pulse(self, pulse_name:str, scale:complex=1.0, phase:float=0.0):
+        
+        current_scale = self._stimulus.get_pulse_config('pulse_name', scale)
+        current_scale *= scale*np.exp(1j*np.deg2rad(phase))
+
+        return self._stimulus.duplicate_pulse(pulse_name, scale=current_scale)
+
+
 # ----------------------  helper functions -----------------------------
 
 def load_tomo_pulses(qubits:List[Qubit]):
@@ -1895,6 +2122,8 @@ def load_tomo_pulses(qubits:List[Qubit]):
     for qubit in qubits:
         for v in qubit.tomo_pulse_dict.values():
             qubit.load_pulse(v)
+
+
 
 
 def define_msmt_dirs(num_qubits:int, symmetrize:bool):
