@@ -37,10 +37,10 @@ class Chevron:
             self.best_swap_str = f"Best SWAP freq: {self.best_swap_freq/1e9:.6g} GHz, time: {self.best_swap_time*1e9:.3g} ns"
         else:
             self.best_swap_str = ''
-        if self.fitted_t0 is not None and self.fitted_f0 is not None:
+        if self.fitted_t0 is not None and self.best_swap_time is not None:
 
             axs.plot(
-                self.fitted_f0/1e9, self.fitted_t0*1e6,
+                self.fitted_f0/1e9, self.best_swap_time*1e6,
                 marker='x',                # Marker shape: 'x'
                 color='black',             # Marker color (the main 'x')
                 markersize=14,             # Size of the marker
@@ -48,7 +48,7 @@ class Chevron:
                 linestyle=''               # Crucial: set to '' so no line connects the point
             )
             axs.plot(
-            self.fitted_f0/1e9, self.fitted_t0*1e6,
+            self.fitted_f0/1e9, self.best_swap_time*1e6,
             marker='x',                # Marker shape: 'x'
             color='yellow',             # Marker color (the main 'x')
             markersize=10,             # Size of the marker

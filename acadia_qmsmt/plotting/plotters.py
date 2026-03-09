@@ -51,7 +51,7 @@ def plot_binaveraged(axis_vals, raw_data, plot_ax=None, n_avg=1, figsize=None, v
 
 
 def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: bool = False,
-                             figsize=None, **kwargs):
+                             figsize=None, share_range:bool=True, **kwargs):
     """
     Plot 2D histograms of IQ points (complex or real-valued 2D arrays).
 
@@ -65,6 +65,7 @@ def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: 
     :param log_scale: Use logarithmic color scale.
     :param figsize: Figure size if creating new figure.
     :param kwargs: Additional kwargs passed to hist2d.
+    :param share_range: If True, all histograms share the same x/y range based on the global min/max of all points.
     :return: (fig, axs) tuple
     """
     from matplotlib.colors import LogNorm
@@ -74,8 +75,11 @@ def plot_multiple_hist2d(*iq_pts: np.ndarray, plot_ax=None, bins=51, log_scale: 
     fig, axs = prepare_plot_axes(plot_ax, axs_shape=(1, len(iq_pts)), figsize=figsize)
     axs = np.atleast_1d(axs)
 
-    all_pts = np.concatenate(iq_pts)
-    hist_range = ((all_pts.real.min(), all_pts.real.max()), (all_pts.imag.min(), all_pts.imag.max()))
+    if share_range:
+        all_pts = np.concatenate(iq_pts)
+        hist_range = ((all_pts.real.min(), all_pts.real.max()), (all_pts.imag.min(), all_pts.imag.max()))
+    else:
+        hist_range = None
 
     for i, pts in enumerate(iq_pts):
         axs[i].hist2d(pts.real, pts.imag, cmap="hot",
@@ -231,7 +235,7 @@ def cmap2d_balanced(z):
     rgba = np.concatenate([rgb, alpha], axis=-1)
     return rgba
 
-def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max_amp=1, add_cbar=True):
+def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max_amp=1, add_cbar=True, cbar_kw=None):
     """
     Plot a density matrix `rho` on a 2D grid. Each matrix element is drawn as a square
     and colored by `cmap_2d`.
@@ -244,6 +248,7 @@ def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max
 
     """
     from acadia_qmsmt.analysis.tomography import _digits_in_base
+    cbar_kw = {} if cbar_kw is None else cbar_kw
     rho = np.array(rho)
     dim = rho.shape[0]
     n_qubits = int(np.log2(dim))
@@ -305,7 +310,7 @@ def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max
         sm = plt.cm.ScalarMappable(norm=norm, cmap=phase_cmap)
         sm.set_array([])
         
-        cbar = plt.colorbar(sm, ax=plot_ax, pad=0.02)
+        cbar = plt.colorbar(sm, ax=plot_ax, pad=0.02, **cbar_kw)
         cbar.set_label("phase [rad]")
         cbar.set_ticks([-np.pi, 0, np.pi])
         cbar.set_ticklabels([r"$-\pi$", "0", r"$\pi$"])

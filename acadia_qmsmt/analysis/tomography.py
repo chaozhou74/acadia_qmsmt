@@ -104,7 +104,13 @@ def xyz_to_full_tomo(*shots_array):
     for p in range(1, 4**N):
         act = active_mask[p]                   # (N,)
         b_idx = np.flatnonzero(M[p])          # (n_compat,)
-        prod_rb = meas_xyz[act][:, :, b_idx].prod(axis=0)  # Product over active qubits only ->(R, n_compat)
+        selected = meas_xyz[act][:, :, b_idx]  # (n_active, R, n_compat)
+
+        if isinstance(selected, np.ma.MaskedArray):
+            union_mask = np.any(np.ma.getmaskarray(selected), axis=0, keepdims=True)
+            selected = np.ma.masked_array(selected.data, mask=np.broadcast_to(union_mask, selected.shape))
+
+        prod_rb = selected.prod(axis=0)
         exps[labels[p]] = prod_rb
 
     return exps

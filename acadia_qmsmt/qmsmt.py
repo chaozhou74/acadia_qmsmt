@@ -468,7 +468,9 @@ class InputOutput:
 
     def load_pulse(self,
                    memory: Union[str, Dict, WaveformMemory] = None,
-                   pulse: Union[str, Dict, NDArray, float, complex] = None, **kwargs) -> None:
+                   pulse: Union[str, Dict, NDArray, float, complex] = None,
+                   zero_pad:Union[bool, Literal["pre", "post", "both"]] = False,
+                   **kwargs) -> None:
         """
         Compute and load a pulse into the specified waveform memory.
         :param memory: The name of the waveform memory to load the pulse into, or
@@ -477,6 +479,10 @@ class InputOutput:
             the pulse config. If a string is provided, it should correspond to a
             pulse name in the configuration. If a dictionary is provided, it should
             contain the pulse configuration, including the "name" key.
+        :param zero_pad: Whether to zero pad the pulse to the full length of the memory.
+            If False, a ValueError will be raised if the pulse shape is not compatible with the memory length.
+            If "pre", "post", or "both", the pulse will be padded with zeros on the left, right, or both sides,
+            respectively, to fit the memory length.
         :param kwargs: Additional keyword arguments to be passed to the pulse
             generation function. These will override values specified using a str, or Dict
         """
@@ -523,7 +529,20 @@ class InputOutput:
 
         # `compute_pulse` return samples as integer pairs that have been converted using `complex_to_samples`
         # so we can directly copy it to the memory
-        samples = self.compute_pulse(pulse, return_raw=True)
+        sample_data = self.compute_pulse(pulse, return_raw=True)
+        if not zero_pad:
+            samples = sample_data
+        else:
+            samples = np.zeros_like(wfm.array)
+            if zero_pad.lower() == "pre":
+                samples[-len(sample_data):] = sample_data
+            elif zero_pad.lower() == "post":
+                samples[:len(sample_data)] = sample_data
+            elif zero_pad.lower() == "both":
+                pre_len = (len(wfm.array) - len(sample_data)) // 2
+                samples[pre_len:pre_len+len(sample_data)] = sample_data
+            else:
+                raise ValueError("Invalid value for zero_pad. Should be one of {False, 'pre', 'post', 'both'}")
         np.copyto(wfm.array, samples)
         
     def compute_pulse(self, 
@@ -1204,13 +1223,14 @@ class MeasurableResonator:
         self._stream = None
         self._windows = {}
         self._classifiers = {}
+        self.capture_delay = capture._config.get("capture_delay", 0)
  
     def measure(self, 
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
                 window_name: str = None,
                 cmacc_offset: Tuple[int,int]=None,
-                capture_delay:float=0,
+                capture_delay:float=None,
                 write_mode: Literal["upper", "lower"] = "upper",
                 reset_fifo: bool = False
                 ):
@@ -1234,6 +1254,9 @@ class MeasurableResonator:
         :type write_mode: str, one of "upper", "lower".
 
         """
+        if capture_delay is None:
+            capture_delay = self.capture_delay
+
         if window_name is None:
             window_name = list(self._capture.get_config("windows").keys())[0]
 
@@ -1265,7 +1288,7 @@ class MeasurableResonator:
     def measure_trace(self, 
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
-                capture_delay:float=0):
+                capture_delay:float=None):
         """
         Schedules the measurement of raw IQ traces. 
         This function should be called inside of a channel synchronizer.
@@ -1277,6 +1300,9 @@ class MeasurableResonator:
         """
 
         # ------------ schedule drive pulse ------------------------------
+        if capture_delay is None:
+            capture_delay = self.capture_delay
+
         self._stimulus.schedule_pulse(stimulus_waveform_memory)
         if capture_delay > 0:
             self._capture.dwell(capture_delay) 
@@ -1405,11 +1431,12 @@ class MeasurableResonator:
         with a.sequencer().repeat_until(a.cmacc_done(self._stream)):
             pass
 
-    def load_pulse(self, pulse_name:str):
+    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None,
+                   zero_pad:Union[bool, Literal["pre", "post", "both"]]=False, **kwargs):
         """
         Load a pulse into the stimulus.
         """
-        self._stimulus.load_pulse(pulse_name)
+        self._stimulus.load_pulse(pulse_name, pulse, zero_pad, **kwargs)
 
 class Qubit:
     """
@@ -1641,11 +1668,12 @@ class Qubit:
 
         self._stimulus.schedule_pulse(waveform_memory, stretch_length, **kwargs)
 
-    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None, **kwargs):
+    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None,
+                   zero_pad:Union[bool, Literal["pre", "post", "both"]]=False, **kwargs):
         """
         Load a pulse into the stimulus.
         """
-        self._stimulus.load_pulse(pulse_name, pulse, **kwargs)
+        self._stimulus.load_pulse(pulse_name, pulse, zero_pad, **kwargs)
 
     def dwell(self, length: float):
         """
@@ -1890,7 +1918,8 @@ class TwoQubit:
 class DRCavity:
 
     def __init__(self, stimulus:InputOutput, qubits:Union[Qubit, List[Qubit]]=None,
-                 qubit_cav_stimuli:Union[Qubit, List[InputOutput]]=None, qubit_cav_swap_pulse_names:str='swap', 
+                 qubit_cav_stimuli:Union[InputOutput, List[InputOutput]]=None,
+                 qubit_cav_swap_pulse_names:Union[str, List[InputOutput]]='swap',
                  swap_pulse_name:str='swap', bs50_pulse_name:str='bs50'):
 
         self._stimulus = stimulus
@@ -1899,6 +1928,9 @@ class DRCavity:
         if type(qubits) is Qubit:
             self.qubit1 = qubits
             num_qubits = 1
+            self.qubit1_cav1_stimulus = qubit_cav_stimuli
+            self.qubit1_cav1_swap_pulse_name = qubit_cav_swap_pulse_names
+
 
         else:
             num_qubits = len(qubits)
@@ -1919,11 +1951,7 @@ class DRCavity:
         self.swap_pulse_name = swap_pulse_name
         self.bs50_pulse_name = bs50_pulse_name
 
-
-
-
-    
-    def measure_via_swap_1qb(self, readout_pulse_name:str, capture_memory_names:Union[str, List[str]], capture_window_name:str, 
+    def measure_via_swap_1qb(self, readout_pulse_name:str, capture_memory_names:List[str], capture_window_name:str,
                             qubit:Qubit=None, qubit_swap_stimulus:InputOutput=None, qubit_swap_pulse_name:str=None,
                             reset_stimulus:InputOutput=None, reset_pulse_name:str=None, logical_swap_pulse_name:str=None):
 
@@ -1933,9 +1961,8 @@ class DRCavity:
         logical_swap_pulse_name = logical_swap_pulse_name or self.swap_pulse_name
         resonator = qubit.readout_resonator
 
-        if type(capture_memory_names) is str:
-            capture_memory_2 = resonator._stimulus.get_waveform_memory(capture_memory_names).duplicate()
-            capture_memory_names = [capture_memory_names, capture_memory_2]
+        if type(capture_memory_names) is str or len(capture_memory_names) != 2:
+            raise ValueError('Two capture memory names must be provided for two measurements.')
 
         if qubit is None: 
                 raise ValueError('Please provide `Qubit` object for measurement.')
@@ -1959,22 +1986,24 @@ class DRCavity:
         
 
         def state_map_and_msmt(a: Acadia):
-
-            qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
-            resonator._stimulus.dwell(qubit_swap_pulse_len)
-            resonator.measure(readout_pulse_name, capture_memory_names[0], capture_window_name)
+            with a.channel_synchronizer(block=True):
+                qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
+                resonator._stimulus.dwell(qubit_swap_pulse_len)
+                resonator._capture.dwell(qubit_swap_pulse_len)
+                resonator.measure(readout_pulse_name, capture_memory_names[0], capture_window_name)
             
+            with a.channel_synchronizer(block=True):
             # with a.channel_synchronizer():
             #     qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
             #     a.barrier()
             #     qubit.readout_resonator.measure(readout_pulse_name, capture_memory_names[0], capture_window_name)
 
-            if reset_stimulus is not None and reset_pulse_name is not None: 
-                reset_stimulus.dwell(qubit_swap_pulse_len + ro_pulse_len)
-                reset_stimulus.schedule_pulse(reset_pulse_name)
-
-            self._stimulus.dwell(qubit_swap_pulse_len + ro_pulse_len)
-            self._stimulus.schedule_pulse(logical_swap_pulse_name)
+                if reset_stimulus is not None and reset_pulse_name is not None: 
+                    # reset_stimulus.dwell(qubit_swap_pulse_len + ro_pulse_len)
+                    reset_stimulus.schedule_pulse(reset_pulse_name)
+    
+                # self._stimulus.dwell(qubit_swap_pulse_len + ro_pulse_len)
+                self._stimulus.schedule_pulse(logical_swap_pulse_name)
 
             
             # if reset_stimulus is not None and reset_pulse_name is not None:
@@ -1985,11 +2014,13 @@ class DRCavity:
             # else:
             #     with a.channel_synchronizer():
             #         self._stimulus.schedule_pulse(logical_swap_pulse_name)
-
-            qubit_swap_stimulus.dwell(ro_pulse_len + wait_len)
-            qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
-            resonator._stimulus.dwell(wait_len + qubit_swap_pulse_len)
-            resonator.measure(readout_pulse_name, capture_memory_names[1], capture_window_name)
+            with a.channel_synchronizer(block=True):
+                # qubit_swap_stimulus.dwell(ro_pulse_len + wait_len)
+                qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
+                # resonator._stimulus.dwell(wait_len + qubit_swap_pulse_len)
+                resonator._stimulus.dwell(qubit_swap_pulse_len)
+                resonator._capture.dwell(qubit_swap_pulse_len)
+                resonator.measure(readout_pulse_name, capture_memory_names[1], capture_window_name)
 
             # with a.channel_synchronizer():
             #     qubit_swap_stimulus.schedule_pulse(qubit_swap_pulse_name)
@@ -2003,6 +2034,7 @@ class DRCavity:
                             qubits:List[Qubit]=None, qubit_swap_stimuli:List[InputOutput]=None, qubit_swap_pulse_names:List[str]=None,
                             logical_swap_pulse_name:str=None):
 
+        logger.warning("This function is yet to be tested.")
 
         qubits = qubits or [self.qubit1, self.qubit2]
         qubit_swap_stimuli = qubit_swap_stimuli or [self.qubit1_cav1_stimulus, self.qubit2_cav2_stimulus]
@@ -2059,17 +2091,19 @@ class DRCavity:
 
         with a.channel_synchronizer():
             self._stimulus.schedule_pulse(pulse)
-        
-        msmt_method(msmt_kwargs)(a)
+        # a.barrier()
+        # with a.channel_synchronizer():
+        msmt_method(**msmt_kwargs)(a)
 
     
-    def make_tomo_pulses(self, swap_pulse_name:str, bs50_pulse_name:str, symmetrize:bool=True):
+    def make_tomo_pulses(self, swap_pulse_name:str, bs50_pulse_name:str, symmetrize:bool=True,
+                         phase_offset_deg:float=0.0):
         '''
         Tomo pulses follow the convention in Teoh 2023 where |01> = +Z logical state. 
         '''
 
         msmt_bases = {'X': bs50_pulse_name, 'Y': bs50_pulse_name, 'Z': swap_pulse_name} # holds pulse name for each tomo dir
-        phases = {'X': -90, 'Y': 0}
+        phases = {'X': -90, 'Y': 0, 'Z': 0}
         signs = {'p': -1, 'm': 1} if symmetrize else {'p': -1} # holds scaling the bs50 pulse info for X and Y
         msmt_dirs = ["".join(p) for p in product(msmt_bases, signs)] # create pulse names
 
@@ -2079,16 +2113,16 @@ class DRCavity:
         
             tomo_pulse = msmt_bases[dir[0]]
             sign = signs[dir[1]]
-            phase = phases[dir[0]]
+            phase = phases[dir[0]] + phase_offset_deg
 
             if dir == 'Zm': 
                 pulse_to_add = tomo_pulse
 
             elif dir == 'Zp':
-                pulse_to_add = self.scale_pulse(tomo_pulse, scale=0.0, phase=0.0)
+                pulse_to_add = self._scale_pulse(tomo_pulse, scale=0.0, phase_deg=0.0)
 
             else: 
-                pulse_to_add = self.scale_pulse(tomo_pulse, scale=sign, phase=phase)
+                pulse_to_add = self._scale_pulse(tomo_pulse, scale=sign, phase_deg=phase)
 
             tomo_pulse_dict[dir] = pulse_to_add
 
@@ -2097,17 +2131,18 @@ class DRCavity:
 
 
 
-    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None, **kwargs):
+    def load_pulse(self, pulse_name:str, pulse: Union[str, Dict, NDArray, float, complex] = None,
+                   zero_pad:Union[bool, Literal["pre", "post", "both"]]=False, **kwargs):
         """
         Load a pulse into the stimulus.
         """
-        self._stimulus.load_pulse(pulse_name, pulse, **kwargs)
+        self._stimulus.load_pulse(pulse_name, pulse, zero_pad, **kwargs)
 
 
-    def scale_pulse(self, pulse_name:str, scale:complex=1.0, phase:float=0.0):
+    def _scale_pulse(self, pulse_name:str, scale:complex=1.0, phase_deg:float=0.0):
         
-        current_scale = self._stimulus.get_pulse_config('pulse_name', scale)
-        current_scale *= scale*np.exp(1j*np.deg2rad(phase))
+        current_scale = self._stimulus.get_config("pulses", pulse_name, "scale")
+        current_scale *= scale*np.exp(1j*np.deg2rad(phase_deg))
 
         return self._stimulus.duplicate_pulse(pulse_name, scale=current_scale)
 
