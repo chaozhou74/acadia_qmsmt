@@ -154,7 +154,6 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import plot_binaveraged
         fig, axs = plot_binaveraged(self.qubit_frequencies, self.shots, axs, n_avg=n_avg, vmin=0, v_max=1, figsize=self.figsize)
         axs.set_ylabel("Average Measurement")
-        axs.set_xlabel("Probe Frequency [Hz]")
         return fig, axs
 
 

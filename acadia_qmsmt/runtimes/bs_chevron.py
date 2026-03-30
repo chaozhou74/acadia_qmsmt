@@ -163,7 +163,7 @@ class BSChevronRuntime(QMsmtRuntime):
         self.avg_shots = np.mean(self.shots, axis=0)
 
         from acadia_qmsmt.analysis.chevron import Chevron
-        self.chevron_analysis = Chevron(self.bs_frequencies, self.flat_length_list, self.avg_shots)
+        self.chevron_analysis = Chevron(self.bs_frequencies, self.flat_length_list, self.avg_shots, do_fits=False)
         try:
             self.chevron_analysis.fit_fft(peak_threshold=fft_peak_threshold,
                                         sweep_freq_min=sweep_freq_min_GHz*1e9 if sweep_freq_min_GHz is not None else None,
@@ -171,6 +171,7 @@ class BSChevronRuntime(QMsmtRuntime):
                                         fft_freq_min=fft_freq_min_MHz*1e6 if fft_freq_min_MHz is not None else None,
                                         fft_freq_max=fft_freq_max_MHz*1e6 if fft_freq_max_MHz is not None else None,
                                         freq_scale=fit_freq_scale)
+            self.chevron_analysis.fit_center_time_linecut()
             self.best_swap_time = self.chevron_analysis.best_swap_time
             self.best_swap_freq = self.chevron_analysis.best_swap_freq  # GHz to Hz
 

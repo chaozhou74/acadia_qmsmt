@@ -102,9 +102,12 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         if self.do_echo:
             qubit_stimulus_io.load_pulse(self.qubit_pi_pulse_name)
         
-        # get the original scale for applying virtual phase shift
+        # get the original scale and detune for applying virtual phase shift
         second_pulse_scale = qubit_stimulus_io.get_config("pulses", second_pi_over_2_pulse_name, "scale")
-        
+
+        # get the origianl detune on the pulse to make it effectively CW later
+        pulse_detune = self._ios["qubit_stimulus"].get_config("pulses", self.qubit_pi_pulse_name).get("detune", 0)
+
         # Determine how many cycles each delay interval should be
         dsp_count_values = self.acadia.seconds_to_cycles(self.delay_times/2)
 
@@ -113,8 +116,9 @@ class QubitCoherenceRuntime(QMsmtRuntime):
                 # Update the delay amount in the cache
                 cache[0] = delay
 
-                # Shift the phase of the second pulse according to the virtual detuning
-                scale = second_pulse_scale * np.exp(2 * np.pi * 1j * self.virtual_detuning * self.delay_times[idx_delay])
+                # Shift the phase of the second pulse according to the virtual detuning and the pulse detune
+                scale = second_pulse_scale * np.exp(2 * np.pi * 1j *
+                                                    (self.virtual_detuning + pulse_detune) * self.delay_times[idx_delay])
                 qubit_stimulus_io.load_pulse(second_pi_over_2_pulse_name, scale=scale)
 
                 # Capture data and put in the corresponding group
@@ -193,15 +197,18 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         return fig, axs
 
 
-    @annotate_method(button_name="update qubit frequency (if Ramsey)")
+    @annotate_method(button_name="update qubit nco frequency (if Ramsey)")
     def update_frequencies(self):
 
         if not self.do_echo:
             if self.fit is not None:
-                self.qubit_freq = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
+                nco_freq = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
                 # we assume the virtual detuning is large enough that the apparent detuning always has the same sign
                 # as the virtual detuning
                 detuning = self.virtual_detuning - abs(self.fit.ufloat_results['f'].n*1e6) * np.sign(self.virtual_detuning)
                 self.update_io_yaml_field("qubit_stimulus", f"channel_config.nco_frequency", 
-                                          np.round(self.qubit_freq + detuning)
+                                          np.round(nco_freq + detuning)
                 )
+                pulse_detune = self._ios["qubit_stimulus"].get_config("pulses", self.qubit_pi_pulse_name).get("detune", 0)
+                qubit_freq0 = nco_freq + pulse_detune
+                self.qubit_freq = np.round(qubit_freq0 + detuning)

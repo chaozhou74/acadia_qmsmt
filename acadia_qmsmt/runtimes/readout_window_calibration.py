@@ -351,6 +351,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         Determine if any additional decimation was used to sample traces for the kernel, and if so,
         interpolate it for the CMACC (which always operates at a decimation of 4).
         """
+        from scipy.interpolate import interp1d
         if decimation_used == 4:
             kernel_array = kernel
 
@@ -364,7 +365,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
             # stretch the kernel trace via interpolation
             scale = int(decimation_used // 4)
             original_len = len(kernel)
-            interp_func = interp1d(np.arange(0, original_len), kernel, kind="cubic")
+            interp_func = interp1d(np.arange(0, original_len), kernel, kind="quadratic")
             x_fine = np.linspace(0, original_len-1, (original_len-1) * scale+1)
             kernel_interp = interp_func(x_fine)
             # the points at the beginning will just be repeated
@@ -580,6 +581,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         imag_bins = np.linspace(all_pts.imag.min(), all_pts.imag.max(), compare_hist_bin)
 
         if debug:
+            from matplotlib import pyplot as plt
             fig, axs = plt.subplots(len(state_pts), 2, figsize=(4, n_states * 3))
             axs = [axs] if n_states == 1 else axs
             fig.suptitle("find_state_circles debug")

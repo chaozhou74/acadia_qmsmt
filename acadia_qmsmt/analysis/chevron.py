@@ -1,3 +1,4 @@
+import logging
 from matplotlib.axes import Axes
 import numpy as np
 from scipy.optimize import curve_fit
@@ -5,8 +6,9 @@ from scipy.optimize import curve_fit
 from acadia_qmsmt.plotting import prepare_plot_axes
 from acadia_qmsmt.utils.fourier_transform import fft_mag
 
+logger = logging.getLogger(__name__)
 class Chevron:
-    def __init__(self, sweep_freqs_Hz:np.ndarray, t_list_sec:np.ndarray, data:np.ndarray):
+    def __init__(self, sweep_freqs_Hz:np.ndarray, t_list_sec:np.ndarray, data:np.ndarray, do_fits:bool=True):
         self.sweep_freqs_Hz = sweep_freqs_Hz
         self.t_list_sec = t_list_sec
         self.data = data
@@ -18,12 +20,15 @@ class Chevron:
         self.fitted_t0 = None
         self.best_swap_freq = None
         self.best_swap_time = None
+        self.line_cut_fit_popt = None
+        self.line_cut_fit_model = self._get_linecut_model()
 
-        try:
-            self.fit_fft()
-            self.fit_center_time_linecut()
-        except Exception as e:
-            pass
+        if do_fits:
+            try:
+                self.fit_fft()
+                self.fit_center_time_linecut()
+            except Exception as e:
+                logger.error(e)
 
     def plot_chevron(self, ax:Axes=None, figsize=None):
         fig, axs = prepare_plot_axes(ax, axs_shape=(1,1), figsize=figsize)
@@ -37,7 +42,7 @@ class Chevron:
             self.best_swap_str = f"Best SWAP freq: {self.best_swap_freq/1e9:.6g} GHz, time: {self.best_swap_time*1e9:.3g} ns"
         else:
             self.best_swap_str = ''
-        if self.fitted_t0 is not None and self.best_swap_time is not None:
+        if self.fitted_f0 is not None and self.best_swap_time is not None:
 
             axs.plot(
                 self.fitted_f0/1e9, self.best_swap_time*1e6,
@@ -100,23 +105,27 @@ class Chevron:
         return self.fitted_f0, self.fitted_g
 
 
+    def _get_linecut_model(self):
+        if np.mean(self.data[:, 0]) < 0.5:# determine the sign of oscillation based on 1st data point
+            def _fit_model(t, A, g0, t0, tau): # only consider T1 effect for now.
+                return A * (1 + np.cos(2 * np.pi * 2 * g0 * (t - t0))) * np.exp(-t / tau)
+        else:
+            def _fit_model(t, A, g0, t0, tau):
+                return A * (1 - np.cos(2 * np.pi * 2 * g0 * (t - t0))) * np.exp(-t / tau)
+        return _fit_model
+
+
     def fit_center_time_linecut(self):
         center_freq_idx = np.argmin(np.abs(self.sweep_freqs_Hz - self.fitted_f0))
         time_linecut = self.data[center_freq_idx, :]
 
-        if np.mean(self.data[:, 0]) < 0.5:# determine the sign of oscillation based on 1st data point
-            def _fit_model(t, A, g0, t0):
-                return A * (1 + np.cos(2 * np.pi * 2 * g0 * (t - t0)))
-        else:
-            def _fit_model(t, A, g0, t0):
-                return A * (1 - np.cos(2 * np.pi * 2 * g0 * (t - t0)))
-
-        p0 = (np.max(time_linecut), self.fitted_g, 1. / (4 * self.fitted_g))
-        bounds = ((0, 0, 0), (1.0, np.inf, np.inf))
-        popt, pcov = curve_fit(_fit_model, self.t_list_sec, time_linecut, p0=p0, bounds=bounds)
+        p0 = (np.max(time_linecut) / 2, self.fitted_g, 1. / (4 * self.fitted_g), self.t_list_sec[-1] * 10)
+        bounds = ((0, 0, 0, 0), (1.1, np.inf, np.inf, np.inf))
+        popt, pcov = curve_fit(self.line_cut_fit_model, self.t_list_sec, time_linecut, p0=p0, bounds=bounds)
         self.fitted_g0 = abs(popt[1])
         self.fitted_t0 = popt[2]
         self.best_swap_time = round(self.fitted_t0 * 1e9 / 5) * 5e-9
+        self.line_cut_fit_popt = popt
         return self.fitted_g0, self.fitted_t0
 
 
@@ -143,6 +152,27 @@ class Chevron:
         ax.set_xlabel("Sweep Frequency (GHz)")
         fig.tight_layout()
 
+        return fig, ax
+
+    def plot_linecut_fit(self, ax:Axes=None):
+        center_freq_idx = np.argmin(np.abs(self.sweep_freqs_Hz - self.fitted_f0))
+        time_linecut = self.data[center_freq_idx, :]
+        fig, ax = prepare_plot_axes(ax, axs_shape=(1, 1))
+        ax.plot(self.t_list_sec, time_linecut, 'o', label="Data")
+        t_list_fine = np.linspace(self.t_list_sec[0], self.t_list_sec[-1], len(self.t_list_sec)*10)
+        if self.line_cut_fit_popt is not None:
+            ax.plot(t_list_fine, self.line_cut_fit_model(t_list_fine, *self.line_cut_fit_popt), label="fit")
+            ax.axvline(self.best_swap_time, color="red", linestyle="--",
+                        label=f"best swap time: {self.best_swap_time * 1e9:.1f} ns")
+
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("epop")
+        ax.set_title(f"Linecut at BS frequency {self.sweep_freqs_Hz[center_freq_idx]:.6g} \n"
+                     f"tau: {self.line_cut_fit_popt[3]*1e6:.3f} us, g0: {self.fitted_g0/1e6:.4g} MHz")
+        ax.set_xlim(self.t_list_sec[0], self.t_list_sec[-1])
+        ax.legend()
+        ax.grid(1)
+        fig.tight_layout()
         return fig, ax
 
 
