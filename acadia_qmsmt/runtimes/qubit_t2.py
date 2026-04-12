@@ -14,7 +14,7 @@ def dual_sine_decay(t, A, tau, B, f1, f2):
 
 class QubitCoherenceRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for measuring the relaxation time (T1) of a qubit.
+    A :class:`Runtime` subclass for measuring the T2 of a qubit.
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig

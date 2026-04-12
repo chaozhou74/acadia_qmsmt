@@ -1,52 +1,55 @@
+# This yaml file is placed in here just as an example, it is recommended to put this in a different folder
+# (e.g. in your data drive). Remember to change `YAML_PATH` in `system_info.py` after that.
 qb_stimulus:
-  channel: DAC2
+  channel: DAC10 # physical DAC channel, dac `228_0`, `228_1` ... `231_3` on the board are mapped to DAC0 to DAC15
   channel_config:
-    vop: 30000 # Gain of the DAC, ~ 2000-40000
-    mix_reconstruction: true # flase # for scope check # Set to falso for zero order hold (ZOH) reconstruction
-    nco_frequency: 8.047785109e+9 # 50e6 # for scope check
+    vop: 5000 # Gain of the DAC, ~ 2500-40000
+    mix_reconstruction: true # flase # if true, use mixed reconstruction mode (stronger signal in 2nd/3rd Nyquist zones), else use Zero-Order-Hold mode (stronger signal in the 1st Nyquist zone)
+    nco_frequency: 7.545434848e+9 # Hz, continious carrier frequency for the pulse modulation. i.e. a digital LO.
   pulses:
     R_x_180:
-      data: hann
-      scale: 0.27814
-      ramp: 120e-9 # Both up and down ramps
-      flat: 100e-9
-      use_stretch: true
+      data: hann  # pulse shape for the ramping parts, can be the name of any function that is predefined in `acadia_qmsmt.qmsmt.InputOutputWaveforms`, or path to a `.npy` file that stores pulse shape defined as an 1D complex array
+      scale: 0.68331 # (-1, 1) amplitude scale. can be a float or a complex number in the form of 0.1+0.2j or (0.5, 45deg) or (0.5, 0.5pi)
+      ramp: 20e-9 # ns, total time for ramp up + ramp down; so total pulse length = flat + ramp
+      flat: 60e-9 # ns, time for the flat part of the pulse
+      use_stretch: false # when `true`, the flat part of the pulse will be realized by repeating the middle point of the ramping waveform to save memory, see details in lower level documentation
+      phase: 0 # radian, optional additional phase added to the pulse. If scale is a complex number, this phase will be added to the phase of the scale.
     R_x_180_selective:
       data: hann
       scale: 0.05228
       ramp: 400e-9
       flat: 5e-6
       use_stretch: true
-    R_x_90:
+    saturation_pulse:
       data: hann
-      scale: 0.32665
-      ramp: 120e-9
-      flat: 100e-9
+      scale: 0.01
+      ramp: 200e-9
+      flat: 5e-6
       use_stretch: true
     R_x_180_selective_ef:
       data: hann
       scale: 0.04036
       ramp: 400e-9
       flat: 5e-6
-      detune: -1.512e+8
+      detune: -1.66e+8 # Hz in range: (-300e6, 300e6), waveform detuning, added as a carrier frequency to the pulse shape. Final pulse frequency = nco_frequency + detune.
       use_stretch: false
     R_x_180_ef:
       data: hann
-      scale: 0.38864
+      scale: 0.22063
       ramp: 400e-9
-      detune: -1.512e+8
+      detune: -1.66e+8
       use_stretch: false
 
 ro_stimulus:
-  channel: DAC0
+  channel: DAC14
   channel_config:
     vop: 35000
     mix_reconstruction: true
-    nco_frequency: 9.309035232e+9 # 8.9985e9 # 9.00057e9 # 20e6 # 8.9995e9 # 9.0004e9
+    nco_frequency: 8.928952227e+9
   pulses:
     readout:
       data: hann
-      scale: (0.35, 0deg)
+      scale: 0.35
       ramp: 120e-9
       flat: 2e-6
       use_stretch: true
@@ -54,67 +57,55 @@ ro_stimulus:
 ro_capture:
   channel: ADC0
   channel_config:
-    nco_frequency: 9.309035232e+9 # 8.9985e9 # 9.00057e9 # 9.0004e9
+    nco_frequency: 8.928952227e+9
   memories:
     readout_trace:
-      length: 3e-6
-      decimation: 4
+      length: 3e-6 # capture length in seconds
+      decimation: 4 # decimation factor N; every N adjacent data points are integrated together in the FPGA to reduce memory usage, equivalent to a moving-average window of size N. Must be either 1 or an integer multiple of 4
       region: plddr
     readout_accumulated:
       length: 3e-6
-      decimation: 0
+      decimation: 0 # when decimation is 0, all points in the captured trace are integrated to form a single IQ point
       region: plddr
   windows:
     boxcar:
       data: 0.1
       offset: [0, 0]
     matched:
-      data: 0.1
-      offset: [61, 3638]
+      data: 0.1 # kernel function to multiply with the readout trace before integration; can be either a constant value or a path to an `.npy` file containing a complex 1D trace
+      offset: [35, 19016] # offsets added to the integrated data after applying the kernel; usually chosen so that the |g> and |e> states fall into the 1st and 2nd quadrants of the IQ plane
     matched_biased_g:
       data: 0.1
-      offset: [-939, 3638]
+      offset: [-965, 19016]
   classifiers:
     default:
-      type: RealQuadratureClassifier
+      type: RealQuadratureClassifier # name of a classifier class in `measurement_classifiers.py`, which can be used to assign qubit states based on the measured IQ points
     rotated_iq:
       type: MaximalVarianceAxisClassifier
 
 
 qb_alice_bs_stimulus:
-  channel: DAC6 # DAC7 for scope check, DAC6 for normal operation
+  channel: DAC3
   channel_config:
     vop: 30000
     mix_reconstruction: false
-    nco_frequency: 1.84396931e+9  # 20e6 # for scope check
+    nco_frequency: 1.2732e+9
   pulses:
     swap_stretchable:
       data: hann
-      scale: 0.036
+      scale: 0.1
       ramp: 120e-9
-      flat: 100e-9
+      flat: 1.05e-7
       use_stretch: true
     swap:
       data: hann
       scale: 0.1
       ramp: 120e-9
-      flat: 3.5e-8
+      flat: 1.05e-7
       use_stretch: false
     bs_50_50:
       data: hann
       scale: 0.036
-      ramp: 120e-9
-      flat: 100e-9
-      use_stretch: true
-    dChi_pump:
-      data: hann
-      scale: 0.1
-      ramp: 120e-9
-      flat: 100e-9
-      use_stretch: true
-    dChi_parity_map:
-      data: hann
-      scale: 0.1
       ramp: 120e-9
       flat: 100e-9
       use_stretch: true

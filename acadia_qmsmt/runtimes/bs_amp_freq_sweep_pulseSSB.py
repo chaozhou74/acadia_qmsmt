@@ -9,9 +9,7 @@ from acadia.runtime import annotate_method
 
 class BSAmpFreqSweepPulseSSBRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the amp and freq of bs pulse without a rotation.
-    This is what we call the "WiFi" experiment, when we use a long pulse and very low amplitude
-    to measure frequency accurately
+    A :class:`Runtime` subclass for sweeping the amp and freq of a beamsplitting pulse.
     """
     qubit_stimulus: IOConfig
     bs_stimulus: IOConfig

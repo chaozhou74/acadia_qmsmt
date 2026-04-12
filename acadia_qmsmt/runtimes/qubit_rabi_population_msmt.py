@@ -9,7 +9,8 @@ from acadia.runtime import annotate_method
 
 class QubitRpmRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` for calibrating the amplitudes of pulses for qubit drives.
+    A :class:`Runtime` for measuring the thermal population of the first excited state of a qubit by performing a Rabi
+    measurement on the e-f transition, while preparing the qubit in either the ground or first excited state.
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig

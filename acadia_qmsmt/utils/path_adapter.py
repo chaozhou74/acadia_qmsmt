@@ -4,8 +4,6 @@ import subprocess
 import re
 
 
-# todo: handle monted drive (labshare)
-
 def detect_platform() -> Literal["windows", "wsl", "linux"]:
     """
     Detects the current platform: 'windows', 'wsl', or 'linux'.

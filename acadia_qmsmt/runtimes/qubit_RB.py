@@ -180,7 +180,9 @@ class QubitRBRuntime(QMsmtRuntime):
                     # the DSP above for P+1, we just pulse CEP to increment it in-place
                     command_pointer.pulse_cep()
 
-
+            # Wait for the DMA to indicate that we can load more data
+            with a.sequencer().repeat_until(a.channel_is_fifo_almost_empty(RB_pulse_channel)):
+                pass
 
 
             with a.channel_synchronizer():

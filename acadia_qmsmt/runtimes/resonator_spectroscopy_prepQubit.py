@@ -9,7 +9,8 @@ from acadia.runtime import annotate_method
 
 class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for readout spectroscopy
+    A :class:`Runtime` subclass for readout spectroscopy with qubit prepared in g or e state.
+    Can be used to find the resonator frequency shift due to the qubit state, and thus the dispersive shift chi.
     """
     # The name of the sections in the yaml file for the required channels
     stimulus: IOConfig

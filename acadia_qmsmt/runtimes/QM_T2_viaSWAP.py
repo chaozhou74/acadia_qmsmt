@@ -10,7 +10,17 @@ from acadia.runtime import annotate_method
 
 class QMT2Runtime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the rabi time
+    A :class:`Runtime` subclass for measuring T2 of a memory mode via a SWAP-based sequence. The sequence is as follows:
+    1. (optional) Cool the memory mode using the qubit and a SWAP-based cooling sequence
+    2. Apply a pi/2 pulse to the qubit to put it in a superposition state
+    3. SWAP the state of the qubit into the memory mode
+    4. Wait for a variable delay time
+    if do_echo:
+        5. SWAP the state back to the qubit
+        6. Apply a pi pulse to the qubit to refocus static dephasing
+        7. SWAP the state back to the memory mode
+    8. SWAP the state back to the qubit
+    9. Measure the qubit state via the readout resonator
     """
     qubit_stimulus: IOConfig
     bs_stimulus: IOConfig

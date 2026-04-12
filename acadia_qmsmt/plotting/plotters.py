@@ -13,7 +13,7 @@ from acadia_qmsmt.plotting import prepare_plot_axes
 from acadia_qmsmt.analysis import to_complex
 
 """
-Collection of commonly used plotting functions
+Collection of commonly used plotting methods
 """
 
 
@@ -209,11 +209,11 @@ def cmap2d_balanced(z):
     
     # some anchor colors picked by gpt... suppose to be perceptually uniform to human eye
     anchors = np.array([
-        [0.30, 0.35, 0.80],  # indigo / deep blue
-        [0.20, 0.65, 0.75],  # teal-cyan
-        [0.85, 0.70, 0.20],  # amber / goldenrod (not neon yellow)
+        [0.20, 0.65, 0.75],  # 0 deg: teal-cyan / greenish
+        [0.30, 0.35, 0.80],  # deep blue
         [0.75, 0.30, 0.60],  # magenta/rose
-        [0.30, 0.35, 0.80],  # wrap back to deep blue
+        [0.85, 0.70, 0.20],  # amber / goldenrod
+        [0.20, 0.65, 0.75],  # wrap back
     ])
     
     # Build a continuous colormap through these anchors
@@ -226,14 +226,15 @@ def cmap2d_balanced(z):
     cmap = LinearSegmentedColormap("phase_balanced_cyclic", cdict)
 
     z = np.asarray(z)
-    phase = np.angle(z)               
-    phase01 = (phase + np.pi) / (2*np.pi)
+    phase = np.angle(z)
+    phase01 = (phase % (2*np.pi)) / (2*np.pi)   # changed line
 
     rgb = np.array(cmap(phase01))[..., :3]
     alpha = np.clip(np.abs(z), 0.0, 1.0)[..., None]
 
     rgba = np.concatenate([rgb, alpha], axis=-1)
     return rgba
+
 
 def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max_amp=1, add_cbar=True, cbar_kw=None):
     """
@@ -253,6 +254,7 @@ def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max
     dim = rho.shape[0]
     n_qubits = int(np.log2(dim))
     basis_labels = ["".join(row.astype(str)) for row in _digits_in_base(2, n_qubits)]
+    basis_labels = [f"$|{label}\\rangle$" for label in basis_labels]
     
     cmap_2d = cmap2d_balanced if cmap_2d is None else cmap_2d
     
@@ -269,11 +271,10 @@ def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max
     def make_phase_cmap_from_cmap2d(cmap2d_func):
         """
         Take a complex->RGBA mapper (like cmap2d_hsv) and build
-        a phase-only ListedColormap over [-pi, pi].
+        a phase-only ListedColormap over [0, 2pi].
         """
-        phases = np.linspace(-np.pi, np.pi, 256)
+        phases = np.linspace(0, 2*np.pi, 256, endpoint=False)   # changed
         rgba = cmap2d_func(np.exp(1j * phases))
-        # rgba is (256,4). ListedColormap accepts RGBA directly.
         return mcolors.ListedColormap(rgba, name="test")
     
     for x in range(dim):
@@ -304,17 +305,52 @@ def plot_density_matrix(rho:np.ndarray, plot_ax=None, cmap_2d:callable=None, max
     
     # color map
     if add_cbar:
-        # build a dummy ScalarMappable: phase ∈ [-π, π] -> hsv colormap
         phase_cmap = make_phase_cmap_from_cmap2d(cmap_2d)
-        norm = mcolors.Normalize(vmin=-np.pi, vmax=np.pi)
+        norm = mcolors.Normalize(vmin=0, vmax=2*np.pi)   # changed
         sm = plt.cm.ScalarMappable(norm=norm, cmap=phase_cmap)
         sm.set_array([])
         
         cbar = plt.colorbar(sm, ax=plot_ax, pad=0.02, **cbar_kw)
         cbar.set_label("phase [rad]")
-        cbar.set_ticks([-np.pi, 0, np.pi])
-        cbar.set_ticklabels([r"$-\pi$", "0", r"$\pi$"])
+        cbar.set_ticks([0, np.pi, 2*np.pi])   # changed
+        cbar.set_ticklabels([r"$0$", r"$\pi$", r"$2\pi$"])   # changed
     
     fig.tight_layout()
     
+    return fig, plot_ax
+
+
+def add_complex_2d_colorbar(plot_ax=None, cmap_2d=None, n_phase=256, n_amp=256,
+                            phase_range=(0, 2*np.pi), amp_range=(0, 1),
+                            xlabel="phase [rad]", ylabel="amplitude"):
+    """
+    Draw a 2D colorbar for a complex->RGBA colormap.
+    
+    Horizontal axis: phase
+    Vertical axis: amplitude
+
+    """
+    cmap_2d = cmap2d_balanced if cmap_2d is None else cmap_2d
+    fig, plot_ax = prepare_plot_axes(plot_ax)
+
+    phases = np.linspace(phase_range[0], phase_range[1], n_phase)
+    amps = np.linspace(amp_range[0], amp_range[1], n_amp)
+
+    # build complex grid: amplitude * exp(i phase)
+    z = amps[:, None] * np.exp(1j * phases[None, :])
+
+    rgba = cmap_2d(z)
+
+    plot_ax.imshow(
+        rgba,
+        origin="lower",
+        aspect="auto",
+        extent=[phase_range[0], phase_range[1], amp_range[0], amp_range[1]],
+    )
+
+    plot_ax.set_xlabel(xlabel)
+    plot_ax.set_ylabel(ylabel)
+    plot_ax.set_xticks([0, np.pi, 2*np.pi])
+    plot_ax.set_xticklabels([r"$0$", r"$\pi$", r"$2\pi$"])
+
     return fig, plot_ax

@@ -10,7 +10,13 @@ from acadia.runtime import annotate_method
 
 class QMT1Runtime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the rabi time
+    A :class:`Runtime` subclass for measuring T1 of a memory mode via a SWAP-based sequence. The sequence is as follows:
+    1. (Optional) Cool the qubit and memory mode using the :class:`QubitQmCooler` utility, which implements a SWAP-based cooling sequence.
+    2. Excite the qubit with a pi pulse.
+    3. SWAP the excitation from the qubit to the memory mode.
+    4. Wait for a variable delay time.
+    5. SWAP the excitation back to the qubit. Can be omitted for a control experiment where we expect to see no decay.
+    6. Measure the qubit state using the readout resonator.
     """
     qubit_stimulus: IOConfig
     bs_stimulus: IOConfig
@@ -22,7 +28,9 @@ class QMT1Runtime(QMsmtRuntime):
     iterations: int
     run_delay: int
 
-    do_not_swap_back: bool = False
+    do_not_swap_back: bool = False # if True, step 5 above is omitted, so we expect to see no decay and a flat line as a
+    # function of delay time, which can be a useful control experiment to verify that any decay we see in the regular
+    # experiment is actually due to T1 decay in the memory mode and not some other spurious effect.
 
     qubit_pulse_name: str = None
     bs_pulse_name: str = None

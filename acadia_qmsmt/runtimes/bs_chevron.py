@@ -11,7 +11,7 @@ logger = logging.getLogger("acadia")
 
 class BSChevronRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for sweeping the rabi time
+    A :class:`Runtime` subclass for sweeping the beam splitter pulse frequency and length.
     """
     qubit_stimulus: IOConfig
     bs_stimulus: IOConfig
@@ -198,6 +198,10 @@ class BSChevronRuntime(QMsmtRuntime):
         fig, axs = self.chevron_analysis.plot_fft(ax=axs, figsize=self.figsize)
         return fig, axs
 
+    @annotate_method(plot_name="linecut", axs_shape=(1,1))
+    def plot_linecut(self, axs=None):
+        fig, axs = self.chevron_analysis.plot_linecut_fit(ax=axs, figsize=self.figsize)
+        return fig, axs
     
     # generate plots for each prep dynamically
     @annotate_method(is_customizer=True)
