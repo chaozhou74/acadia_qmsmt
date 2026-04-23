@@ -594,7 +594,7 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
                 axs[i, 0].hist2d(pts.real, pts.imag, bins=[real_bins, imag_bins], cmap="hot")
                 axs[i, 0].set_aspect(1)
 
-        hist_all = np.sum(hist_list, axis=0)
+        hist_all = np.sum(hist_list, axis=0) / len(hist_list)
 
         # find circle for each state
         for i, pts in enumerate(state_pts):
