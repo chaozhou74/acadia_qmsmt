@@ -69,7 +69,7 @@ class BSChevronRuntime(QMsmtRuntime):
 
             if self.cool_qm_rounds>0:
                 cooler.cool(1, self.qubit_pulse_name,
-                    self.readout_pulse_name, self.capture_memory_name, self.capture_window_name,
+                    self.readout_pulse_name, prep_capture_mem, self.capture_window_name,
                     self.cool_swap_pulse_name, self.cool_qm_rounds) # efficient use of register
 
             with a.channel_synchronizer():
@@ -213,7 +213,7 @@ class BSChevronRuntime(QMsmtRuntime):
                 from acadia_qmsmt.plotting import plot_multiple_hist2d
                 fig, axs = plot_multiple_hist2d(self.prep_data,
                                                 plot_ax=axs, log_scale=log_scale, bins=bins)
-                axs[0].set_title("prep")
+                axs.set_title("prep")
                 return fig, axs
             return plot
 

@@ -67,6 +67,13 @@ def parse(input: Any) -> Any:
     if input.endswith('.npy') or input.endswith('.npz'):
         return np.load(input)
 
+    # case 7: np functions, e.g. "np.linspace(0, 1, 5)"
+    if input.startswith("np."):
+        try:
+            return eval(input, {"np": np})
+        except Exception as e:
+            return input
+
     # An arbitrary string
     return input
 

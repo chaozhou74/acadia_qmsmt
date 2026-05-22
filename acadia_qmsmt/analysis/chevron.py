@@ -44,7 +44,7 @@ class Chevron:
         self.line_cut_fit_model = self._get_linecut_model()
         self.sweep_freq_fit = None
         self.fft_freq_fit = None
-        self.fit_freq_scale = None
+        self.fit_freq_scale = 1
         self.fit_fft_freq_min = None
         self.fit_fft_freq_max = None
         self.fit_sweep_freq_min = None
@@ -86,18 +86,18 @@ class Chevron:
         return _fit_model
 
     def _get_linecut_model(self):
-        # Only consider decay during beamsplitting for now. Ignored dephasing effect in the fitting model.
+        # Only consider decay during beamsplitting for now. Dephasing effect is treated as offset.
         if np.mean(self.data[:, 0]) < 0.5:
-            def _fit_model(t, A, g0, t0, tau):
-                return A * (1 + np.cos(2 * np.pi * 2 * g0 * (t - t0))) * np.exp(-t / tau)
+            def _fit_model(t, A, g0, t0, tau, off):
+                return A * (1 + np.cos(2 * np.pi * 2 * g0 * (t - t0))) * np.exp(-t / tau) + off
         else:
-            def _fit_model(t, A, g0, t0, tau):
-                return A * (1 - np.cos(2 * np.pi * 2 * g0 * (t - t0))) * np.exp(-t / tau)
+            def _fit_model(t, A, g0, t0, tau, off):
+                return A * (1 - np.cos(2 * np.pi * 2 * g0 * (t - t0))) * np.exp(-t / tau) + off
 
         return _fit_model
 
     def _get_masked_fft_data(self, fft_freq_min, fft_freq_max):
-        fft_freq_mask = (self.fft_freqs > fft_freq_min) & (self.fft_freqs < fft_freq_max)
+        fft_freq_mask = (self.fft_freqs >= fft_freq_min) & (self.fft_freqs <= fft_freq_max)
         fft_freqs = self.fft_freqs[fft_freq_mask]
         fft_data = self.fft_data[:, fft_freq_mask]
 
@@ -128,8 +128,9 @@ class Chevron:
         t0_guess = 1.0 / (4 * g_guess)
         tau_guess = max(float(self.t_list_sec[-1] * 10), 1e-12)
         amp_guess = max(float(np.max(time_linecut) / 2), 1e-12)
+        offset_guess = np.min(time_linecut)
 
-        return amp_guess, g_guess, t0_guess, tau_guess
+        return amp_guess, g_guess, t0_guess, tau_guess, offset_guess
 
     # ----------------------------
     # Plotting
@@ -289,6 +290,12 @@ class Chevron:
         sweep_freq_min = min(self.sweep_freqs_Hz) if sweep_freq_min is None else sweep_freq_min
         sweep_freq_max = max(self.sweep_freqs_Hz) if sweep_freq_max is None else sweep_freq_max
 
+        self.fit_freq_scale = freq_scale
+        self.fit_fft_freq_min = fft_freq_min
+        self.fit_fft_freq_max = fft_freq_max
+        self.fit_sweep_freq_min = sweep_freq_min
+        self.fit_sweep_freq_max = sweep_freq_max
+
         fft_freqs, fft_data = self._get_masked_fft_data(fft_freq_min, fft_freq_max)
 
         fft_max_idxes = np.argmax(fft_data, axis=1)
@@ -305,7 +312,14 @@ class Chevron:
         self.fft_freq_fit = fft_freqs[fft_max_idxes][peak_mask]
 
         if len(self.sweep_freq_fit) < 2:
-            raise ValueError("Not enough points selected for FFT fit.")
+            self.fitted_f0 = self.find_chevron_center()
+            fft_center_line = fft_data[np.argmin(abs(self.sweep_freqs_Hz-self.fitted_f0))]
+            self.fitted_g = fft_freqs[np.argmax(fft_center_line)]/2
+            logger.warning("Not enough points selected for FFT fit, "
+                           "using chevron center and max FFT linecut as fallback."
+                           f"{self.fitted_f0:.6g}, {self.fitted_g:3g}")
+            self.best_swap_freq = self.fitted_f0
+            return self.fitted_f0, self.fitted_g
 
         fit_model = self._get_fft_fit_model(freq_scale)
 
@@ -329,23 +343,26 @@ class Chevron:
         self.fitted_f0 = popt[0]
         self.fitted_g = abs(popt[1] / 2)
 
-        self.fit_freq_scale = freq_scale
-        self.fit_fft_freq_min = fft_freq_min
-        self.fit_fft_freq_max = fft_freq_max
-        self.fit_sweep_freq_min = sweep_freq_min
-        self.fit_sweep_freq_max = sweep_freq_max
-
         self.best_swap_freq = self.fitted_f0
         self._update_best_swap_str()
 
         return self.fitted_f0, self.fitted_g
+
+    def find_chevron_center(self):
+        data_avg = np.mean(self.data, axis=1)
+        if np.mean(self.data[:, 0]) < 0.5:
+            # if the data starts low, we look for the max point
+            center_freq = self.sweep_freqs_Hz[np.argmax(data_avg)]
+        else:            # if the data starts high, we look for the min point
+            center_freq = self.sweep_freqs_Hz[np.argmin(data_avg)]
+        return center_freq
 
     def fit_center_time_linecut(self):
         center_freq_idx = self._get_center_freq_idx()
         time_linecut = self.data[center_freq_idx, :]
 
         p0 = self._get_linecut_initial_guess(time_linecut)
-        bounds = ((0, 0, 0, 0), (1.1, np.inf, np.inf, np.inf))
+        bounds = ((0, 0, 0, 0, 0), (1.1, np.inf, np.inf, np.inf, 1))
 
         popt, pcov = curve_fit(
             self.line_cut_fit_model,
