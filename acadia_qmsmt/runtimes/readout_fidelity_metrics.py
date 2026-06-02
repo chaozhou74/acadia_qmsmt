@@ -131,8 +131,6 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     def process_current_data(self,my_thresh=0.):
         # First make sure that we actually have new data to process
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        from scipy.stats import norm
-        from scipy.optimize import minimize
 
         data_g = reshape_iq_data_by_axes(self.data["prep_g"].records())
         data_e = reshape_iq_data_by_axes(self.data["prep_e"].records())
@@ -172,56 +170,6 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
         self.median_g = np.median(self.real_g)
         self.median_e = np.median(self.real_e)
-        
-
-        def two_gaussian_mixture(params, data):
-            w_g, mu_g, std_g, mu_e, std_e = params
-            
-            return (w_g * norm.pdf(data, mu_g, std_g) + 
-                (1.0 - w_g) * norm.pdf(data, mu_e, std_e))
-        
-        def optimize(data, guess, bounds=None):
-            def objective(params, data):
-                # Avoid log(0) by adding a tiny epsilon
-                return -np.sum(np.log(two_gaussian_mixture(params, data) + 1e-15)) 
-        
-            res = minimize(objective, guess, args=(data,), bounds=bounds)
-            return res.x
-        
-
-        # First fit all the data to a GMM
-        init_guess = [0.5, self.median_g, np.std(self.real_g), self.median_e, np.std(self.real_e)]
-        bounds = [(0,1), (None, None), (1e-3, None), (None, None), (1e-3, None)]
-        data = np.concatenate((self.real_g, self.real_e))
-        w_g, mu_g, std_g, mu_e, std_e = optimize(data, init_guess, bounds)
-        
-        # constrain guesses and bounds for future fits based on this fit
-        new_guess_g = [0.95, mu_g, std_g, mu_e, std_e]
-        new_guess_e = [0.05, mu_g, std_g, mu_e, std_e]
-        new_bounds = [(0, 1)] + [(i, i) for i in new_guess_g[1:]]
-
-        # Now fit only to prep g and prep e separately
-        amp_g, _, _, _, _ = optimize(self.real_g, new_guess_g, new_bounds)
-        self.p_up = 1 - amp_g
-        amp_g, _, _, _, _ = optimize(self.real_e, new_guess_e, new_bounds)
-        self.p_down = amp_g
-
-        # calculate infidelities
-        overlap_g = norm.cdf(self.my_thresh, loc=mu_g, scale=std_g)
-        overlap_e = 1 - norm.cdf(self.my_thresh, loc=mu_e, scale=std_e)
-        self.infid_overlap = 0.5*(overlap_g + overlap_e)
-        self.infid_decay = 0.5*self.p_down
-        self.infid_heating = 0.5*self.p_up
-
-        # from the ideal Gaussian params, analytically calculate optimal threshold
-        A = std_g**2 - std_e**2
-        B = 2*(mu_g*std_e**2 - mu_e*std_g**2)
-        C = mu_e**2 * std_g**2 - mu_g**2 * std_e**2 - 2*std_g**2*std_e**2*np.log((w_g*std_g)/((1-w_g)*std_e))
-        thresh1 = (-B - np.sqrt(B**2 - 4*A*C))/(2*A)
-        thresh2 = (-B + np.sqrt(B**2 - 4*A*C))/(2*A)
-        self.overlap_thresh = int(thresh1) if mu_e < thresh1 < mu_g else int(thresh2)
-
-        self.mu_g, self.std_g, self.mu_e, self.std_e = mu_g, std_g, mu_e, std_e
 
         return completed_iterations
 
@@ -292,12 +240,62 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     def plot_histograms_1d_fitted(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         from scipy.stats import norm
+        from scipy.optimize import minimize
 
         def two_gaussian_mixture(params, data):
             w_g, mu_g, std_g, mu_e, std_e = params
             
             return (w_g * norm.pdf(data, mu_g, std_g) + 
                 (1.0 - w_g) * norm.pdf(data, mu_e, std_e))
+        
+        def optimize(data, guess, bounds=None):
+            def objective(params, data):
+                # Avoid log(0) by adding a tiny epsilon
+                return -np.sum(np.log(two_gaussian_mixture(params, data) + 1e-15)) 
+        
+            res = minimize(objective, guess, args=(data,), bounds=bounds)
+            return res.x
+        
+
+        # First fit all the data to a GMM
+        init_guess = [0.5, self.median_g, np.std(self.real_g), self.median_e, np.std(self.real_e)]
+        bounds = [(0,1), (None, None), (1e-3, None), (None, None), (1e-3, None)]
+        data = np.concatenate((self.real_g, self.real_e))
+        w_g, mu_g, std_g, mu_e, std_e = optimize(data, init_guess, bounds)
+        
+        # constrain guesses and bounds for future fits based on this fit
+        new_guess_g = [0.95, mu_g, std_g, mu_e, std_e]
+        new_guess_e = [0.05, mu_g, std_g, mu_e, std_e]
+        new_bounds = [(0, 1)] + [(i, i) for i in new_guess_g[1:]]
+
+        # Now fit only to prep g and prep e separately
+        amp_g, _, _, _, _ = optimize(self.real_g, new_guess_g, new_bounds)
+        p_up = 1 - amp_g
+        amp_g, _, _, _, _ = optimize(self.real_e, new_guess_e, new_bounds)
+        p_down = amp_g
+
+        # calculate infidelities
+        overlap_g = norm.cdf(self.my_thresh, loc=mu_g, scale=std_g)
+        overlap_e = 1 - norm.cdf(self.my_thresh, loc=mu_e, scale=std_e)
+        infid_overlap = 0.5*(overlap_g + overlap_e)
+        infid_decay = 0.5*p_down
+        infid_heating = 0.5*p_up
+
+        # from the ideal Gaussian params, analytically calculate optimal threshold
+        if mu_g > mu_e:
+            A = std_g**2 - std_e**2
+            B = 2*(mu_g*std_e**2 - mu_e*std_g**2)
+            C = mu_e**2 * std_g**2 - mu_g**2 * std_e**2 - 2*std_g**2*std_e**2*np.log((w_g*std_g)/((1-w_g)*std_e))
+            discrim = B**2 - 4*A*C
+
+            if discrim > 0:
+                thresh1 = (-B - np.sqrt(discrim))/(2*A)
+                thresh2 = (-B + np.sqrt(discrim))/(2*A)
+                self.overlap_thresh = int(thresh1) if mu_e < thresh1 < mu_g else int(thresh2)
+            else: 
+                self.overlap_thresh = np.nan
+        else:
+            self.overlap_thresh = np.nan
 
         fig, ax = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
         _, bins_g, _ = ax.hist(self.real_g,bins=100,alpha=0.6)
@@ -308,10 +306,10 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         scale_factor_e = len(self.real_e) * (bins_e[1] - bins_e[0])
 
         xs = np.linspace(bins_e[0], bins_g[-1], 200)
-        ys_g = norm.pdf(xs, loc=self.mu_g, scale=self.std_g) * scale_factor_g
-        ys_e = norm.pdf(xs, loc=self.mu_e, scale=self.std_e) * scale_factor_e
-        ys_g_prep_g = two_gaussian_mixture([1-self.p_up, self.mu_g, self.std_g, self.mu_e, self.std_e], xs) * scale_factor_g
-        ys_e_prep_e = two_gaussian_mixture([self.p_down, self.mu_g, self.std_g, self.mu_e, self.std_e], xs) * scale_factor_e
+        ys_g = norm.pdf(xs, loc=mu_g, scale=std_g) * scale_factor_g
+        ys_e = norm.pdf(xs, loc=mu_e, scale=std_e) * scale_factor_e
+        ys_g_prep_g = two_gaussian_mixture([1-p_up, mu_g, std_g, mu_e, std_e], xs) * scale_factor_g
+        ys_e_prep_e = two_gaussian_mixture([p_down, mu_g, std_g, mu_e, std_e], xs) * scale_factor_e
 
         ax.plot(xs, ys_g, color='blue', label='Fitted g (ideal)', linestyle='dashed')
         ax.plot(xs, ys_e, color='orange', label='Fitted e (ideal)', linestyle='dashed')
@@ -319,16 +317,17 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         ax.plot(xs, ys_e_prep_e, color='green', label='Fitted e (prep)', linestyle='dashed')
 
         ax.axvline(self.my_thresh,linestyle='dashed',color='black')
-        ax.axvline(self.mu_g,linestyle='dotted',color='red')
-        ax.axvline(self.mu_e,linestyle='dotted',color='red')
-        ax.axvline(self.overlap_thresh,linestyle='dashdot',color='red', label='Optimal Threshold')
-    
+        ax.axvline(mu_g,linestyle='dotted',color='red')
+        ax.axvline(mu_e,linestyle='dotted',color='red')
+        if not np.isnan(self.overlap_thresh):
+            ax.axvline(self.overlap_thresh, linestyle='dashdot',color='red', label='Optimal Threshold')
+
         ax.set_xlabel("I (uncalibrated)")
         ax.set_ylabel("Counts")
         ax.set_yscale('log')
-        ax.set_title(f"Total: {1-self.Fidelity:.2e}, Overlap: {self.infid_overlap:.2e}, "
-                     f"\nDecay: {self.infid_decay:.2e}, Heating: {self.infid_heating:.2e}, "
-                     f"Leftover: {(1-self.Fidelity-self.infid_overlap-self.infid_decay-self.infid_heating):.2e}")
+        ax.set_title(f"Total: {1-self.Fidelity:.2e}, Overlap: {infid_overlap:.2e}, "
+                     f"\nDecay: {infid_decay:.2e}, Heating: {infid_heating:.2e}, "
+                     f"Leftover: {(1-self.Fidelity-infid_overlap-infid_decay-infid_heating):.2e}")
         
         ax.grid(True)
         ax.legend()
@@ -343,5 +342,6 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     def update_thresh(self):
 
         window_offset = self._ios["readout_capture"].get_config("windows", self.capture_window_name, "offset")
-        self.update_io_yaml_field("readout_capture", f"windows.{self.capture_window_name}.offset", 
-                                  [window_offset[0] - self.overlap_thresh, window_offset[1]])
+        if not np.isnan(self.overlap_thresh):
+            self.update_io_yaml_field("readout_capture", f"windows.{self.capture_window_name}.offset", 
+                                    [self.overlap_thresh, window_offset[1]])
