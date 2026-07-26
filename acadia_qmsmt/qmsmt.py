@@ -1,3 +1,4 @@
+import re
 import sys
 import shutil
 import os
@@ -47,8 +48,11 @@ def make_hash(val):
     if val is None:
         return None
     elif isinstance(val, dict):
-        # Convert dict to a sorted tuple of (key, value) pairs, recursively hashable
-        return ("__dict__", tuple((k, make_hash(v)) for k, v in sorted(val.items())))
+        # Convert dict to a sorted tuple of (key, value) pairs, recursively hashable.
+        # Sort by repr() of the key rather than the key itself: dict keys aren't
+        # guaranteed to be a single, mutually-orderable type (e.g. a mix of str
+        # and None keys), but repr() always is.
+        return ("__dict__", tuple((k, make_hash(v)) for k, v in sorted(val.items(), key=lambda item: repr(item[0]))))
     elif isinstance(val, np.ndarray):
         # Store bytes, dtype, shape as metadata
         return ("__ndarray__", val.tobytes(), str(val.dtype), val.shape)
@@ -1170,12 +1174,15 @@ class QMsmtRuntime(Runtime):
         new_cfg = update_yaml(yaml_path, {f"{yaml_key}.{config_field}": value}, verbose=verbose)
         logger.info(f"!! updated yaml file `{yaml_path}`: {yaml_key}.{config_field}: {value}")
         return new_cfg
+    
 
     
-    def wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = True):
+    def wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = False):
         """
         wait for the deployment to complete by joining the event loop.
-        :param suppress_data_sync_warnings: If True, suppress warnings related to data synchronization.
+        :param suppress_data_sync_warnings: If True, hide ALL data-sync warnings for the whole
+            wait. Off by default: deploy() already hides the normal start-up chatter for a few
+            seconds, so a genuine, persistent sync problem still reaches.
         """
         from acadia_qmsmt.utils import suppress_data_sync_messages
         try:
@@ -1197,6 +1204,11 @@ class QMsmtRuntime(Runtime):
 
         super().deploy(*args, **kwargs)
 
+        # Hide the normal DataManager connect chatter for the first few seconds
+        # of the run; a persistent connection problem will still surface after.
+        from acadia_qmsmt.utils import add_data_sync_log_filter
+        add_data_sync_log_filter()
+
         # Create the flag file in the local data directory
         if no_backup:
             try:
@@ -1206,6 +1218,17 @@ class QMsmtRuntime(Runtime):
                 flag_path.write_text("Exclude this run from backups.\n", encoding="utf-8")
             except Exception as e:
                 logger.warning("Failed to create .no_backup_flag in %s: %s", getattr(self, "local_directory", "?"), e)
+
+
+    def stop(self):
+        try:
+            super().stop()
+        except Exception as e:
+            logger.warning(f"Exception during stop: {e}. Trying remote stop with .stop() file")
+            directory = Path(self.local_directory)
+            directory.mkdir(parents=True, exist_ok=True)  # Create directory if needed
+            file = directory / ".stop"
+            file.touch()
 
         
 
@@ -1950,6 +1973,7 @@ class DRCavity:
 
         self.swap_pulse_name = swap_pulse_name
         self.bs50_pulse_name = bs50_pulse_name
+
 
     def measure_via_swap_1qb(self, readout_pulse_name:str, capture_memory_names:List[str], capture_window_name:str,
                             qubit:Qubit=None, qubit_swap_stimulus:InputOutput=None, qubit_swap_pulse_name:str=None,

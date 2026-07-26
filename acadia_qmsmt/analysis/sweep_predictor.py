@@ -2,6 +2,38 @@ from typing import Union, List
 import numpy as np
 
 
+def is_valid_y(y):
+    """
+    Check whether a y-value is usable, i.e. neither None nor NaN.
+
+    :param y: The y-value to check.
+    :return: False if `y` is None or NaN, True otherwise.
+    """
+    if y is None:
+        return False
+    try:
+        return not np.isnan(y)
+    except TypeError:  # non-numeric y, leave it to the caller
+        return True
+
+
+def drop_invalid_points(x_vals, y_vals):
+    """
+    Drop (x, y) pairs whose y-value is None or NaN.
+
+    :param x_vals: List or array of x-values.
+    :param y_vals: List or array of y-values corresponding to `x_vals`.
+    :return: Tuple of (x_vals, y_vals) lists containing only the valid pairs.
+    """
+    valid_x, valid_y = [], []
+    for x, y in zip(x_vals, y_vals):
+        if not is_valid_y(y):
+            continue
+        valid_x.append(x)
+        valid_y.append(y)
+    return valid_x, valid_y
+
+
 def polyfit_predict(history_x, history_y, new_x, order=2, debug=False):
     """
     Fit a 1D polynomial to the provided history data and evaluate it at `new_x`.
@@ -12,7 +44,12 @@ def polyfit_predict(history_x, history_y, new_x, order=2, debug=False):
     :param order: Degree of the polynomial to fit. Will be reduced if not enough points.
     :param debug: If True, also return the fitted polynomial coefficients.
     :return: Predicted y-value at `new_x`, or (y-value, coeffs) if debug is True.
+
+    Points whose y-value is None or NaN are excluded from the fit.
     """
+    history_x, history_y = drop_invalid_points(history_x, history_y)
+    if len(history_x) == 0:
+        raise ValueError("No valid (non-None, non-NaN) data points to fit.")
     history_x = np.asarray(history_x)
     history_y = np.asarray(history_y)
 
@@ -76,7 +113,10 @@ class PolyPredictor:
         """
         self.x_vals.append(x_val)
         self.y_vals.append(y_val)
-        self.x_vals, self.y_vals = map(list, zip(*sorted(zip(self.x_vals, self.y_vals))))
+        # sort on x only: y may be None, which is not comparable
+        self.x_vals, self.y_vals = map(
+            list, zip(*sorted(zip(self.x_vals, self.y_vals), key=lambda pair: pair[0]))
+        )
 
     def predict(self, new_x, debug=False):
         """
@@ -86,23 +126,31 @@ class PolyPredictor:
         :param debug: When True, return the fitted poly coefficients and x, y data for ploy fitting as well
 
         :return: Predicted y-value at `new_x`.
+
+        Observations whose y-value is None or NaN are excluded, so the window
+        always holds up to `window_size` usable points.
         """
-        n = len(self.x_vals)
-        if n == 0:
+        if len(self.x_vals) == 0:
             raise ValueError("No data points to predict from.")
+
+        valid_x, valid_y = drop_invalid_points(self.x_vals, self.y_vals)
+        n = len(valid_x)
+        if n == 0:
+            raise ValueError("No valid (non-None, non-NaN) data points to predict from.")
+
         if n <= self.window_size:
-            x_data = self.x_vals
-            y_data = self.y_vals
+            x_data = valid_x
+            y_data = valid_y
         else:
-            center = np.searchsorted(self.x_vals, new_x)
+            center = np.searchsorted(valid_x, new_x)
             half = self.window_size // 2
 
             # Clamp window to fit in range
             start = max(0, min(n - self.window_size, center - half))
             end = start + self.window_size
 
-            x_data = self.x_vals[start:end]
-            y_data = self.y_vals[start:end]
+            x_data = valid_x[start:end]
+            y_data = valid_y[start:end]
 
         if debug:
             return *polyfit_predict(x_data, y_data, new_x, self.poly_order, debug=debug), x_data, y_data
@@ -113,8 +161,11 @@ class PolyPredictor:
         """
         Plot the observed point, fitted curve, and predicted value.
 
+        The observed point is skipped if its y-value is None or NaN; the fit and
+        the prediction are still drawn.
+
         :param x_obs: The observed x value just added.
-        :param y_obs: The observed y value just added.
+        :param y_obs: The observed y value just added. None/NaN is not plotted.
         :param x_pred: The x value to predict at (usually next time step).
         :param y_pred: The predicted y value.
         :param coeffs: Fitted polynomial coefficients.
@@ -132,7 +183,8 @@ class PolyPredictor:
 
         idx = len(self.x_vals)
 
-        plot_ax.scatter(x_obs, y_obs, marker="*", color=f"C{idx}", s=100)
+        if is_valid_y(y_obs):
+            plot_ax.scatter(x_obs, y_obs, marker="*", color=f"C{idx}", s=100)
 
         x_fit_fine = np.linspace(min(min(x_fit), x_pred), max(max(x_fit), x_pred), 50)
         plot_ax.plot(x_fit_fine, np.polyval(coeffs, x_fit_fine), color=f"C{idx + 1}")

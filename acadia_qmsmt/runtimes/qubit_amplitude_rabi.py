@@ -114,7 +114,8 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         self.avg_shots = np.mean(self.shots, axis=0)
         
         self.fit = Cosine(self.qubit_amplitudes, self.avg_shots)
-        self.fitted_pi_amp = abs(0.5 * (1 / self.fit.ufloat_results["f"]))
+        self.fitted_pi_amp = 0.5 * (1 / self.fit.ufloat_results["f"])
+        self.fitted_pi_amp = -self.fitted_pi_amp if self.fitted_pi_amp.n <0 else self.fitted_pi_amp
         return completed_iterations
     
 
@@ -145,7 +146,7 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,2))
 
         data_g = self.data_complex[:, np.argmin(abs(self.qubit_amplitudes))]
-        closet_pi_amp_idx = np.argmin(abs(self.qubit_amplitudes-self.fitted_pi_amp))
+        closet_pi_amp_idx = np.argmin(abs(self.qubit_amplitudes-self.fitted_pi_amp.n))
         data_e = self.data_complex[:, closet_pi_amp_idx]
 
         plot_multiple_hist2d(data_g, data_e, plot_ax=axs, bins=bins, log_scale=log_scale)

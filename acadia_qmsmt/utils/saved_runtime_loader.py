@@ -142,7 +142,7 @@ def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt: bool = True
     runtime_cls = get_saved_runtime_class(data_directory, use_saved_qmsmt)
 
     # Initialize and return the runtime instance
-    return runtime_cls.load(data_directory)
+    return runtime_cls.load(str(data_directory))
 
 
 if __name__ == "__main__":

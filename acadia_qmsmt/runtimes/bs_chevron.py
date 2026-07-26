@@ -31,7 +31,7 @@ class BSChevronRuntime(QMsmtRuntime):
 
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
-    capture_window_name: str = "boxcar"
+    capture_window_name: str = "matched"
 
     cool_swap_pulse_name: str = "swap"
     cool_qm_rounds: int = 2
@@ -92,7 +92,7 @@ class BSChevronRuntime(QMsmtRuntime):
         readout_stimulus_io.load_pulse(self.readout_pulse_name)
         qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
-        my_bs_scale = self.bs_amp if self.bs_amp is not None else bs_stimulus_io.get_config("pulses", self.bs_pulse_name, "scale")                                        
+        my_bs_scale = self.bs_amp if self.bs_amp is not None else bs_stimulus_io.get_config("pulses", self.bs_pulse_name, "scale")
         bs_stimulus_io.load_pulse(self.bs_pulse_name, scale=my_bs_scale)
 
         # Determine how many cycles each flat_length_list should be
@@ -179,9 +179,9 @@ class BSChevronRuntime(QMsmtRuntime):
             logger.warning(f"Failed to fit chevron fft result, {e}", exc_info=True)
             self.best_swap_time = None
             self.best_swap_freq = None
-        
-        self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")    
-        self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")    
+
+        self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")
+        self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")
         return completed_iterations
 
 
@@ -202,7 +202,16 @@ class BSChevronRuntime(QMsmtRuntime):
     def plot_linecut(self, axs=None):
         fig, axs = self.chevron_analysis.plot_linecut_fit(ax=axs, figsize=self.figsize)
         return fig, axs
-    
+
+    @annotate_method(plot_name="time axis averaged", axs_shape=(1,1))
+    def plot_time_meaned(self, axs=None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, ax = prepare_plot_axes(axs)
+        ax.plot(self.bs_frequencies, np.mean(self.avg_shots, axis=1))
+        ax.grid(True)
+        ax.set_xlabel("frequency")
+        return fig, ax
+
     # generate plots for each prep dynamically
     @annotate_method(is_customizer=True)
     def _generate_plots(self):
@@ -222,8 +231,8 @@ class BSChevronRuntime(QMsmtRuntime):
             setattr(self, "plot_prep_msmts", plot_factory("prep msmts"))
 
     
-    @annotate_method(button_name="coarse_swap_update")
-    def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable")):
+    @annotate_method(button_name="coarse_swap_and_bs50_update")
+    def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable", "bs50")):
         # Find the center frequency from the FFT data, use that for frequency
         if (self.best_swap_freq is not None) and (self.best_swap_time is not None):
             self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", self.best_swap_freq)
@@ -232,3 +241,9 @@ class BSChevronRuntime(QMsmtRuntime):
             for pulse in pulses:
                 self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.scale", self.bs_scale)
                 self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.flat", self.best_swap_time)
+            if "bs50" in self._ios["bs_stimulus"].get_config("pulses"):
+                root_swap_time = np.round(self.best_swap_time/2/5e-9)*5e-9
+                self.update_io_yaml_field("bs_stimulus", f"pulses.bs50.scale", self.bs_scale)
+                self.update_io_yaml_field("bs_stimulus", f"pulses.bs50.flat", root_swap_time)
+            else:
+                logger.warning(f"No pulse found for {pulses}, not updated")
