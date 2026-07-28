@@ -130,19 +130,31 @@ def get_saved_runtime_class(data_directory: str, use_saved_qmsmt: bool = True):
     return list(runtime_classes.values())[0]
 
 
-def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt: bool = True):
+def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt: bool = True, run_data_processor=False):
     """
     Load and return the saved runtime object from a given saved data directory.
 
     :param data_directory: Path to a local data folder
     :param use_saved_qmsmt: If True, temporarily switch current working directory to `data_directory` before loading the
         runtime class, so the `acadia_qmsmt` saved in the data folder will be used to create the runtime class.
+    :param run_data_processor: If True, the runtime method tagged with "is_data_processor" will be excuted after loading.
     """
     # Get the saved runtime class
     runtime_cls = get_saved_runtime_class(data_directory, use_saved_qmsmt)
 
     # Initialize and return the runtime instance
-    return runtime_cls.load(str(data_directory))
+    rt = runtime_cls.load(str(data_directory))
+
+    if run_data_processor:
+        try:
+            from acadia_qmsmt.utils.annotation import get_data_process_method
+            process_method_name = get_data_process_method(rt)
+            getattr(rt, process_method_name)()
+        except Exception as e:
+            logger.error(f"Error running runtime data processing method: {e}", exc_info=True)
+
+    return rt
+
 
 
 if __name__ == "__main__":
