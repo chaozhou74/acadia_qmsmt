@@ -1,4 +1,5 @@
 from typing import Union, Annotated
+from copy import deepcopy
 
 import numpy as np
 
@@ -235,15 +236,27 @@ class BSChevronRuntime(QMsmtRuntime):
     def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable", "bs50")):
         # Find the center frequency from the FFT data, use that for frequency
         if (self.best_swap_freq is not None) and (self.best_swap_time is not None):
+            # update NCO first
             self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", self.best_swap_freq)
             if type(pulses)==str:
                 pulses = [pulses]
+
+            # take the pulse used for chevron, update its parameters based on the calibration
+            swap_config = deepcopy(self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name))
+            swap_config["scale"] = self.bs_scale
+            swap_config["flat"] = self.best_swap_time
+
+            # bs50 uses half of the effective total time
+            bs50_config = deepcopy(swap_config)
+            swap_ramp = swap_config["ramp"] # ramp part is counted as half effective power
+            bs50_config["flat"] = np.round((self.best_swap_time / 2 - swap_ramp / 4) / 5e-9) * 5e-9
+
+            # apply the new config to designated pulses
             for pulse in pulses:
-                self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.scale", self.bs_scale)
-                self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.flat", self.best_swap_time)
-            if "bs50" in self._ios["bs_stimulus"].get_config("pulses"):
-                root_swap_time = np.round(self.best_swap_time/2/5e-9)*5e-9
-                self.update_io_yaml_field("bs_stimulus", f"pulses.bs50.scale", self.bs_scale)
-                self.update_io_yaml_field("bs_stimulus", f"pulses.bs50.flat", root_swap_time)
-            else:
-                logger.warning(f"No pulse found for {pulses}, not updated")
+                if pulse in self._ios["bs_stimulus"].get_config("pulses"):
+                    if pulse != "bs50":
+                        self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}", swap_config)
+                    else:
+                        self.update_io_yaml_field("bs_stimulus", f"pulses.bs50", bs50_config)
+                else:
+                    logger.warning(f"Pulse {pulse} not found in bs_stimulus, not updated")

@@ -809,8 +809,7 @@ class InputOutput:
             # when decimate, the capture cycles need to be scaled to capture the full trace
             length_cycles = length_cycles * (decimation //4)
 
-        capture_dict = self.get_waveform_memory("readout_trace").__dict__
-        logger.debug(f"output_size_bytes {output_size_bytes}, capture_dict: {capture_dict}, length_cycles: {length_cycles}")
+        logger.debug(f"output_size_bytes {output_size_bytes}, capture_dict: {dst.__dict__}, length_cycles: {length_cycles}")
 
         self._acadia.stream(configuration=dsp_stream_config, 
                     dst=dst,
