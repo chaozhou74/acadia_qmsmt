@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# acadia writes these next to the working directory; dry runs redirect them to a
+# temp dir, but a stray one can still appear if the module is used differently
+compiled.log
+assembled.log
+
+# machine/board-specific validation paths (copy paths.local.example.yaml)
+paths.local.yaml

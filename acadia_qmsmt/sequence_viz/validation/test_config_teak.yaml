@@ -1,0 +1,276 @@
+# Test config for the 4-channel loopback runtime (LoopbackMultichannelRuntime).
+# ch0=DAC0/ADC0, ch1=DAC2/ADC2, ch2=DAC4/ADC4, ch3=DAC6/ADC6 -- each pair expected to be
+# physically cabled together. DAC/ADC 0 is the high-freq channel (7 GHz, mix_reconstruction on);
+# DAC/ADC 2/4/6 are the low-freq channels (1 GHz, mix_reconstruction off).
+# Placed here as an example; recommended to keep this on the data drive for a real station,
+# same as test_config_walnut.yaml.
+
+stimulus0:
+  channel: DAC0
+  channel_config:
+    vop: 28000 # Gain of the DAC, ~ 2500-40000, adjust to your setup
+    mix_reconstruction: true
+    nco_frequency: 7.0e+9
+  pulses:
+    test_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 100e-9
+      use_stretch: false
+    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
+    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
+    stretch_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 400e-9
+      use_stretch: true
+    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
+    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
+    long_ramp_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      use_stretch: false
+    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
+    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
+    detune_10MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 10.0e+6
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 25.0e+6
+      use_stretch: false
+    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
+    # (scale_detune_pulse applies exp(1j*phase)).
+    phase_half_pi:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      phase: 1.5707963267948966
+      use_stretch: false
+
+stimulus1:
+  channel: DAC2
+  channel_config:
+    vop: 18000
+    mix_reconstruction: false
+    nco_frequency: 1.0e+9
+  pulses:
+    test_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 100e-9
+      use_stretch: false
+    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
+    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
+    stretch_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 400e-9
+      use_stretch: true
+    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
+    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
+    long_ramp_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      use_stretch: false
+    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
+    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
+    detune_10MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 10.0e+6
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 25.0e+6
+      use_stretch: false
+    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
+    # (scale_detune_pulse applies exp(1j*phase)).
+    phase_half_pi:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      phase: 1.5707963267948966
+      use_stretch: false
+
+stimulus2:
+  channel: DAC4
+  channel_config:
+    vop: 18000
+    mix_reconstruction: false
+    nco_frequency: 1.0e+9
+  pulses:
+    test_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 100e-9
+      use_stretch: false
+    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
+    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
+    stretch_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 400e-9
+      use_stretch: true
+    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
+    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
+    long_ramp_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      use_stretch: false
+    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
+    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
+    detune_10MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 10.0e+6
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 25.0e+6
+      use_stretch: false
+    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
+    # (scale_detune_pulse applies exp(1j*phase)).
+    phase_half_pi:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      phase: 1.5707963267948966
+      use_stretch: false
+
+stimulus3:
+  channel: DAC6
+  channel_config:
+    vop: 18000
+    mix_reconstruction: false
+    nco_frequency: 1.0e+9
+  pulses:
+    test_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 100e-9
+      use_stretch: false
+    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
+    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
+    stretch_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 400e-9
+      use_stretch: true
+    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
+    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
+    long_ramp_pulse:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      use_stretch: false
+    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
+    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
+    detune_10MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 10.0e+6
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      detune: 25.0e+6
+      use_stretch: false
+    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
+    # (scale_detune_pulse applies exp(1j*phase)).
+    phase_half_pi:
+      data: hann
+      scale: 0.3
+      ramp: 100e-9
+      flat: 200e-9
+      phase: 1.5707963267948966
+      use_stretch: false
+
+capture0:
+  channel: ADC0
+  channel_config:
+    nco_frequency: 7.0e+9
+  memories:
+    loopback_trace:
+      length: 1.2e-6 # seconds; padded beyond pre_pulse_dwell + pulse length -- see tail_trim_samples in the runtime
+      decimation: 4 # fixed by the CMACC "input" passthrough tap (see runtime docstring); required for 32-bit dtype
+      region: plddr
+
+capture1:
+  channel: ADC2
+  channel_config:
+    nco_frequency: 1.0e+9
+  memories:
+    loopback_trace:
+      length: 1.2e-6
+      decimation: 4
+      region: plddr
+
+capture2:
+  channel: ADC4
+  channel_config:
+    nco_frequency: 1.0e+9
+  memories:
+    loopback_trace:
+      length: 1.2e-6
+      decimation: 4
+      region: plddr
+
+capture3:
+  channel: ADC6
+  channel_config:
+    nco_frequency: 1.0e+9
+  memories:
+    loopback_trace:
+      length: 1.2e-6
+      decimation: 4
+      region: plddr
+
+capture_dummy:
+  channel: ADC1
+  channel_config:
+    nco_frequency: 7.0e+9
+  memories:
+    dummy_trace:
+      length: 1.2e-6 # seconds; padded beyond pre_pulse_dwell + pulse length -- see tail_trim_samples in the runtime
+      decimation: 4 # fixed by the CMACC "input" passthrough tap (see runtime docstring); required for 32-bit dtype
+      region: plddr

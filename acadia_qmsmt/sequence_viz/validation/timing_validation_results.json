@@ -1,0 +1,1960 @@
+[
+  {
+    "folder": "/mnt/Data/test/test_loopback/single/260727_022424",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/two_same_block/260727_022638",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 289.81,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 288.28,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 288.39,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 288.68,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/two_blocks/260727_022642",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 4,
+    "gaps_ns": [
+      70.0,
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 14,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2
+      },
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 5.0,
+    "worst_error_cycles": 1.001,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 284.77,
+        "measured_intervals_ns": [
+          194.91
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          4.91
+        ],
+        "error_cycles": [
+          0.983
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.27,
+        "measured_intervals_ns": [
+          195.0
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          5.0
+        ],
+        "error_cycles": [
+          1.0
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.38,
+        "measured_intervals_ns": [
+          195.0
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          5.0
+        ],
+        "error_cycles": [
+          1.001
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.68,
+        "measured_intervals_ns": [
+          194.98
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          4.98
+        ],
+        "error_cycles": [
+          0.997
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/two_blocks_1ch/260727_022647",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 4,
+    "gaps_ns": [
+      55.0,
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 11,
+        "detect": 3,
+        "issue": 6,
+        "propagate": 2
+      },
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 4.96,
+    "worst_error_cycles": 0.992,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 284.76,
+        "measured_intervals_ns": [
+          179.96
+        ],
+        "predicted_intervals_ns": [
+          175.0
+        ],
+        "error_ns": [
+          4.96
+        ],
+        "error_cycles": [
+          0.992
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 283.24,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 283.39,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 1,
+        "first_edge_ns": 283.67,
+        "measured_intervals_ns": [
+          203.74
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/two_blocks_2ch/260727_022652",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 4,
+    "gaps_ns": [
+      60.0,
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 12,
+        "detect": 3,
+        "issue": 7,
+        "propagate": 2
+      },
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 4.99,
+    "worst_error_cycles": 0.998,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 284.76,
+        "measured_intervals_ns": [
+          184.96
+        ],
+        "predicted_intervals_ns": [
+          180.0
+        ],
+        "error_ns": [
+          4.96
+        ],
+        "error_cycles": [
+          0.993
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.28,
+        "measured_intervals_ns": [
+          184.99
+        ],
+        "predicted_intervals_ns": [
+          180.0
+        ],
+        "error_ns": [
+          4.99
+        ],
+        "error_cycles": [
+          0.998
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 283.39,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 283.67,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/three_blocks/260727_023347",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 5,
+    "gaps_ns": [
+      70.0,
+      70.0,
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 14,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2
+      },
+      {
+        "total": 14,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2
+      },
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 10.04,
+    "worst_error_cycles": 2.009,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 3,
+        "n_predicted": 3,
+        "first_edge_ns": 284.73,
+        "measured_intervals_ns": [
+          194.96,
+          390.04
+        ],
+        "predicted_intervals_ns": [
+          190.0,
+          380.0
+        ],
+        "error_ns": [
+          4.96,
+          10.04
+        ],
+        "error_cycles": [
+          0.993,
+          2.009
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 3,
+        "n_predicted": 3,
+        "first_edge_ns": 283.26,
+        "measured_intervals_ns": [
+          195.0,
+          390.01
+        ],
+        "predicted_intervals_ns": [
+          190.0,
+          380.0
+        ],
+        "error_ns": [
+          5.0,
+          10.01
+        ],
+        "error_cycles": [
+          1.0,
+          2.003
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 3,
+        "n_predicted": 3,
+        "first_edge_ns": 283.38,
+        "measured_intervals_ns": [
+          195.0,
+          390.02
+        ],
+        "predicted_intervals_ns": [
+          190.0,
+          380.0
+        ],
+        "error_ns": [
+          5.0,
+          10.02
+        ],
+        "error_cycles": [
+          1.001,
+          2.003
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 3,
+        "n_predicted": 3,
+        "first_edge_ns": 283.67,
+        "measured_intervals_ns": [
+          195.0,
+          389.99
+        ],
+        "predicted_intervals_ns": [
+          190.0,
+          380.0
+        ],
+        "error_ns": [
+          5.0,
+          9.99
+        ],
+        "error_cycles": [
+          1.0,
+          1.999
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/batch_nonblocking/260727_023352",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [],
+    "gap_breakdowns": [],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 3,
+        "first_edge_ns": 309.72,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0,
+          240.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 3,
+        "first_edge_ns": 308.25,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0,
+          240.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 3,
+        "first_edge_ns": 308.37,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0,
+          240.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 3,
+        "first_edge_ns": 308.67,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0,
+          240.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/dwell_between/260727_023357",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      75.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2
+      }
+    ],
+    "worst_error_ns": 0.12,
+    "worst_error_cycles": 0.023,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 309.66,
+        "measured_intervals_ns": [
+          320.12
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          0.12
+        ],
+        "error_cycles": [
+          0.023
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 308.25,
+        "measured_intervals_ns": [
+          320.0
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          -0.0
+        ],
+        "error_cycles": [
+          -0.0
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 308.39,
+        "measured_intervals_ns": [
+          319.99
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          -0.01
+        ],
+        "error_cycles": [
+          -0.001
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 308.67,
+        "measured_intervals_ns": [
+          320.01
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          0.01
+        ],
+        "error_cycles": [
+          0.002
+        ]
+      }
+    ]
+  },
+  {
+    "case": "barrier_uneven",
+    "error": "KeyError: 'Group t_data not found'"
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/barrier_single_channel/260727_024227",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 289.8,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 408.26,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 408.39,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 408.67,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/two_blocks_3ch/260727_102356",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 4,
+    "gaps_ns": [
+      70.0,
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 14,
+        "detect": 3,
+        "issue": 8,
+        "propagate": 2,
+        "measured_offset": 1
+      },
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.13,
+    "worst_error_cycles": 0.026,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 284.66,
+        "measured_intervals_ns": [
+          190.13
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          0.13
+        ],
+        "error_cycles": [
+          0.026
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.24,
+        "measured_intervals_ns": [
+          190.03
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          0.03
+        ],
+        "error_cycles": [
+          0.006
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.4,
+        "measured_intervals_ns": [
+          189.99
+        ],
+        "predicted_intervals_ns": [
+          190.0
+        ],
+        "error_ns": [
+          -0.01
+        ],
+        "error_cycles": [
+          -0.002
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 283.66,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/four_blocks/260727_102406",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 6,
+    "gaps_ns": [
+      75.0,
+      75.0,
+      75.0,
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2,
+        "measured_offset": 1
+      },
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2,
+        "measured_offset": 1
+      },
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2,
+        "measured_offset": 1
+      },
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.14,
+    "worst_error_cycles": 0.028,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 4,
+        "n_predicted": 4,
+        "first_edge_ns": 284.63,
+        "measured_intervals_ns": [
+          195.11,
+          390.14,
+          584.99
+        ],
+        "predicted_intervals_ns": [
+          195.0,
+          390.0,
+          585.0
+        ],
+        "error_ns": [
+          0.11,
+          0.14,
+          -0.01
+        ],
+        "error_cycles": [
+          0.021,
+          0.028,
+          -0.003
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 4,
+        "n_predicted": 4,
+        "first_edge_ns": 283.22,
+        "measured_intervals_ns": [
+          195.02,
+          390.05,
+          585.03
+        ],
+        "predicted_intervals_ns": [
+          195.0,
+          390.0,
+          585.0
+        ],
+        "error_ns": [
+          0.02,
+          0.05,
+          0.03
+        ],
+        "error_cycles": [
+          0.004,
+          0.01,
+          0.005
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 4,
+        "n_predicted": 4,
+        "first_edge_ns": 283.4,
+        "measured_intervals_ns": [
+          194.99,
+          390.0,
+          584.99
+        ],
+        "predicted_intervals_ns": [
+          195.0,
+          390.0,
+          585.0
+        ],
+        "error_ns": [
+          -0.01,
+          -0.0,
+          -0.01
+        ],
+        "error_cycles": [
+          -0.001,
+          -0.0,
+          -0.002
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 4,
+        "n_predicted": 4,
+        "first_edge_ns": 283.67,
+        "measured_intervals_ns": [
+          194.99,
+          390.02,
+          584.99
+        ],
+        "predicted_intervals_ns": [
+          195.0,
+          390.0,
+          585.0
+        ],
+        "error_ns": [
+          -0.01,
+          0.02,
+          -0.01
+        ],
+        "error_cycles": [
+          -0.002,
+          0.004,
+          -0.002
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/barrier_uneven/260727_102411",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.01,
+    "worst_error_cycles": 0.003,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 314.7,
+        "measured_intervals_ns": [
+          320.01
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          0.01
+        ],
+        "error_cycles": [
+          0.002
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 313.27,
+        "measured_intervals_ns": [
+          320.0
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          -0.0
+        ],
+        "error_cycles": [
+          -0.0
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 313.39,
+        "measured_intervals_ns": [
+          320.01
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          0.01
+        ],
+        "error_cycles": [
+          0.003
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 313.67,
+        "measured_intervals_ns": [
+          320.01
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          0.01
+        ],
+        "error_cycles": [
+          0.003
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/barrier_uneven_2ch/260727_102416",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.02,
+    "worst_error_cycles": 0.003,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 284.79,
+        "measured_intervals_ns": [
+          319.99
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          -0.01
+        ],
+        "error_cycles": [
+          -0.001
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.26,
+        "measured_intervals_ns": [
+          319.98
+        ],
+        "predicted_intervals_ns": [
+          320.0
+        ],
+        "error_ns": [
+          -0.02
+        ],
+        "error_cycles": [
+          -0.003
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 0,
+        "n_predicted": 0,
+        "first_edge_ns": null,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 0,
+        "n_predicted": 0,
+        "first_edge_ns": null,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/barrier_uneven_pulses/260727_102420",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.01,
+    "worst_error_cycles": 0.002,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 3,
+        "first_edge_ns": 284.61,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          120.0,
+          240.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 283.25,
+        "measured_intervals_ns": [
+          240.01
+        ],
+        "predicted_intervals_ns": [
+          240.0
+        ],
+        "error_ns": [
+          0.01
+        ],
+        "error_cycles": [
+          0.002
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 0,
+        "n_predicted": 0,
+        "first_edge_ns": null,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 0,
+        "n_predicted": 0,
+        "first_edge_ns": null,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/register_dwell/260727_103057",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.04,
+    "worst_error_cycles": 0.008,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 379.79,
+        "measured_intervals_ns": [
+          420.04
+        ],
+        "predicted_intervals_ns": [
+          420.0
+        ],
+        "error_ns": [
+          0.04
+        ],
+        "error_cycles": [
+          0.008
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 378.25,
+        "measured_intervals_ns": [
+          420.0
+        ],
+        "predicted_intervals_ns": [
+          420.0
+        ],
+        "error_ns": [
+          0.0
+        ],
+        "error_cycles": [
+          0.001
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 378.39,
+        "measured_intervals_ns": [
+          420.01
+        ],
+        "predicted_intervals_ns": [
+          420.0
+        ],
+        "error_ns": [
+          0.01
+        ],
+        "error_cycles": [
+          0.003
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 378.69,
+        "measured_intervals_ns": [
+          420.0
+        ],
+        "predicted_intervals_ns": [
+          420.0
+        ],
+        "error_ns": [
+          -0.0
+        ],
+        "error_cycles": [
+          -0.0
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/stretch/260727_103102",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 335.17,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 334.01,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 333.75,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 334.61,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/stretch_then_pulse/260727_103107",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 355.39,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          495.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 353.95,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          495.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 353.83,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          495.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 2,
+        "first_edge_ns": 354.62,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [
+          495.0
+        ],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/stretch_two_blocks/260727_103230",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 4,
+    "gaps_ns": [
+      75.0,
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 15,
+        "detect": 3,
+        "issue": 9,
+        "propagate": 2,
+        "measured_offset": 1
+      },
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 25.84,
+    "worst_error_cycles": 5.167,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 335.25,
+        "measured_intervals_ns": [
+          544.57
+        ],
+        "predicted_intervals_ns": [
+          570.0
+        ],
+        "error_ns": [
+          -25.43
+        ],
+        "error_cycles": [
+          -5.086
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 333.99,
+        "measured_intervals_ns": [
+          544.27
+        ],
+        "predicted_intervals_ns": [
+          570.0
+        ],
+        "error_ns": [
+          -25.73
+        ],
+        "error_cycles": [
+          -5.145
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 333.71,
+        "measured_intervals_ns": [
+          544.68
+        ],
+        "predicted_intervals_ns": [
+          570.0
+        ],
+        "error_ns": [
+          -25.32
+        ],
+        "error_cycles": [
+          -5.063
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 334.51,
+        "measured_intervals_ns": [
+          544.16
+        ],
+        "predicted_intervals_ns": [
+          570.0
+        ],
+        "error_ns": [
+          -25.84
+        ],
+        "error_cycles": [
+          -5.167
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/stretch_two_blocks_same/260727_103316",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 4,
+    "gaps_ns": [
+      100.0,
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 20,
+        "detect": 3,
+        "issue": 14,
+        "propagate": 2,
+        "measured_offset": 1
+      },
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.15,
+    "worst_error_cycles": 0.03,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 335.0,
+        "measured_intervals_ns": [
+          595.15
+        ],
+        "predicted_intervals_ns": [
+          595.0
+        ],
+        "error_ns": [
+          0.15
+        ],
+        "error_cycles": [
+          0.03
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 333.95,
+        "measured_intervals_ns": [
+          594.98
+        ],
+        "predicted_intervals_ns": [
+          595.0
+        ],
+        "error_ns": [
+          -0.02
+        ],
+        "error_cycles": [
+          -0.003
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 333.73,
+        "measured_intervals_ns": [
+          594.99
+        ],
+        "predicted_intervals_ns": [
+          595.0
+        ],
+        "error_ns": [
+          -0.01
+        ],
+        "error_cycles": [
+          -0.002
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 334.63,
+        "measured_intervals_ns": [
+          594.99
+        ],
+        "predicted_intervals_ns": [
+          595.0
+        ],
+        "error_ns": [
+          -0.01
+        ],
+        "error_cycles": [
+          -0.002
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/loop_2/260727_110817",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      90.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 18,
+        "detect": 3,
+        "issue": 12,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 1,
+        "first_edge_ns": 289.74,
+        "measured_intervals_ns": [
+          219.98
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 1,
+        "first_edge_ns": 288.27,
+        "measured_intervals_ns": [
+          219.98
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 1,
+        "first_edge_ns": 288.4,
+        "measured_intervals_ns": [
+          220.03
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 1,
+        "first_edge_ns": 288.69,
+        "measured_intervals_ns": [
+          219.97
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/loop_3/260727_110822",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      90.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 18,
+        "detect": 3,
+        "issue": 12,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 3,
+        "n_predicted": 1,
+        "first_edge_ns": 289.71,
+        "measured_intervals_ns": [
+          220.04,
+          440.09
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 3,
+        "n_predicted": 1,
+        "first_edge_ns": 288.26,
+        "measured_intervals_ns": [
+          220.0,
+          440.0
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 3,
+        "n_predicted": 1,
+        "first_edge_ns": 288.42,
+        "measured_intervals_ns": [
+          219.97,
+          439.99
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 3,
+        "n_predicted": 1,
+        "first_edge_ns": 288.68,
+        "measured_intervals_ns": [
+          219.99,
+          439.96
+        ],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/loop_2_double/260727_110953",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      90.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 18,
+        "detect": 3,
+        "issue": 12,
+        "propagate": 2,
+        "measured_offset": 1
+      }
+    ],
+    "worst_error_ns": 225.0,
+    "worst_error_cycles": 45.001,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 294.89,
+        "measured_intervals_ns": [
+          344.96
+        ],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [
+          224.96
+        ],
+        "error_cycles": [
+          44.993
+        ]
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 293.27,
+        "measured_intervals_ns": [
+          345.0
+        ],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [
+          225.0
+        ],
+        "error_cycles": [
+          45.001
+        ]
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 293.41,
+        "measured_intervals_ns": [
+          344.98
+        ],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [
+          224.98
+        ],
+        "error_cycles": [
+          44.996
+        ]
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 2,
+        "n_predicted": 2,
+        "first_edge_ns": 293.7,
+        "measured_intervals_ns": [
+          345.0
+        ],
+        "predicted_intervals_ns": [
+          120.0
+        ],
+        "error_ns": [
+          225.0
+        ],
+        "error_cycles": [
+          44.999
+        ]
+      }
+    ]
+  },
+  {
+    "folder": "/mnt/Data/test/test_loopback/single/260727_120342",
+    "runtime": "LoopbackTimingCaseRuntime",
+    "case": null,
+    "blocks": 3,
+    "gaps_ns": [
+      80.0
+    ],
+    "gap_breakdowns": [
+      {
+        "total": 16,
+        "detect": 3,
+        "issue": 10,
+        "propagate": 2,
+        "measured_offset": 1,
+        "branch_penalty": 0,
+        "edge": "fall-through"
+      }
+    ],
+    "executed_blocks": 3,
+    "worst_error_ns": 0.0,
+    "worst_error_cycles": 0.0,
+    "rows": [
+      {
+        "channel": "ch0",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 304.81,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch1",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 303.26,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch2",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 303.38,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      },
+      {
+        "channel": "ch3",
+        "n_measured": 1,
+        "n_predicted": 1,
+        "first_edge_ns": 303.69,
+        "measured_intervals_ns": [],
+        "predicted_intervals_ns": [],
+        "error_ns": [],
+        "error_cycles": []
+      }
+    ]
+  }
+]
