@@ -22,11 +22,11 @@ fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 | `interactive.py` | `SequenceView` — drag-box zoom, scroll, pan, reset |
 | `qt_widget.py` | `SequenceWidget` — PyQt5 wrapper for acadia_gui |
 | `notebooks/` | `explore_sequence.ipynb` (interactive), `visualize_sequence.ipynb` (static) |
-| `selftest.py` | hardware-free regression: traces archived folders, checks each against its own `compiled.log`, exercises every render option |
+| `validation/selftest.py` | hardware-free regression: traces archived folders, checks each against its own `compiled.log`, exercises every render option |
 | `docs/VALIDATION.md` | staged record of checking the model against the loopback station — what was tried, what it found |
 | `docs/EMPIRICAL_CONSTANTS.md` | the only two numbers that are measured rather than derived, and the brief for tracking them down in acadia |
 | `docs/EXAMPLE_FOLDERS.md` | one archived folder per runtime class (39 of them) with its structure — the quickest varied test set |
-| `validation/` | the hardware-validation harness: the loopback test runtime, the deploy/measure/compare scripts, and the measured results |
+| `validation/` | the regression net for acadia/acadia_qmsmt drift: loopback test runtime, deploy/measure/compare scripts, measured results — run these when those packages change (`validation/README.md`) |
 | `docs/DEVELOPER_NOTES.md` | maintainer notes: known issues (KI_001–004), gotchas, open items |
 
 `tracing`/`folder`/`compiled_log` are pure data — no matplotlib. `qt_widget` is the
@@ -359,4 +359,4 @@ and they come back.
 Depends only on `acadia`, `acadia_qmsmt`, `numpy`, `matplotlib` and (in
 `qt_widget` alone) PyQt5. Move the directory as-is. The only change needed is the
 `sys.path` bootstrap in the notebooks (and the `import sequence_viz as sv` in
-`selftest.py` / `validation/*`), which becomes `from acadia_qmsmt.sequence_viz import ...`.
+`validation/*`), which becomes `from acadia_qmsmt.sequence_viz import ...`.

@@ -28,8 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # holds sequence_viz
-sys.path.insert(0, str(Path(__file__).resolve().parent))      # loopback_timing_cases, paths_local
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # loopback_timing_cases, paths_local
 
 import paths_local
 
@@ -149,7 +148,7 @@ def predict(folder):
     ``two_same_block`` compares nothing (fewer measured regions than predicted pulses) and
     ``loop_2_double`` compares the wrong pairs.
     """
-    import sequence_viz as sv
+    from acadia_qmsmt import sequence_viz as sv
 
     trace = sv.trace_folder(folder)
     starts = {}
@@ -255,7 +254,7 @@ def dry_run(case, **kwargs):
     reject at compile time is rejected here too -- barrier_uneven's multi-argument
     max() is the example.
     """
-    import sequence_viz as sv
+    from acadia_qmsmt import sequence_viz as sv
 
     trace = sv.trace_runtime(build_runtime(case, **kwargs), capture_points=False,
                              envelopes=False)
@@ -303,7 +302,7 @@ def main():
     if args.program:
         # Tagged dump of the compiled program, so control-flow edges can be read off.
         dry_run(args.program)   # prints a summary + reproduces any compile error
-        import sequence_viz as sv
+        from acadia_qmsmt import sequence_viz as sv
         runtime = build_runtime(args.program)
         # dry_run already compiled a runtime, but it is not returned -- recompile a fresh
         # one purely to hold the program (a runtime can only be traced once, by design)

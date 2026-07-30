@@ -19,7 +19,7 @@ from .compiled_log import compare as compare_with_compiled_log
 from .compiled_log import parse as parse_compiled_log
 from .dryrun import (InstrumentAccessBlocked, StopDryRun, fake_attach,
                      hardware_stubbed)
-from .folder import is_data_folder, load_runtime, trace_folder
+from .folder import is_data_folder, trace_folder
 from .interactive import SequenceView, interactive_view
 from .plotting import (assign_colors, base_pulse, branch_caption,
                        branch_regions, draw, plot_trace)
@@ -31,7 +31,7 @@ __all__ = [
     "trace_folder", "trace_runtime", "plot_trace", "draw",
     "SequenceView", "interactive_view",
     "assign_colors", "base_pulse", "branch_regions", "branch_caption",
-    "load_runtime", "is_data_folder",
+    "is_data_folder",
     "parse_compiled_log", "compare_with_compiled_log",
     "SequenceTrace", "Block", "Command", "describe_registers",
     "fake_attach", "hardware_stubbed", "StopDryRun",

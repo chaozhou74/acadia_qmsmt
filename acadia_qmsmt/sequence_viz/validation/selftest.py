@@ -5,7 +5,7 @@ Traces a set of archived data folders and checks each one against its own
 ``compiled.log`` -- the independent artifact of what the FPGA actually ran -- then
 exercises every render option, point selection, and the interactive viewport.
 
-    $ACADIA_ENV/bin/python selftest.py
+    $ACADIA_ENV/bin/python validation/selftest.py
 
 The archived runs it traces are read from the gitignored
 ``validation/paths.local.yaml`` (``selftest_folders``), so no data path is
@@ -21,14 +21,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 for _name in ("acadia", "qmsmt_runtime_loader", "sequence_viz"):
     logging.getLogger(_name).setLevel(logging.ERROR)
 
-import sequence_viz as sv
+from acadia_qmsmt import sequence_viz as sv
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "validation"))  # paths_local
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # paths_local (sibling)
 import paths_local
 
 # Archived runs to trace, from the gitignored validation/paths.local.yaml

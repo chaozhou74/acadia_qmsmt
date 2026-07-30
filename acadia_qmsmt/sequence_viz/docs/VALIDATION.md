@@ -16,7 +16,7 @@ resolves an edge to ~0.05 ns despite 5 ns samples.
 **Tools.** `validation/timing_validation.py` (`--dryrun`, `--case`, `--analyse`,
 `--regions`, `--logs`, `--revalidate`) driving
 `validation/loopback_timing_cases.py` (29 selectable DAC sequences).
-`sequence_viz/selftest.py` is the hardware-free regression.
+`sequence_viz/validation/selftest.py` is the hardware-free regression.
 
 ---
 

@@ -31,8 +31,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # timing_validation, loopback_timing_cases
 
 from timing_validation import CHANNEL_OF, pulse_regions_ns, run_case
 
@@ -98,7 +97,7 @@ def shape_error(predicted, t_ns, samples):
 
 
 def analyse(folder, verbose=True):
-    import sequence_viz as sv
+    from acadia_qmsmt import sequence_viz as sv
     from acadia_qmsmt.utils.saved_runtime_loader import load_runtime_from_data_dir
 
     trace = sv.trace_folder(folder)
