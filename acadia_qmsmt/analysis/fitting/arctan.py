@@ -29,6 +29,41 @@ class Arctan(FitterBase):
             "of": {"value": offset_guess},
         }
 
+class ArctanWrapped(FitterBase):
+    @staticmethod
+    def model(coordinates, x0, A, w, of):
+        # 1. Calculate the raw phase (result is in radians)
+        phases = A * np.arctan((coordinates - x0)/w) + of
+        
+        # 2. Convert radians to degrees
+        phases = np.degrees(phases)
+
+        # 3. Wrap the phase to the [-180, 180) range
+        #    (phases + 180) % 360 shifts the range to [0, 360)
+        #    Subtracting 180 shifts it back to [-180, 180)
+        phases = (phases + 180) % 360 - 180
+
+        return phases
+
+    @staticmethod
+    def guess(coordinates, data):
+        smoothed_data = gaussian_filter1d(data, sigma=3)
+        dphi = np.gradient(smoothed_data, coordinates)
+        x0_guess = coordinates[np.argmax(np.abs(dphi))]
+        scale_guess = np.mean(data[-3:] - data[:3])/180
+        w_guess = (coordinates[-1] - coordinates[0]) * 0.02
+        offset_guess = np.median(smoothed_data[:5]) + scale_guess * 180/2
+
+        if scale_guess < 0:
+            scale_min, scale_max = scale_guess*2 ,0
+        else:
+            scale_min, scale_max = 0, scale_guess*2
+        return {
+            "x0": {"value": x0_guess, "min": coordinates[0], "max": coordinates[-1]},
+            "A": {"value": scale_guess, "min": scale_min, "max": scale_max},
+            "w": {"value": w_guess, "min": coordinates[1] - coordinates[0], "max": coordinates[-1] - coordinates[0]},
+            "of": {"value": offset_guess},
+        }
 
 
 

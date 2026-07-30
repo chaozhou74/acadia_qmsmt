@@ -36,7 +36,6 @@ class QubitPulseAmplitudeCalibrationRuntime(QMsmtRuntime):
 
     def main(self):
         import logging
-        from acadia.utils import clock_monotonic_ns
         logger = logging.getLogger("acadia")
 
         qubit_stimulus_io = self.io("qubit_stimulus")

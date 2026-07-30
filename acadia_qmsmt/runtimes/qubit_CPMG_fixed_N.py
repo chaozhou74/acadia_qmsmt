@@ -1,4 +1,4 @@
-from typing import Union, Annotated, Literal
+from typing import Union, Annotated
 from functools import partial
 
 import numpy as np
@@ -12,9 +12,12 @@ from acadia.runtime import annotate_method
 def dual_sine_decay(t, A, tau, B, f1, f2):
     return A * np.exp(-t/tau) * np.cos(2*np.pi*f1*t) * np.cos(2*np.pi*f2*t)  + B
 
-class QubitCoherenceRuntime(QMsmtRuntime):
+class QubitCPMGFixedNRuntime(QMsmtRuntime):
     """
-    A :class:`Runtime` subclass for measuring the T2 of a qubit.
+    A :class:`Runtime` subclass for measuring the CPMG T2 of a qubit.
+
+    The CPMG sequence is similar to the Ramsey sequence, but with multiple pi pulses inserted in the middle to refocus low frequency noise. 
+    Here, we will fix the number of pi pulses and vary the total time to see how the coherence time changes with the number of pi pulses.
     """
     qubit_stimulus: IOConfig
     readout_stimulus: IOConfig
@@ -22,15 +25,13 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
     delay_times: Union[list, np.ndarray]
     virtual_detuning: float = 0
-    do_echo:bool = False
+    num_pi_pulses: int = 2
 
 
     iterations: int
     run_delay: int
     
     qubit_pi_pulse_name: str = "R_x_180"
-
-    initial_qubit_phase: float = 0.0
 
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
@@ -60,9 +61,11 @@ class QubitCoherenceRuntime(QMsmtRuntime):
 
 
         qubit_pi_over_2_pulse_name = qubit.make_rotation_pulse(90, 0, self.qubit_pi_pulse_name)
+        qubit_pi_orthogonal_pulse_name = qubit.make_rotation_pulse(180, 90, self.qubit_pi_pulse_name)
         second_pi_over_2_pulse_name = qubit_stimulus_io.duplicate_pulse(qubit_pi_over_2_pulse_name)
 
 
+        assert self.num_pi_pulses >= 1, "Number of pi pulses must be at least 1 for CPMG sequence"
 
         def sequence(a: Acadia):
             # Initialize a Register for the dwell time
@@ -74,15 +77,11 @@ class QubitCoherenceRuntime(QMsmtRuntime):
             with a.channel_synchronizer():
                 qubit_stimulus_io.schedule_pulse(qubit_pi_over_2_pulse_name)
             
-            with a.channel_synchronizer():
-                qubit_stimulus_io.dwell(counter)
-                
-            if self.do_echo:
+            for _ in range(self.num_pi_pulses):
                 with a.channel_synchronizer():
-                   qubit_stimulus_io.schedule_pulse(self.qubit_pi_pulse_name)
-
-            with a.channel_synchronizer():
-                qubit_stimulus_io.dwell(counter)
+                    qubit_stimulus_io.dwell(counter)
+                    qubit_stimulus_io.schedule_pulse(qubit_pi_orthogonal_pulse_name)
+                    qubit_stimulus_io.dwell(counter)
 
             with a.channel_synchronizer():
                 qubit_stimulus_io.schedule_pulse(second_pi_over_2_pulse_name)
@@ -101,26 +100,21 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         qubit_stimulus_io.load_pulse(qubit_pi_over_2_pulse_name)
         
 
-        if self.do_echo:
-            qubit_stimulus_io.load_pulse(self.qubit_pi_pulse_name, phase=np.pi/2)
+        qubit_stimulus_io.load_pulse(qubit_pi_orthogonal_pulse_name)
         
-        # get the original scale and detune for applying virtual phase shift
+        # get the original scale for applying virtual phase shift
         second_pulse_scale = qubit_stimulus_io.get_config("pulses", second_pi_over_2_pulse_name, "scale")
-
-        # get the origianl detune on the pulse to make it effectively CW later
-        pulse_detune = self._ios["qubit_stimulus"].get_config("pulses", self.qubit_pi_pulse_name).get("detune", 0)
-
+        
         # Determine how many cycles each delay interval should be
-        dsp_count_values = self.acadia.seconds_to_cycles(self.delay_times/2)
+        dsp_count_values = self.acadia.seconds_to_cycles(self.delay_times/(2*self.num_pi_pulses))
 
         for i in range(self.iterations):
             for idx_delay,delay in enumerate(dsp_count_values):
                 # Update the delay amount in the cache
                 cache[0] = delay
 
-                # Shift the phase of the second pulse according to the virtual detuning and the pulse detune
-                scale = second_pulse_scale * np.exp(2 * np.pi * 1j *
-                                                    (self.virtual_detuning + pulse_detune) * self.delay_times[idx_delay] + 1j*self.initial_qubit_phase)
+                # Shift the phase of the second pulse according to the virtual detuning
+                scale = second_pulse_scale * np.exp(2 * np.pi * 1j * self.virtual_detuning * self.delay_times[idx_delay])
                 qubit_stimulus_io.load_pulse(second_pi_over_2_pulse_name, scale=scale)
 
                 # Capture data and put in the corresponding group
@@ -146,52 +140,45 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import save_registered_plots
         save_registered_plots(self)
 
-    @annotate_method(is_data_processor=True)
-    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"] = None,
-            fit_function: Literal["ExpCosine", "StretchedExpCosine"] = "ExpCosine"):
-        from acadia_qmsmt.analysis import reshape_iq_data_by_axes
-        from acadia_qmsmt.analysis.fitting import ExpCosine, StretchedExpCosine
 
-        fit_classes = {
-            "ExpCosine": ExpCosine,
-            "StretchedExpCosine": StretchedExpCosine,
-        }
-        FitClass = fit_classes[fit_function]
+    @annotate_method(is_data_processor=True)
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"] = None):
+        from acadia_qmsmt.analysis import reshape_iq_data_by_axes
+        from acadia_qmsmt.analysis.fitting import ExpCosine
 
         data = reshape_iq_data_by_axes(self.data["points"].records(), self.delay_times, to_complex=True)
         if data is None:
             return
+
         completed_iterations = len(data)
         readout_resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+
         self.data_complex = data
         self.shots = readout_resonator.classify_measurement(self.data_complex, readout_classifier)
         self.avg_shots = np.mean(self.shots, axis=0)
         self.sigma_shots = np.std(self.shots, axis=0) / np.sqrt(completed_iterations)
-        self.fit = FitClass(self.delay_times * 1e6, self.avg_shots, sigma=self.sigma_shots)
+        
+        self.fit = ExpCosine(self.delay_times * 1e6, self.avg_shots, sigma=self.sigma_shots)
         self.fitted_t2_us = self.fit.ufloat_results["tau"]
         self.fitted_detune_MHz = self.fit.ufloat_results["f"]
-        self.fitted_beta = self.fit.ufloat_results.get("beta", None)
         return completed_iterations
+    
 
     @annotate_method(plot_name="1 qubit T2", axs_shape=(1,1))
     def plot_data(self, axs=None):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, axs = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        label = f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.6g}"
-        if self.fitted_beta is not None:
-            label += f"\nbeta: {self.fitted_beta:.3g}"
+        self.fit.plot(axs, oversample=5, 
+                            result_kwargs={"label":f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.6g}"})
+        # self.fit.plot_fitted(axs, oversample=5, label=f"T2 (us): {self.fitted_t2_us:.4g}\nDetune(MHz): {self.fitted_detune_MHz:.4g}")
 
-        self.fit.plot(axs, oversample=5, result_kwargs={"label": label})
         axs.set_xlabel("Time [us]")
         axs.set_ylabel("Average Measurement")
         if np.ptp(self.avg_shots) > 0.5 and np.ptp(self.avg_shots) < 1.0:
             axs.set_ylim(-0.02, 1.02)
 
-        title = f"T2{'E' if self.do_echo else 'R'}: {self.fit.ufloat_results['tau']:.5g}"
-        if self.fitted_beta is not None:
-            title += f", β: {self.fitted_beta:.3g}"
-        axs.set_title(title)
+        axs.set_title(f"T2 CPMG, N={self.num_pi_pulses}: {self.fit.ufloat_results['tau']:.5g}")
 
         axs.legend()
         return fig, axs
@@ -205,19 +192,3 @@ class QubitCoherenceRuntime(QMsmtRuntime):
         axs.set_ylabel("Time [us]")
         return fig, axs
 
-
-    @annotate_method(button_name="update qubit nco frequency (if Ramsey)")
-    def update_frequencies(self):
-
-        if not self.do_echo:
-            if self.fit is not None:
-                nco_freq = self._ios["qubit_stimulus"].get_config("channel_config", "nco_frequency")
-                # we assume the virtual detuning is large enough that the apparent detuning always has the same sign
-                # as the virtual detuning
-                detuning = self.virtual_detuning - abs(self.fit.ufloat_results['f'].n*1e6) * np.sign(self.virtual_detuning)
-                self.update_io_yaml_field("qubit_stimulus", f"channel_config.nco_frequency", 
-                                          np.round(nco_freq + detuning)
-                )
-                pulse_detune = self._ios["qubit_stimulus"].get_config("pulses", self.qubit_pi_pulse_name).get("detune", 0)
-                qubit_freq0 = nco_freq + pulse_detune
-                self.qubit_freq = np.round(qubit_freq0 + detuning)

@@ -170,7 +170,17 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
         self.median_g = np.median(self.real_g)
         self.median_e = np.median(self.real_e)
-
+        
+        # Calculate standard deviations
+        self.sigma_g = np.std(self.real_g)
+        self.sigma_e = np.std(self.real_e)
+        
+        # Calculate separation in units of average sigma
+        avg_sigma = (self.sigma_g + self.sigma_e) / 2.0
+        
+        # Using medians for the distance, consistent with your existing code
+        self.separation_sigma = abs(self.median_g - self.median_e) / avg_sigma
+        
         return completed_iterations
 
     @annotate_method(plot_name="Readout Histogram 2D", axs_shape=(1, 2))
@@ -210,9 +220,22 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         from acadia_qmsmt.plotting import prepare_plot_axes
         fig, ax = prepare_plot_axes(axs, axs_shape=(1,1), figsize=self.figsize)
 
-        labels = ['Fidelity', 'P(g given g)', 'P(e given g)', 'P(g given e)', 'P(e given e)','median g','median e','separation','# of shots','threshold']
-        values = [np.round(self.Fidelity,5), np.round(self.P_g_given_g,5) , np.round(self.P_e_given_g,5) , np.round(self.P_g_given_e,5), np.round(self.P_e_given_e,5), self.median_g,self.median_e, self.median_g - self.median_e,self.num_counts,self.my_thresh]
-
+        labels = [
+            'Fidelity', 'Fidelity (worse def)', 
+            'P(g given g)', 'P(e given g)', 
+            'P(g given e)', 'P(e given e)',
+            'median g', 'median e', 'separation', 
+            'sigma g', 'sigma e', 
+            'separation (sigma)', '# of shots', 'threshold'
+        ]
+        values = [
+            np.round(self.Fidelity, 5), np.round(1. - 2*(1. - self.Fidelity), 5), 
+            np.round(self.P_g_given_g, 5), np.round(self.P_e_given_g, 5), 
+            np.round(self.P_g_given_e, 5), np.round(self.P_e_given_e, 5), 
+            self.median_g, self.median_e, self.median_g - self.median_e, 
+            np.round(self.sigma_g, 3), np.round(self.sigma_e, 3), np.round(self.separation_sigma, 3), 
+            self.num_counts, self.my_thresh
+        ]
         # Table data: each row has [label, value]
         table_data = [[label, value] for label, value in zip(labels, values)]
 
