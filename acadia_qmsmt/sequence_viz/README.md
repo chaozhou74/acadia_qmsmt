@@ -23,9 +23,8 @@ fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 | `qt_widget.py` | `SequenceWidget` — PyQt5 wrapper for acadia_gui |
 | `notebooks/` | `explore_sequence.ipynb` (interactive), `visualize_sequence.ipynb` (static) |
 | `validation/selftest.py` | hardware-free regression: traces archived folders, checks each against its own `compiled.log`, exercises every render option |
-| `docs/VALIDATION.md` | staged record of checking the model against the loopback station — what was tried, what it found |
+| `docs/MAINTENANCE.md` | the workflow to update the visualizer when acadia/acadia_qmsmt change (symptom → coupling point → fix → re-validate) |
 | `docs/EMPIRICAL_CONSTANTS.md` | the only two numbers that are measured rather than derived, and the brief for tracking them down in acadia |
-| `docs/EXAMPLE_FOLDERS.md` | one archived folder per runtime class (39 of them) with its structure — the quickest varied test set |
 | `validation/` | the regression net for acadia/acadia_qmsmt drift: loopback test runtime, deploy/measure/compare scripts, measured results — run these when those packages change (`validation/README.md`) |
 | `docs/DEVELOPER_NOTES.md` | maintainer notes: known issues (KI_001–004), gotchas, open items |
 

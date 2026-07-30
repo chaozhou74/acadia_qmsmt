@@ -2,7 +2,7 @@
 
 Maintenance notes for `sequence_viz`: known issues, gotchas, and open items. For
 usage see `README.md`; for the timing model and its hardware validation see
-`VALIDATION.md` and `EMPIRICAL_CONSTANTS.md`.
+`../validation/README.md` and `EMPIRICAL_CONSTANTS.md`.
 
 ## Known issues
 
@@ -46,8 +46,9 @@ in a Jupyter kernel those contexts belong to ipykernel, and destroying them kill
 
 Every distinct runtime class in one station's full archive (39 classes) was traced as a
 breadth test — **37 succeed**, and `compare_with_compiled_log` matches on all 37; the other 2
-are the instrument-touching ones above, blocked by design. `EXAMPLE_FOLDERS.md` records a
-folder per class with its structure (paths are that station's; see the note there).
+are the instrument-touching ones above, blocked by design. A good regression set spans the
+runtime shapes: single-block, register-driven (T1/T2), loop, `test`, `repeat_until`, stretch,
+and multi-rail — the `selftest_folders` in `validation/paths.local.yaml` are picked that way.
 
 Two bugs the sweep found, now fixed:
 
