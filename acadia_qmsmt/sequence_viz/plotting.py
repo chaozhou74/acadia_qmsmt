@@ -27,11 +27,36 @@ INK_SECONDARY = "#5c5b55"
 INK_MUTED = "#8c8b83"
 SURFACE = "#ffffff"
 NEUTRAL_FILL = "#c9c8c0"
-GAP_FILL = "#e34948"        # dead time is a problem, not a category -- status red
+GAP_FILL = "#f2c94c"        # inter-block gap -- a light yellow band
 BRANCH_INK = "#4a3aa7"      # control flow is a caveat, not a series
 
 LANE_HEIGHT = 0.62
 SEPARATOR_PIXELS = 1.5      # visual gap between fills that butt up against each other
+
+# Pulse fills are drawn softened so the envelope stroke on top reads as the shape.
+PULSE_FILL_ALPHA = 0.7
+ENVELOPE_LINEWIDTH = 1.7    # magnitude stroke; iq uses 0.75x (two overlapping lines)
+
+# Color themes. draw() takes one (default LIGHT_THEME); the Qt widget swaps to DARK
+# when the app is in a dark theme. Envelope + all labels + title use ink_primary, so a
+# near-white ink turns them white on dark; surface (capture/register fill) is kept off
+# pure white; figure/axes bg is opaque so there is no white frame in dark mode.
+LIGHT_THEME = {
+    "series": SERIES_LIGHT,
+    "ink_primary": INK_PRIMARY, "ink_secondary": INK_SECONDARY, "ink_muted": INK_MUTED,
+    "surface": SURFACE, "neutral_fill": NEUTRAL_FILL,
+    "gap_fill": GAP_FILL, "branch_ink": BRANCH_INK,
+    "figure_bg": "#ffffff", "axes_bg": "#ffffff",
+    "fill_alpha": PULSE_FILL_ALPHA,
+}
+DARK_THEME = {
+    "series": SERIES_LIGHT,
+    "ink_primary": "#f2f2ec", "ink_secondary": "#b6b5ae", "ink_muted": "#7f7e77",
+    "surface": "#3a3a42", "neutral_fill": "#4c4c54",
+    "gap_fill": "#d9c24e", "branch_ink": "#9d90ff",
+    "figure_bg": "#26262b", "axes_bg": "#26262b",
+    "fill_alpha": 0.82,
+}
 
 # Above this many bars in view, drop the per-bar extras -- they are unreadable at
 # that density anyway and redrawing them makes dragging feel sticky.
@@ -57,7 +82,7 @@ def color_key(cmd, color_by="memory", group_copies=True):
     raise ValueError(f"unknown color_by: {color_by!r}")
 
 
-def assign_styles(trace, color_by="memory", group_copies=True):
+def assign_styles(trace, color_by="memory", group_copies=True, series=None):
     """Identity -> ``{"color", "generation"}``, assigned in first-appearance order.
 
     ``color_by="memory"`` (default) gives one style per **waveform memory**, keyed
@@ -71,10 +96,11 @@ def assign_styles(trace, color_by="memory", group_copies=True):
     ``generation`` counts the wrap -- the renderer marks later generations with an
     outline, so identity stays unambiguous.
 
-    ``color_by="name"`` keys on the pulse name instead, so a name means one colour
+    ``color_by="name"`` keys on the pulse name instead, so a name means one color
     everywhere at the cost of merging same-named pulses across channels.
     ``color_by="channel"`` gives one style per lane.
     """
+    series = series or SERIES_LIGHT
     styles = {}
     for cmd in trace.commands:
         if cmd.pulse is None:
@@ -83,8 +109,8 @@ def assign_styles(trace, color_by="memory", group_copies=True):
         if key in styles:
             continue
         slot = len(styles)
-        styles[key] = {"color": SERIES_LIGHT[slot % len(SERIES_LIGHT)],
-                       "generation": slot // len(SERIES_LIGHT)}
+        styles[key] = {"color": series[slot % len(series)],
+                       "generation": slot // len(series)}
     return styles
 
 
@@ -257,7 +283,7 @@ def _reference_peaks(trace, envelope_scale, envelope_source):
 
 
 def _legend_labels(trace, colors, color_by, group_copies):
-    """Human label per colour key. Memory keys are named by their pulse, prefixed
+    """Human label per color key. Memory keys are named by their pulse, prefixed
     with the channel only when that name is ambiguous across lanes."""
     if color_by != "memory":
         return {k: str(k) for k in colors}
@@ -278,12 +304,42 @@ def lane_label(trace, channel):
     return f"{channel}\n{'/'.join(ios)}" if ios else channel
 
 
+def _hide_overflowing_labels(marks, ax):
+    """Hide any bar label wider than its bar.
+
+    Called after ``xlim`` is set, so ``transData`` gives the bars' real pixel
+    width. A hidden label reads once you zoom in; hovering shows it meanwhile
+    (see :class:`~.interactive.SequenceView`). ``marks`` is
+    ``[(text_artist, bar_left, bar_right), ...]`` in plotted units.
+    """
+    if not marks:
+        return
+    try:
+        renderer = ax.figure.canvas.get_renderer()
+    except Exception:
+        renderer = None                 # estimate from the font metrics instead
+    transform = ax.transData
+    for artist, left, right in marks:
+        try:
+            bar_px = abs(transform.transform((right, 0))[0]
+                         - transform.transform((left, 0))[0])
+            if renderer is not None:
+                text_px = artist.get_window_extent(renderer).width
+            else:
+                text_px = (len(artist.get_text()) * artist.get_fontsize()
+                           * 0.6 * ax.figure.dpi / 72.0)
+        except Exception:
+            continue
+        if text_px > bar_px:
+            artist.set_visible(False)
+
+
 def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
          pulse_label="name",
          show_barriers=True, show_blocks=True, show_gaps=True, show_branches=True,
          group_copies=True,
          color_by="memory", envelope_source="memory", envelope_scale="per-pulse",
-         envelope_mode="magnitude", legend=True, title=None):
+         envelope_mode="magnitude", legend=True, title=None, theme=None):
     """Draw ``trace`` into ``ax`` for the visible window. Returns the x limits
     actually applied, in the plotted time unit.
 
@@ -304,6 +360,17 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
     """
     from matplotlib.patches import Patch, Rectangle
 
+    # Theme colors, bound as locals so the body below reads the same in either mode.
+    th = theme or LIGHT_THEME
+    INK_PRIMARY = th["ink_primary"]
+    INK_SECONDARY = th["ink_secondary"]
+    INK_MUTED = th["ink_muted"]
+    SURFACE = th["surface"]
+    NEUTRAL_FILL = th["neutral_fill"]
+    GAP_FILL = th["gap_fill"]
+    BRANCH_INK = th["branch_ink"]
+    fill_alpha = th["fill_alpha"]
+
     channels = list(trace.channels)
     if not channels:
         raise ValueError("trace contains no channels")
@@ -323,7 +390,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
     t0, t1 = limits_ns[0] / divisor, limits_ns[1] / divisor
 
     lane = {ch: len(channels) - 1 - i for i, ch in enumerate(channels)}
-    styles = assign_styles(trace, color_by, group_copies)
+    styles = assign_styles(trace, color_by, group_copies, series=th["series"])
     peaks = (_reference_peaks(trace, envelope_scale, envelope_source)
              if show_envelopes else {})
 
@@ -335,6 +402,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
     used_pulses = set()
     drew_capture = drew_padding = drew_symbolic = drew_gap = drew_branch = False
     drew_dwell = False
+    label_marks = []       # (text artist, bar left, bar right) in plotted units
 
     # one outline per control-flow region, not per block: a repeat_until wraps
     # every block in its body, and per-block captions collide
@@ -359,7 +427,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         if show_gaps and blk.gap_after:
             g0, g1 = blk.stop * ns, (blk.stop + blk.gap_after) * ns
             if g1 >= t0 and g0 <= t1:
-                ax.axvspan(g0, g1, facecolor=GAP_FILL, alpha=0.16, linewidth=0,
+                ax.axvspan(g0, g1, facecolor=GAP_FILL, alpha=0.22, linewidth=0,
                            zorder=1)
                 drew_gap = True
                 if detailed and (g1 - g0) >= min_label * 1.5:
@@ -402,15 +470,15 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
 
                 if pulse:
                     style = styles[key]
-                    face, hatch, alpha = style["color"], None, 1.0
-                    # a wrapped palette slot is marked, not recoloured
+                    face, hatch, alpha = style["color"], None, fill_alpha
+                    # a wrapped palette slot is marked, not recolored
                     edge = INK_PRIMARY if style["generation"] else "none"
                     used_pulses.add(key)
                 elif is_capture:
                     face, edge, hatch, alpha = SURFACE, INK_SECONDARY, None, 1.0
                     drew_capture = True
                 elif head.is_padding:
-                    # hatch renders in the edge colour, so padding needs one
+                    # hatch renders in the edge color, so padding needs one
                     face, edge, hatch, alpha = NEUTRAL_FILL, INK_MUTED, "///", 0.35
                     drew_padding = True
                 else:
@@ -449,14 +517,14 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                                         y + pick(values) / reference
                                         * LANE_HEIGHT * 0.46,
                                         color=INK_PRIMARY, alpha=alpha_,
-                                        linewidth=0.9, zorder=3)
+                                        linewidth=ENVELOPE_LINEWIDTH * 0.75, zorder=3)
                         elif envelope_mode == "magnitude":
                             ax.plot(times * ns,
                                     y - LANE_HEIGHT / 2
                                     + pick(np.abs(samples)) / reference
                                     * LANE_HEIGHT * 0.92,
-                                    color=INK_PRIMARY, alpha=0.5, linewidth=1.0,
-                                    zorder=3)
+                                    color=INK_PRIMARY, alpha=0.7,
+                                    linewidth=ENVELOPE_LINEWIDTH, zorder=3)
                         else:
                             raise ValueError(
                                 f"unknown envelope_mode: {envelope_mode!r}")
@@ -470,13 +538,25 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                         text = (f"{(x1 - x0) * trace.ns_per_cycle:.0f} ns"
                                 if pulse_label == "length" else pulse)
                     elif is_capture:
-                        text = "capture"
+                        text = (f"{(x1 - x0) * trace.ns_per_cycle:.0f} ns"
+                                if pulse_label == "length" else "capture")
+                    elif head.kind == "DWELL" and not head.is_padding:
+                        # a scheduled dwell has only a duration -- always label it in ns
+                        text = f"{(x1 - x0) * trace.ns_per_cycle:.0f} ns"
                     else:
                         text = None
                     if text and (x1 - x0) * ns >= min_label:
-                        ax.text((x0 + (x1 - x0) / 2) * ns, y, text, ha="center",
-                                va="center", fontsize=7.5, color=INK_PRIMARY,
-                                zorder=4, clip_on=True)
+                        # a register label sits over an "xx" hatch -- put it on a
+                        # small surface box so it stays readable
+                        bbox = (dict(facecolor=SURFACE, edgecolor="none", pad=1.5,
+                                     alpha=0.9) if head.symbolic else None)
+                        artist = ax.text((x0 + (x1 - x0) / 2) * ns, y, text,
+                                         ha="center", va="center", fontsize=7.5,
+                                         color=INK_PRIMARY, zorder=4, clip_on=True,
+                                         bbox=bbox)
+                        # remember the drawn bar extent so a label wider than its
+                        # bar can be hidden once xlim is set (hover shows it then)
+                        label_marks.append((artist, x0 * ns, (x0 + width) * ns))
 
         if show_barriers:
             for t in blk.barriers:
@@ -498,10 +578,15 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(INK_MUTED)
     ax.tick_params(colors=INK_SECONDARY, labelsize=8)
+    ax.set_facecolor(th["axes_bg"])
+    ax.figure.set_facecolor(th["figure_bg"])
+
+    _hide_overflowing_labels(label_marks, ax)
 
     if legend:
         labels = _legend_labels(trace, styles, color_by, group_copies)
         handles = [Patch(facecolor=styles[k]["color"], label=labels[k],
+                         alpha=fill_alpha,
                          edgecolor=INK_PRIMARY if styles[k]["generation"] else "none",
                          linewidth=1.0 if styles[k]["generation"] else 0)
                    for k in styles if k in used_pulses]
@@ -518,8 +603,8 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
             handles.append(Patch(facecolor=SURFACE, edgecolor=INK_MUTED, hatch="xx",
                                  label="indeterminate (register)"))
         if drew_gap:
-            handles.append(Patch(facecolor=GAP_FILL, alpha=0.16,
-                                 label="inter-block gap (dead)"))
+            handles.append(Patch(facecolor=GAP_FILL, alpha=0.22,
+                                 label="inter-block gap"))
         if drew_branch:
             handles.append(Patch(facecolor="none", edgecolor=BRANCH_INK,
                                  linestyle=(0, (4, 3)),
@@ -539,7 +624,7 @@ def plot_trace(trace, ax=None, figsize=None, **draw_kwargs):
     """One-shot static figure. Returns ``(fig, ax)``.
 
     ``draw_kwargs`` are passed to :func:`draw` -- notably ``xlim_ns=(t0, t1)`` to
-    render a window, and ``group_copies=False`` to colour duplicates separately.
+    render a window, and ``group_copies=False`` to color duplicates separately.
     For drag-box zooming use :func:`~.interactive.interactive_view` instead.
     """
     import matplotlib.pyplot as plt

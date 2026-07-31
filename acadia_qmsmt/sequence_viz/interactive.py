@@ -28,6 +28,10 @@ class SequenceView:
 
     MIN_SPAN_NS = 2.0
 
+    # Half a lane height (LANE_HEIGHT / 2), for deciding whether the cursor is on
+    # a pulse bar when hovering.
+    HOVER_HALF_HEIGHT = 0.31
+
     # Some backends (ipympl among them) never set MouseEvent.dblclick, so the
     # double click is also detected by timing. Compared in pixels, not data
     # coordinates -- a reset changes the data scale underfoot.
@@ -50,6 +54,9 @@ class SequenceView:
         self._last_click = None
         self._rubber = None
         self._cids = []
+        self._hover = None          # tooltip annotation, rebuilt on every render
+        self._hover_index = []      # (lane y, x0, x1, name, length_ns) per pulse
+        self._hover_key = None      # the bar the tooltip is currently on
         self.render()
         self._connect()
 
@@ -63,6 +70,7 @@ class SequenceView:
 
     def render(self):
         draw(self.ax, self.trace, xlim_ns=self.xlim_ns, **self.draw_kwargs)
+        self._install_hover()       # draw() cleared the axes, so rebuild the tooltip
         if self.ylim is not None:
             self.ax.set_ylim(*self.ylim)
         # an interactive canvas gets no bbox_inches="tight" expansion, so the
@@ -145,6 +153,7 @@ class SequenceView:
         self._last_xy = None        # never fall back to a previous drag's end
         self._press = (event.xdata, event.ydata,
                        bool(event.key and "shift" in event.key))
+        self._hide_hover()          # get the tooltip out of the way while dragging
 
     def _is_double_click(self, event):
         now = time.monotonic()
@@ -164,7 +173,10 @@ class SequenceView:
             # matplotlib reports xdata=None there, and dragging off the edge
             # of the plot is a normal gesture
             self._last_xy = (event.xdata, event.ydata)
-        if self._press is None or event.xdata is None:
+        if self._press is None:
+            self._update_hover(event)       # not dragging: show the pulse tooltip
+            return
+        if event.xdata is None:
             return
         x0, y0, panning = self._press
         if panning:
@@ -239,6 +251,113 @@ class SequenceView:
     def _clear_rubber(self):
         if self._rubber is not None:
             self._rubber.set_visible(False)
+
+    # ---------------- hover tooltip ----------------
+
+    def _install_hover(self):
+        """Rebuild the pulse index and the tooltip artist after a render.
+
+        ``draw()`` clears the axes, so both are recreated every time. The index
+        holds each pulse's lane and extent in the *plotted* unit (ns or µs, per
+        the current zoom) plus its real length in ns.
+        """
+        channels = list(self.trace.channels)
+        lane = {ch: len(channels) - 1 - i for i, ch in enumerate(channels)}
+        ns = self.trace.ns_per_cycle / self.divisor
+        # entry: (lane_y | None for full-height, x0, x1, name, length_ns, always_time)
+        from .plotting import _stretch_groups
+        cyc_ns = self.trace.ns_per_cycle
+        by_channel = {}
+        for c in self.trace.commands:
+            if c.channel in lane:
+                by_channel.setdefault(c.channel, []).append(c)
+        index = []
+        for ch, cmds in by_channel.items():
+            cmds = sorted(cmds, key=lambda c: c.start)
+            # a use_stretch pulse is three commands; hover the whole span, not just
+            # the ARB head (else only the rising edge is hoverable) -- mirror draw()
+            groups = _stretch_groups(cmds)
+            skip = set()
+            for i, c in enumerate(cmds):
+                if i in skip:
+                    continue
+                group = groups.get(i)
+                if group:
+                    skip.update({i + 1, i + 2})
+                    head, x0, x1 = group[0], group[0].start, group[2].stop
+                else:
+                    head, x0, x1 = c, c.start, c.stop
+                length_ns = (x1 - x0) * cyc_ns
+                if head.pulse:                    # pulse: hovers to length/name (toggle)
+                    index.append((lane[ch], x0 * ns, x1 * ns, head.pulse,
+                                  length_ns, False))
+                elif head.kind == "CONST_CONT" and ch.startswith("ADC"):
+                    index.append((lane[ch], x0 * ns, x1 * ns, "capture",
+                                  length_ns, False))
+                elif head.kind == "DWELL" and not head.is_padding:   # dwell: its time
+                    index.append((lane[ch], x0 * ns, x1 * ns, "dwell",
+                                  length_ns, True))
+        # inter-block dead time spans the full height -- always its time
+        for p in (self.trace.placements or self.trace.blocks):
+            if getattr(p, "gap_after", 0):
+                index.append((None, p.stop * ns, (p.stop + p.gap_after) * ns,
+                              "dead time", p.gap_after * cyc_ns, True))
+        self._hover_index = index
+        self._hover_key = None
+        self._hover = self.ax.annotate(
+            "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+            ha="left", va="bottom", fontsize=8, color="#1a1a19", zorder=20,
+            bbox=dict(boxstyle="round,pad=0.35", fc="#fbfbe6", ec="#8c8b83",
+                      lw=0.6))
+        self._hover.set_visible(False)
+
+    def _hit_pulse(self, event):
+        if event.inaxes is not self.ax or event.xdata is None:
+            return None
+        x, y = event.xdata, event.ydata
+        gap_hit = None
+        for entry in self._hover_index:
+            lane_y, x0, x1 = entry[0], entry[1], entry[2]
+            if not (x0 <= x <= x1):
+                continue
+            if lane_y is None:                 # full-height dead-time band
+                gap_hit = gap_hit or entry
+            elif abs(y - lane_y) <= self.HOVER_HALF_HEIGHT:
+                return entry                   # a lane bar wins over the band
+        return gap_hit
+
+    def _update_hover(self, event):
+        """Tooltip for whatever is under the cursor. A pulse/capture shows the
+        *other* attribute (length when labels are names, name when lengths); a
+        dwell or dead-time band always shows its duration."""
+        if self._hover is None:
+            return
+        hit = self._hit_pulse(event)
+        if hit is None:
+            self._hide_hover()
+            return
+        lane_y, x0, x1, name, length_ns, always_time = hit
+        key = (name, x0, x1, lane_y)
+        if key == self._hover_key:      # same bar -- tooltip already up, no redraw
+            return
+        if always_time:
+            text = f"{length_ns:.0f} ns"
+        else:
+            mode = self.draw_kwargs.get("pulse_label", "name")
+            text = f"{length_ns:.0f} ns" if mode == "name" else name
+        lo, hi = self.ax.get_ylim()
+        self._hover.xy = ((x0 + x1) / 2,
+                          lane_y if lane_y is not None else (lo + hi) / 2)
+        self._hover.set_text(text)
+        self._hover.set_visible(True)
+        self._hover_key = key
+        self.canvas.draw_idle()
+
+    def _hide_hover(self):
+        if self._hover is not None and self._hover.get_visible():
+            self._hover.set_visible(False)
+            self.canvas.draw_idle()
+        self._hover_key = None
 
 
 def interactive_view(trace, figsize=None, **draw_kwargs):

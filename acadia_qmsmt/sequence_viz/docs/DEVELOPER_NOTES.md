@@ -80,4 +80,5 @@ Two bugs the sweep found, now fixed:
 2. KI_004 wants a fix in acadia (`compiler.block_end` return placement), not a workaround here.
 3. `repeat_until` has no hardware validation and cannot have one; if a way to bound the trip
    count from archived data turns up, that changes.
-4. Integrate `qt_widget.SequenceWidget` into acadia_gui.
+4. The Qt wrapper now lives in acadia_gui (`gui/sequence_view.py`); finish wiring it into the
+   data browser (a toggle between the live plot view and the sequence view).

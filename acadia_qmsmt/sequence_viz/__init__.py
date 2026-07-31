@@ -12,8 +12,8 @@ Two entry points::
     fig, ax, trace = plot_runtime(rt)                      # live object
 
 Self-contained: depends only on ``acadia``, ``acadia_qmsmt``, ``numpy`` and
-``matplotlib`` (plus PyQt5 in ``qt_widget`` alone), so the whole directory can
-live inside ``acadia_qmsmt`` unchanged.
+``matplotlib`` — no PyQt5 (the Qt wrapper lives in acadia_gui), so the whole
+directory sits inside ``acadia_qmsmt`` cleanly.
 """
 from .compiled_log import compare as compare_with_compiled_log
 from .compiled_log import parse as parse_compiled_log

@@ -20,7 +20,6 @@ fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 | `compiled_log.py` | decode `compiled.log`; cross-check a trace against it |
 | `plotting.py` | `draw()` — the zoom-aware renderer; `plot_trace()` for a static figure |
 | `interactive.py` | `SequenceView` — drag-box zoom, scroll, pan, reset |
-| `qt_widget.py` | `SequenceWidget` — PyQt5 wrapper for acadia_gui |
 | `notebooks/` | `explore_sequence.ipynb` (interactive), `visualize_sequence.ipynb` (static) |
 | `validation/selftest.py` | hardware-free regression: traces archived folders, checks each against its own `compiled.log`, exercises every render option |
 | `docs/MAINTENANCE.md` | the workflow to update the visualizer when acadia/acadia_qmsmt change (symptom → coupling point → fix → re-validate) |
@@ -28,8 +27,8 @@ fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 | `validation/` | the regression net for acadia/acadia_qmsmt drift: loopback test runtime, deploy/measure/compare scripts, measured results — run these when those packages change (`validation/README.md`) |
 | `docs/DEVELOPER_NOTES.md` | maintainer notes: known issues (KI_001–004), gotchas, open items |
 
-`tracing`/`folder`/`compiled_log` are pure data — no matplotlib. `qt_widget` is the
-only file that imports PyQt5, and it is not imported by `__init__`.
+`tracing`/`folder`/`compiled_log` are pure data — no matplotlib. Nothing in this package
+imports PyQt5; the Qt wrapper lives in acadia_gui (see *In acadia_gui* below).
 
 ## How it works
 
@@ -76,38 +75,17 @@ armed.
 
 ## In acadia_gui
 
-The interaction lives here, not in the GUI, because it is pure matplotlib event
-handling — the same `SequenceView` drives an ipympl canvas in a notebook and a
-`FigureCanvasQTAgg` in Qt. The GUI supplies the window, the folder selection and
-the toolbar; there is one implementation of the behaviour to keep correct.
+`SequenceView` (in `interactive.py`) is pure matplotlib event handling, so the same class
+drives an ipympl canvas in a notebook and a `FigureCanvasQTAgg` in Qt — one implementation of
+the zoom/pan behaviour to keep correct. The Qt wrapper that embeds it in acadia_gui lives
+**in acadia_gui** (`gui/sequence_view.py`), not in this package, which is why nothing here
+imports PyQt5.
 
-acadia_gui is already matplotlib-in-Qt (`LivePlotWidget` uses `FigureCanvasQTAgg` +
-`NavigationToolbar2QT`), so it drops in. In `acadia_gui/gui/main_data_browser.py`,
-`RightPanelTabs`:
-
-```python
-from sequence_viz.qt_widget import SequenceWidget      # or acadia_qmsmt.sequence_viz
-
-self.sequence_tab = SequenceWidget()
-self.addTab(self.sequence_tab, "Pulse Sequence")
-```
-
-and wherever the browser learns the selected folder:
-
-```python
-self.sequence_tab.load_folder(path)
-```
-
-`load_folder` never raises — a non-data folder or a trace failure is reported in
-the widget. The widget adds sweep-point / register-cycles / saved-qmsmt controls
-and a jump-to-block dropdown.
-
-Folder loading goes through `acadia_qmsmt.utils.saved_runtime_loader`, the same path
-`LivePlotWidget` uses, so a folder that opens in the GUI traces here and vice versa.
-`use_saved_qmsmt` defaults to `True` — the folder's own `acadia_qmsmt.py`, which is
-the faithful choice for an archived run — and falls back to the installed package
-with a warning if that import fails, exactly as `LivePlotWidget` does. Whichever
-was used ends up on `trace.used_saved_qmsmt` and in `trace.summary()`.
+That wrapper's `load_folder(path)` never raises — a non-data folder or a trace failure is
+reported in the widget. Folder loading goes through `acadia_qmsmt.utils.saved_runtime_loader`
+(the same path the GUI's plot view uses); `use_saved_qmsmt` defaults to the folder's own
+`acadia_qmsmt.py` and falls back to the installed package, ending up on
+`trace.used_saved_qmsmt` and in `trace.summary()`.
 
 ## Sweep points
 
@@ -260,7 +238,7 @@ known-good archived run.
 
 ## Reading the plot
 
-### Colour
+### Color
 
 `color_by="memory"` (default) gives **one hue per waveform memory**, keyed on
 `(channel, address)`. Two `schedule_pulse` calls that share a memory necessarily
@@ -276,7 +254,7 @@ second generation is drawn with a dark outline, so identity stays unambiguous.
 Legend entries are named by pulse, prefixed with the channel only when that name
 is ambiguous (`DAC9/swap`).
 
-`color_by="name"` restores name-keyed colour (one hue per name everywhere, merged
+`color_by="name"` restores name-keyed color (one hue per name everywhere, merged
 across channels); `color_by="channel"` gives one hue per lane.
 
 ### Envelope
@@ -352,10 +330,3 @@ and they come back.
   `trace.loop_counts[block_index] = n`).
 - **Readout kernel `.npy` files are not archived** with the folder. If one has
   moved, window loading fails; this does not affect the timeline.
-
-## Moving this into acadia_qmsmt
-
-Depends only on `acadia`, `acadia_qmsmt`, `numpy`, `matplotlib` and (in
-`qt_widget` alone) PyQt5. Move the directory as-is. The only change needed is the
-`sys.path` bootstrap in the notebooks (and the `import sequence_viz as sv` in
-`validation/*`), which becomes `from acadia_qmsmt.sequence_viz import ...`.
