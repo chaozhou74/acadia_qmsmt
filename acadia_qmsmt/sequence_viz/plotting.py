@@ -36,6 +36,9 @@ SEPARATOR_PIXELS = 1.5      # visual gap between fills that butt up against each
 # Pulse fills are drawn softened so the envelope stroke on top reads as the shape.
 PULSE_FILL_ALPHA = 0.7
 ENVELOPE_LINEWIDTH = 1.7    # magnitude stroke; iq uses 0.75x (two overlapping lines)
+ENVELOPE_MIN_PX = 6         # skip a pulse's envelope below this on-screen width --
+                            # its shape is unreadable there and each envelope is a
+                            # separate plot call (the dominant zoom-render cost)
 
 # Color themes. draw() takes one (default LIGHT_THEME); the Qt widget swaps to DARK
 # when the app is in a dark theme. Envelope + all labels + title use ink_primary, so a
@@ -358,6 +361,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         register labels, so every mark on the timeline reads in time). Set
         ``label_pulses=False`` to drop pulse labels entirely.
     """
+    from matplotlib.collections import LineCollection
     from matplotlib.patches import Patch, Rectangle
 
     # Theme colors, bound as locals so the body below reads the same in either mode.
@@ -386,6 +390,10 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
     # separator between fills that actually touch: a true pixel width, so it does
     # not eat a percentage of the pulse and does not change as you zoom
     gap = _pixels_in_cycles(ax, SEPARATOR_PIXELS, span, ns)
+    try:
+        axes_px = max(ax.get_window_extent().width, 1.0)   # for envelope downsampling
+    except Exception:
+        axes_px = 800.0
     min_label = 0.022 * span
     t0, t1 = limits_ns[0] / divisor, limits_ns[1] / divisor
 
@@ -403,6 +411,10 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
     drew_capture = drew_padding = drew_symbolic = drew_gap = drew_branch = False
     drew_dwell = False
     label_marks = []       # (text artist, bar left, bar right) in plotted units
+    # envelope polylines are collected and drawn as one LineCollection each,
+    # rather than one ax.plot() per pulse -- the dominant zoom-render cost
+    env_mag, env_iq_real, env_iq_imag = [], [], []
+    pulse_rects = []       # solid pulse fills, batched into one PatchCollection
 
     # one outline per control-flow region, not per block: a repeat_until wraps
     # every block in its body, and per-block captions collide
@@ -414,11 +426,19 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         ax.add_patch(Rectangle(
             (r0, -0.62), max(r1 - r0, gap * ns), len(channels) - 0.05,
             facecolor="none", edgecolor=BRANCH_INK, linestyle=(0, (4, 3)),
-            linewidth=1.0, zorder=1.5))
-        if detailed and (r1 - r0) >= min_label:
-            ax.text(r0 + 0.005 * span, len(channels) - 0.45,
-                    branch_caption(trace, context, info), ha="left", va="bottom",
-                    fontsize=7, color=BRANCH_INK, zorder=6, clip_on=True)
+            linewidth=1.6, zorder=1.5))
+        if detailed:
+            caption = branch_caption(trace, context, info)
+            vis0, vis1 = max(r0, t0), min(r1, t1)      # visible part of the region
+            char_px = 7 * 0.6 * ax.figure.dpi / 72.0
+            # label the box only where the *visible* part is wide enough to hold the
+            # caption (it reads on hover otherwise); anchor to the visible left edge
+            # so it stays on screen when zoomed/panned inside the region, just above
+            # the top stroke (top is len(channels) - 0.67)
+            if (vis1 - vis0) / span * axes_px >= len(caption) * char_px:
+                ax.text(vis0 + 0.004 * span, len(channels) - 0.65, caption,
+                        ha="left", va="bottom", fontsize=7, color=BRANCH_INK,
+                        zorder=6, clip_on=True)
 
     for blk in (trace.placements or trace.blocks):
         if blk.stop * ns < t0 or blk.start * ns > t1:
@@ -492,15 +512,27 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                     drew_symbolic = True
 
                 lw = 0.0 if edge == "none" else (0.5 if hatch else 1.0)
-                ax.add_patch(Rectangle(
+                rect = Rectangle(
                     (x0 * ns, y - LANE_HEIGHT / 2), width * ns, LANE_HEIGHT,
                     facecolor=face, edgecolor=edge, hatch=hatch, alpha=alpha,
-                    linewidth=lw, zorder=2))
+                    linewidth=lw, zorder=2)
+                if pulse and hatch is None:   # plain pulse fill -> batch it
+                    pulse_rects.append(rect)
+                else:                          # capture/padding/symbolic/dwell
+                    ax.add_patch(rect)
 
                 if show_envelopes and detailed and pulse and not head.symbolic:
+                    bar_px = (x1 - x0) * ns / span * axes_px
                     samples = trace.envelope(head.io_name, pulse, envelope_source)
                     reference = peaks.get((head.io_name, pulse), 0.0)
-                    if samples is not None and len(samples) and reference > 0:
+                    if (bar_px >= ENVELOPE_MIN_PX and samples is not None
+                            and len(samples) and reference > 0):
+                        # downsample to ~2 points per on-screen pixel (cheap, keeps
+                        # detail when zoomed in)
+                        target = int(min(len(samples), max(2.0 * bar_px, 8)))
+                        if target < len(samples):
+                            keep = np.linspace(0, len(samples) - 1, target).astype(int)
+                            samples = samples[keep]
                         if group:
                             times, half = _stretched_time(group, len(samples))
                             pick = lambda v: _stretched_values(v, half)
@@ -509,22 +541,20 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                             times = np.linspace(x0, x0 + width, len(samples))
                             pick = lambda v: v
 
+                        xs = times * ns
                         if envelope_mode == "iq":
                             # about the lane centre, so sign and phase are visible
-                            for values, alpha_ in ((samples.real, 0.75),
-                                                   (samples.imag, 0.45)):
-                                ax.plot(times * ns,
-                                        y + pick(values) / reference
-                                        * LANE_HEIGHT * 0.46,
-                                        color=INK_PRIMARY, alpha=alpha_,
-                                        linewidth=ENVELOPE_LINEWIDTH * 0.75, zorder=3)
+                            env_iq_real.append(np.column_stack(
+                                [xs, y + pick(samples.real) / reference
+                                 * LANE_HEIGHT * 0.46]))
+                            env_iq_imag.append(np.column_stack(
+                                [xs, y + pick(samples.imag) / reference
+                                 * LANE_HEIGHT * 0.46]))
                         elif envelope_mode == "magnitude":
-                            ax.plot(times * ns,
-                                    y - LANE_HEIGHT / 2
-                                    + pick(np.abs(samples)) / reference
-                                    * LANE_HEIGHT * 0.92,
-                                    color=INK_PRIMARY, alpha=0.7,
-                                    linewidth=ENVELOPE_LINEWIDTH, zorder=3)
+                            env_mag.append(np.column_stack(
+                                [xs, y - LANE_HEIGHT / 2
+                                 + pick(np.abs(samples)) / reference
+                                 * LANE_HEIGHT * 0.92]))
                         else:
                             raise ValueError(
                                 f"unknown envelope_mode: {envelope_mode!r}")
@@ -565,6 +595,26 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         if show_blocks:
             ax.axvline(blk.start * ns, color=INK_MUTED, linewidth=0.6, alpha=0.35,
                        zorder=0)
+
+    # batch the solid pulse fills into one collection (per-patch colour/alpha
+    # preserved via match_original) instead of one add_patch() per pulse
+    if pulse_rects:
+        from matplotlib.collections import PatchCollection
+        ax.add_collection(PatchCollection(pulse_rects, match_original=True, zorder=2))
+
+    # one LineCollection per envelope style instead of one plot() per pulse
+    if env_mag:
+        ax.add_collection(LineCollection(
+            env_mag, colors=INK_PRIMARY, linewidths=ENVELOPE_LINEWIDTH,
+            alpha=0.7, zorder=3))
+    if env_iq_real:
+        ax.add_collection(LineCollection(
+            env_iq_real, colors=INK_PRIMARY, linewidths=ENVELOPE_LINEWIDTH * 0.75,
+            alpha=0.75, zorder=3))
+    if env_iq_imag:
+        ax.add_collection(LineCollection(
+            env_iq_imag, colors=INK_PRIMARY, linewidths=ENVELOPE_LINEWIDTH * 0.75,
+            alpha=0.45, zorder=3))
 
     ax.set_yticks(range(len(channels)))
     ax.set_yticklabels([lane_label(trace, ch) for ch in reversed(channels)],
