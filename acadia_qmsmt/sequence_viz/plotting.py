@@ -451,9 +451,11 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                            zorder=1)
                 drew_gap = True
                 if detailed and (g1 - g0) >= min_label * 1.5:
-                    ax.text((g0 + g1) / 2, len(channels) - 0.55,
+                    # sit above the control-flow caption (at len(channels) - 0.65)
+                    # so the two never crowd where a gap meets a branch edge
+                    ax.text((g0 + g1) / 2, len(channels) - 0.45,
                             f"{blk.gap_after * trace.ns_per_cycle:.0f} ns",
-                            ha="center", va="top", fontsize=7,
+                            ha="center", va="bottom", fontsize=7,
                             color=INK_SECONDARY, zorder=5, clip_on=True)
 
         by_channel = {}
@@ -497,19 +499,25 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                 elif is_capture:
                     face, edge, hatch, alpha = SURFACE, INK_SECONDARY, None, 1.0
                     drew_capture = True
+                elif head.symbolic and head.resolution == "fallback":
+                    # a register/DSP length that could not be recovered from the cache:
+                    # drawn indeterminate -- cross-hatched, clamped to a visible width
+                    face, edge, hatch, alpha = SURFACE, INK_MUTED, "xx", 1.0
+                    width = max(width, 0.02 * span / ns)
+                    drew_symbolic = True
+                elif head.symbolic:
+                    # a register/DSP length resolved from the per-point cache: its width
+                    # is known, so it reads as an ordinary dwell -- the register label on
+                    # top says where it came from
+                    face, edge, hatch, alpha = NEUTRAL_FILL, "none", None, 0.75
+                    drew_dwell = True
                 elif head.is_padding:
                     # hatch renders in the edge color, so padding needs one
                     face, edge, hatch, alpha = NEUTRAL_FILL, INK_MUTED, "///", 0.35
                     drew_padding = True
                 else:
                     face, edge, hatch, alpha = NEUTRAL_FILL, "none", None, 0.75
-                    if not head.symbolic:      # a dwell you scheduled (plain grey)
-                        drew_dwell = True
-
-                if head.symbolic:
-                    face, edge, hatch, alpha = SURFACE, INK_MUTED, "xx", 1.0
-                    width = max(width, 0.02 * span / ns)
-                    drew_symbolic = True
+                    drew_dwell = True      # a dwell you scheduled (plain grey)
 
                 lw = 0.0 if edge == "none" else (0.5 if hatch else 1.0)
                 rect = Rectangle(

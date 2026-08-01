@@ -394,6 +394,45 @@ class SequenceTrace:
         source = self.registers.get(name, {}).get("source")
         return f"{alias} = {source}" if source else alias
 
+    def register_summary(self):
+        """Describe every register / length-symbol for a per-register UI control.
+
+        Two kinds appear, distinguished by ``settable``:
+
+        * cache-fed registers resolve themselves from the per-point cache, so
+          their value is shown but not settable. One may drive a command length
+          (``is_length``, shown in cycles/ns) or only a ``test``/``repeat_until``
+          condition (shown as the raw register value).
+        * register/DSP-driven command *lengths* not recoverable from the cache
+          (``resolution`` "fallback"/"override") -- the only thing worth setting,
+          via :attr:`register_overrides`.
+
+        :return: ``[{name, label, source, resolution, value_cycles, is_length,
+            settable}, ...]``, deduped by name, identified registers first.
+        """
+        resolved = {c.symbolic: (c.resolution, c.length)
+                    for c in self.commands if c.symbolic}
+
+        def entry(name, resolution, cycles, is_length):
+            return {"name": name, "label": self.register_label(name),
+                    "source": self.registers.get(name, {}).get("source") or "",
+                    "resolution": resolution, "value_cycles": cycles,
+                    "is_length": is_length,
+                    "settable": resolution in ("override", "fallback")}
+
+        entries = {}
+        for name, info in self.registers.items():             # cache/device registers
+            if name in resolved:                              # also drives a length
+                entries[name] = entry(name, *resolved[name], True)
+            else:                                             # condition-only register
+                resolution = "cache" if info["cache_word"] is not None else "device"
+                entries[name] = entry(name, resolution,
+                                      self.register_cycles.get(name), False)
+        for name, (resolution, cycles) in resolved.items():   # DSP-driven lengths
+            if name not in entries:
+                entries[name] = entry(name, resolution, cycles, True)
+        return list(entries.values())
+
     def envelope(self, io_name, pulse, source="memory"):
         """Complex waveform for a pulse, in DAC full-scale units.
 
@@ -813,7 +852,7 @@ def _build_trace(runtime, raw_blocks, resolve):
     return trace
 
 
-LOAD_RE = re.compile(r"BUS_DATA -> (REG\d+)")
+LOAD_RE = re.compile(r"BUS_DATA -> (REG\d+|DSP_AB\d+)")
 BUS_ADDR_RE = re.compile(r"(?:0x([0-9A-Fa-f]+)|\b([0-9A-F]{8})\b)\s*->\s*BUS_ADDR")
 
 
@@ -902,11 +941,15 @@ def describe_registers(acadia):
         001D0000 -> BUS_ADDR  |  REG0 -> NONE      <- cache base + word index
         BUS_DATA -> REG0      |  REG0 -> NONE
 
-    So walking back from each ``BUS_DATA -> REGn`` to the preceding ``-> BUS_ADDR``
-    identifies the source. An address inside the cache region gives the exact word
-    -- which the dry run captures per sweep point, so the register's real value is
-    known. Any other device (a CMACC accumulator, i.e. a measurement result) is
-    named but has no static value.
+    A DSP unit's input loads the same way (``BUS_DATA -> DSP_ABn``); its output
+    ``DSPn`` then drives a command length, so it is recorded under that ``DSPn``
+    name to match the length symbol the schedule carries.
+
+    So walking back from each ``BUS_DATA -> REGn`` / ``DSP_ABn`` to the preceding
+    ``-> BUS_ADDR`` identifies the source. An address inside the cache region gives
+    the exact word -- which the dry run captures per sweep point, so the register's
+    real value is known. Any other device (a CMACC accumulator, i.e. a measurement
+    result) is named but has no static value.
 
     :return: ``{"REG0": {"source": "cache[0]", "cache_word": 0}, ...}``
     """
@@ -938,12 +981,13 @@ def describe_registers(acadia):
                 break
         if address is None:
             continue
+        # a DSP unit's output DSPn drives the command length, not DSP_ABn (its input)
+        name = re.sub(r"^DSP_AB(\d+)$", r"DSP\1", loaded.group(1))
         if cache_base <= address < cache_base + cache_words:
             word = address - cache_base
-            registers[loaded.group(1)] = {"source": f"cache[{word}]",
-                                          "cache_word": word}
+            registers[name] = {"source": f"cache[{word}]", "cache_word": word}
         else:
-            registers[loaded.group(1)] = {
+            registers[name] = {
                 "source": devices.get(address, f"bus 0x{address:X}"),
                 "cache_word": None}
     return registers
