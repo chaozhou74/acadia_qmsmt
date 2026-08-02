@@ -60,6 +60,9 @@ class SequenceView:
         self._bg = None             # cached plot background for blitting the rubber band
         self._cids = []
         self._hover = None          # tooltip annotation, rebuilt on every render
+        self._readout = None        # bottom-left time/IQ readout, rebuilt on every render
+        self._readout_text = None   # its current text, to skip redundant redraws
+        self._pulse_iq = []         # (lane y, x0, x1, io_name, pulse) per pulse, for IQ
         self._hover_index = []      # (lane y, x0, x1, name, length_ns) per pulse
         self._branch_regions = []   # (x0, x1, y_bottom, y_top, caption), hovered near edge
         self._hover_key = None      # the bar the tooltip is currently on
@@ -362,6 +365,9 @@ class SequenceView:
             if c.channel in lane:
                 by_channel.setdefault(c.channel, []).append(c)
         index = []
+        # pulses only, for the bottom-left time/IQ readout: (lane y, x0, x1 in the plotted
+        # unit, io name, pulse name) -- enough to sample the envelope at the hovered time
+        self._pulse_iq = []
         for ch, cmds in by_channel.items():
             cmds = sorted(cmds, key=lambda c: c.start)
             # a use_stretch pulse is three commands; hover the whole span, not just
@@ -381,6 +387,9 @@ class SequenceView:
                 if head.pulse:                    # pulse: hovers to length/name (toggle)
                     index.append((lane[ch], x0 * ns, x1 * ns, head.pulse,
                                   length_ns, "toggle"))
+                    if head.io_name:
+                        self._pulse_iq.append(
+                            (lane[ch], x0 * ns, x1 * ns, head.io_name, head.pulse))
                 elif head.kind == "CONST_CONT" and ch.startswith("ADC"):
                     index.append((lane[ch], x0 * ns, x1 * ns, "capture",
                                   length_ns, "toggle"))
@@ -410,6 +419,25 @@ class SequenceView:
             bbox=dict(boxstyle="round,pad=0.35", fc="#fbfbe6", ec="#8c8b83",
                       lw=0.6))
         self._hover.set_visible(False)
+
+        # Readout below the time axis: the cursor time, plus the pulse amplitude / IQ when
+        # the cursor is over a pulse. A blended transform pins x to the plot's left edge
+        # (axes fraction) and y to the figure's bottom margin (figure fraction), so it sits
+        # under the x-axis rather than on a lane, and left-aligns with the plot. Colours come
+        # from the active theme so it reads in dark mode too.
+        from matplotlib.transforms import blended_transform_factory
+        from .plotting import LIGHT_THEME
+        th = self.draw_kwargs.get("theme") or LIGHT_THEME
+        below_axis = blended_transform_factory(
+            self.ax.transAxes, self.ax.figure.transFigure)
+        self._readout_text = None
+        self._readout = self.ax.text(
+            0.0, 0.018, "", transform=below_axis, ha="left", va="bottom", clip_on=False,
+            fontsize=8, family="monospace", zorder=21,
+            color=th.get("ink_primary", "#1a1a19"),
+            bbox=dict(boxstyle="round,pad=0.3", fc=th.get("surface", "#ffffff"),
+                      ec=th.get("ink_muted", "#8c8b83"), lw=0.6, alpha=0.95))
+        self._readout.set_visible(False)
 
     def _hit_pulse(self, event):
         if event.inaxes is not self.ax or event.xdata is None:
@@ -447,12 +475,21 @@ class SequenceView:
         return None
 
     def _update_hover(self, event):
-        """Tooltip for whatever is under the cursor. A pulse/capture shows the
-        *other* attribute (length when labels are names, name when lengths); a
-        dwell or dead-time band shows its duration; a control-flow box shows its
-        caption when hovered near the stroke."""
+        """The near-cursor tooltip and the bottom-left time/IQ readout, in one redraw."""
         if self._hover is None:
             return
+        tip_changed = self._compute_tooltip(event)
+        readout_changed = self._compute_readout(event)
+        if tip_changed or readout_changed:
+            self.canvas.draw_idle()
+
+    def _compute_tooltip(self, event):
+        """Point the near-cursor tooltip at whatever is under the cursor (no redraw).
+
+        A pulse/capture shows the *other* attribute (length when labels are names, name
+        when lengths); a dwell or dead-time band shows its duration; a control-flow box
+        shows its caption when hovered near the stroke. Returns True if anything changed.
+        """
         hit = self._hit_pulse(event)
         if hit is not None:
             lane_y, x0, x1, name, length_ns, kind = hit
@@ -467,25 +504,78 @@ class SequenceView:
         else:
             region = self._hit_branch(event)
             if region is None:
-                self._hide_hover()
-                return
+                if self._hover_key is None:
+                    return False
+                self._hover.set_visible(False)
+                self._hover_key = None
+                return True
             x0, x1, _yb, yt, text = region
             key = ("branch", x0)
             xlo, xhi = self.ax.get_xlim()
             anchor = (max(x0, xlo) + 0.01 * (xhi - xlo), yt)   # visible top-left
-        if key == self._hover_key:      # already showing this -- no redraw
-            return
+        if key == self._hover_key:      # already showing this
+            return False
         self._hover.xy = anchor
         self._hover.set_text(text)
         self._hover.set_visible(True)
         self._hover_key = key
-        self.canvas.draw_idle()
+        return True
+
+    def _compute_readout(self, event):
+        """Update the bottom-left readout: the cursor time, plus the pulse amplitude and
+        IQ when the cursor is on a pulse (just the time otherwise). Returns True if the
+        text changed (so a redraw is worthwhile)."""
+        if self._readout is None:
+            return False
+        if event.inaxes is not self.ax or event.xdata is None:
+            if self._readout_text is None:
+                return False
+            self._readout.set_visible(False)
+            self._readout_text = None
+            return True
+        t_ns = event.xdata * self.divisor
+        time_str = (f"t = {t_ns / 1000:.4f} µs" if self.divisor >= 1000
+                    else f"t = {t_ns:.1f} ns")
+        iq = self._iq_at(event)
+        text = (time_str if iq is None else
+                f"{time_str}   |A| = {abs(iq):.3f}   "
+                f"IQ = {iq.real:+.3f}{iq.imag:+.3f}j")
+        if text == self._readout_text:
+            return False
+        self._readout.set_text(text)
+        self._readout.set_visible(True)
+        self._readout_text = text
+        return True
+
+    def _iq_at(self, event):
+        """Complex envelope value (DAC full scale) at the hovered pulse and time, or None
+        when the cursor is not on a pulse. The envelope is sampled evenly across the bar,
+        matching how draw() lays it down."""
+        x, y = event.xdata, event.ydata
+        if y is None:
+            return None
+        for lane_y, x0, x1, io_name, pulse in self._pulse_iq:
+            if x0 <= x <= x1 and abs(y - lane_y) <= self.HOVER_HALF_HEIGHT:
+                samples = self.trace.envelope(io_name, pulse)
+                if samples is None or not len(samples):
+                    return None
+                frac = (x - x0) / (x1 - x0) if x1 > x0 else 0.0
+                idx = int(round(min(max(frac, 0.0), 1.0) * (len(samples) - 1)))
+                return complex(samples[idx])
+        return None
 
     def _hide_hover(self):
+        dirty = False
         if self._hover is not None and self._hover.get_visible():
             self._hover.set_visible(False)
-            self.canvas.draw_idle()
+            dirty = True
         self._hover_key = None
+        if self._readout is not None and self._readout.get_visible():
+            self._readout.set_visible(False)
+            self._readout_text = None
+            dirty = True
+        if dirty:
+            self.canvas.draw_idle()
 
 
 def interactive_view(trace, figsize=None, **draw_kwargs):
