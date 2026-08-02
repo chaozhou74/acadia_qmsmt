@@ -124,6 +124,7 @@ class Placement:
     conditional: tuple = ()
     gap_after: int = 0
     gap_breakdown: dict = field(default_factory=dict)
+    stream: bool = False        # this placement is an unrolled cache-pointer pulse stream
 
     @property
     def stop(self):
@@ -163,6 +164,14 @@ class SequenceTrace:
     point_offset: int = 0            # when only one point was captured
     iterations_forced: bool = False
     truncated_points: bool = False
+    # A cache-pointer pulse stream (randomized benchmarking): the loop walks a cache region
+    # issuing each word straight to the DMA. `stream` holds where the command region starts,
+    # which cache word holds the count, the per-pulse period floor, and the channel; the
+    # unroll reads the words out of `point_cache` (this point's full cache) and decodes each
+    # via `addr_names` (see describe_cache_stream / relayout). None when there is no stream.
+    stream: Optional[dict] = None
+    addr_names: dict = field(default_factory=dict)   # (channel num, word addr) -> (io, pulse)
+    point_cache: dict = field(default_factory=dict)  # this point's full cache, word -> value
 
     @property
     def n_points(self):
@@ -188,6 +197,7 @@ class SequenceTrace:
                 name: snapshot["cache"][word]
                 for name, word in self.register_sources.items()
                 if word in snapshot["cache"]}
+            self.point_cache = snapshot["cache"]   # full cache, for a cache-pointer stream
         self.point = index + self.point_offset
         self.relayout()
         return self
@@ -229,10 +239,20 @@ class SequenceTrace:
             channels = {c.channel for c in block.commands}
             placement.start = max([t_seq] + [cursor.get(c, 0) for c in channels])
 
+            stream_here = False
             t_sub = placement.start
             for i_sub, group in enumerate(block.subschedules):
                 per_channel, sub_len = {}, 0
                 for command in group:
+                    if self._is_stream_command(command):
+                        # a cache-pointer pulse stream: unroll it into one concrete command
+                        # per cached word (randomized benchmarking), spaced by the period
+                        stream_here = True
+                        start = per_channel.get(command.channel, t_sub)
+                        end = self._expand_stream(command, placement, start)
+                        per_channel[command.channel] = end
+                        sub_len = max(sub_len, end - t_sub)
+                        continue
                     length = command.length
                     resolution = command.resolution
                     if command.symbolic:
@@ -257,6 +277,7 @@ class SequenceTrace:
                     placement.barriers.append(t_sub)
 
             placement.length = t_sub - placement.start
+            placement.stream = stream_here
 
             # gap to whatever executes NEXT, which for a loop back-edge is not the
             # textually-following block
@@ -278,7 +299,12 @@ class SequenceTrace:
                             "branch_penalty": edge["branch_penalty"],
                             "edge": edge["kind"]}
 
-            if placement.blocking:
+            if placement.blocking or stream_here:
+                # A cache-pointer stream is non-blocking per se, but the runtime waits for
+                # its DAC FIFO to drain (the post-loop fifo-almost-empty poll) before the
+                # next block, which holds the whole sequencer -- so, like a blocking block,
+                # it advances t_seq for every channel, not just its own. Without this the
+                # readout (on other channels) would be drawn on top of the gate train.
                 t_seq = placement.stop + placement.gap_after
                 for ch in channels:
                     cursor[ch] = t_seq
@@ -289,6 +315,49 @@ class SequenceTrace:
 
             self.placements.append(placement)
         return self
+
+    def _is_stream_command(self, command):
+        """True for the direct DMA command of a cache-pointer stream on its channel.
+
+        The whole DMA word is fetched at runtime, so it comes through as symbolic
+        ``BUS_DATA``; :attr:`stream` marks which channel that stream drives.
+        """
+        return bool(self.stream and command.symbolic == "BUS_DATA"
+                    and command.channel == self.stream["channel"])
+
+    def _expand_stream(self, command, placement, start):
+        """Unroll a cache-pointer pulse stream into one command per played gate.
+
+        The loop plays ``count`` gates, ``count`` read from the cache word the runtime
+        computed the pointer bound from; gate ``k`` is ``cache[start_offset + k]``, a DMA
+        word decoding to ``addr = word >> 16`` / ``length = (word & 0xFFFF) + 1`` (the same
+        ``waveform_dma_command`` packing the static path uses), and ``addr`` names the pulse
+        via :attr:`addr_names`. Gates are laid at the per-pulse *period* ``max(length,
+        floor)`` -- the fifo-refill floor means short pulses cannot play back-to-back.
+
+        :return: the cursor after the train (its start plus ``count`` period slots).
+        """
+        meta = self.stream
+        cache = self.point_cache or {}
+        count = int(cache.get(meta["count_word"], 0))
+        floor = int(meta["floor"])
+        cnum = meta["channel_num"]
+        cursor = start
+        for k in range(count):
+            word = int(cache.get(meta["start_offset"] + k, 0))
+            address = word >> 16
+            length = (word & 0xFFFF) + 1
+            io_name, pulse = self.addr_names.get((cnum, address), (None, None))
+            placement.commands.append(replace(
+                command, start=cursor, length=length, symbolic=None,
+                resolution="cache", pulse=pulse, io_name=io_name, address=address))
+            cursor += max(length, floor)      # advance by the per-pulse period
+        # The loop runs `count` full period slots, so the train ends `count` periods in --
+        # the last slot's refill gap is where the loop does its exit check and the post-loop
+        # fifo drains before the next block. Ending at the last pulse's stop instead would
+        # butt the next block against the final gate and merge them (which the hardware,
+        # separated by that drain, does not). The residual (~one refill gap) is small.
+        return cursor
 
     @property
     def commands(self):
@@ -809,6 +878,20 @@ def _build_trace(runtime, raw_blocks, resolve):
                               for name, info in trace.registers.items()
                               if info["cache_word"] is not None}
 
+    # A cache-pointer pulse stream (randomized benchmarking) is unrolled from the per-point
+    # cache in relayout; store the decode map and the stream descriptor here.
+    trace.addr_names = addr_names
+    try:
+        stream = describe_cache_stream(acadia)
+        if stream:
+            for io in runtime._ios.values():
+                if str(io.channel) == stream["channel"]:
+                    stream["channel_num"] = io.channel.num()
+                    trace.stream = stream
+                    break
+    except Exception:
+        pass                    # the stream unroll is an enhancement; never fail the trace
+
     for index, raw in enumerate(raw_blocks):
         block = Block(index=index, start=0, length=0,
                       trigger=raw.get("trigger", True),
@@ -991,6 +1074,89 @@ def describe_registers(acadia):
                 "source": devices.get(address, f"bus 0x{address:X}"),
                 "cache_word": None}
     return registers
+
+
+# The randomized-benchmarking pulse stream, spelled in the compiled program:
+#   <addr> -> DSP_AB0                                   pointer's initial cache address
+#   mode='P+1' -> DSP_CFG0                              from now on it only increments
+#   BUS_DATA -> DSP_C1                                  final = pointer + cache[count word]
+#   BUS_DATA -> BUS_DATA ; Command DMA for <chan>       the played word, fetched at runtime
+STREAM_DIRECT_RE = re.compile(r"BUS_DATA -> BUS_DATA\b.*Command DMA for (\w+)")
+STREAM_PTR_CFG_RE = re.compile(r"mode='P\+1'.*->\s*DSP_CFG(\d+)")
+STREAM_C_RE = re.compile(r"BUS_DATA -> DSP_C\d+")
+
+
+def describe_cache_stream(acadia):
+    """Locate a cache-pointer pulse stream (the randomized-benchmarking idiom).
+
+    A DSP holds a bus pointer into a command cache and walks it -- loaded once, then
+    configured ``P+1`` and pulsed each iteration -- issuing each cached word straight to the
+    DMA via ``schedule_direct`` until it reaches a final pointer. Off-hardware the played
+    word is unknown (it shows up as ``BUS_DATA -> BUS_DATA``), but the cache is captured per
+    point, so the whole train is recoverable: the pointer's initial address gives where the
+    command region starts, and the final pointer is ``start + cache[count word]``, so the
+    loop runs ``cache[count word]`` times.
+
+    :return: ``{"channel", "start_offset", "count_word", "floor"}`` (``channel_num`` is filled
+        in by the caller from the runtime), or ``None`` when there is no such stream.
+    """
+    text = [instruction.pprint()
+            for sequencer in acadia._sequencer_type.instances
+            for instruction in sequencer._compiled_program]
+
+    direct = next(((i, m.group(1)) for i, line in enumerate(text)
+                   if (m := STREAM_DIRECT_RE.search(line))), None)
+    if direct is None:
+        return None
+    direct_idx, channel = direct
+
+    # the walking pointer: the DSP reconfigured P+1 (loaded once, then only incremented)
+    cfg = next((m.group(1) for line in text
+                if (m := STREAM_PTR_CFG_RE.search(line))), None)
+    if cfg is None:
+        return None
+
+    decoder = acadia._firmware.sequencer_bus_decoder
+    cache_base = decoder["cache"].address().value()
+    cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
+
+    # start_offset: the immediate loaded into that DSP's AB input (its first cache address)
+    ab_re = re.compile(rf"\b([0-9A-Fa-f]{{8}}) -> DSP_AB{cfg}\b")
+    start_offset = None
+    for line in text:
+        found = ab_re.search(line)
+        if found:
+            addr = int(found.group(1), 16)
+            if cache_base <= addr < cache_base + cache_words:
+                start_offset = addr - cache_base
+            break
+
+    # count_word: the cache read feeding the AB+C 'count' term of the final-pointer DSP
+    count_word = None
+    for i, line in enumerate(text):
+        if STREAM_C_RE.search(line):
+            for j in range(i - 1, max(i - 12, -1), -1):
+                found = BUS_ADDR_RE.search(text[j])
+                if found:
+                    addr = int(found.group(1) or found.group(2), 16)
+                    if cache_base <= addr < cache_base + cache_words:
+                        count_word = addr - cache_base
+                    break
+            break
+
+    # floor: the per-pulse period floor = the loop body's instruction span + the taken-branch
+    # penalty (measured 22 cyc = ~110 ns, the fifo-refill floor). Use the back-edge whose span
+    # contains the direct command.
+    floor = None
+    for branch, target in sequencer_control_flow(acadia)["back_branches"]:
+        if target <= direct_idx <= branch:
+            floor = (branch - target + 1) + MEASURED_BRANCH_PENALTY
+            break
+
+    if start_offset is None or count_word is None or floor is None:
+        return None
+    return {"channel": channel, "start_offset": start_offset,
+            "count_word": count_word, "floor": floor}
 
 
 INT16_FULL_SCALE = 2 ** 15 - 1

@@ -38,7 +38,7 @@ import paths_local
 _LOCAL = paths_local.load()
 BOARD_IP = _LOCAL.get("board_ip")
 SAVE_ROOT = _LOCAL.get("loopback_data_root")
-YAML_PATH = _LOCAL.get("yaml_path") or str(Path(__file__).parent / "test_config_teak.yaml")
+YAML_PATH = _LOCAL.get("yaml_path") or str(Path(__file__).parent / "validation_board_config.yaml")
 REPORT = Path(__file__).parent / "timing_validation_results.json"
 
 CHANNEL_OF = {"ch0": "DAC0", "ch1": "DAC2", "ch2": "DAC4", "ch3": "DAC6"}
@@ -80,8 +80,18 @@ def pulse_regions_ns(runtime, label, threshold_sigmas=10.0):
     """
     t = np.asarray(runtime.t_data) * 1e9
     y = np.asarray(runtime.avg_trace_pwr[label])
-    baseline = y[:30]
-    above = np.where(y > baseline.mean() + threshold_sigmas * baseline.std())[0]
+    # Baseline from a LOW percentile, not the first 30 samples: a capture_start_delay can
+    # slide a pulse into those early samples (a first-samples baseline would then inflate the
+    # threshold and hide every region), while a median baseline sits ON the pulse when a
+    # pulse fills most of the trace (the stretch cases). The 20th percentile tracks the quiet
+    # level as long as some of the trace is quiet; the noise comes from the lower band so a
+    # plateau cannot inflate it.
+    level = float(np.percentile(y, 20))
+    band = y[y <= np.percentile(y, 40)]
+    noise = float(band.std()) if band.size > 1 else float(y.std())
+    if noise == 0.0:                                        # degenerate flat trace
+        noise = 1.0
+    above = np.where(y > level + threshold_sigmas * noise)[0]
     if not len(above):
         return []
     regions, start = [], above[0]
@@ -183,7 +193,22 @@ def compare(folder, verbose=True):
         errors = [m_int[i] - p_int[i] for i in range(n)]
         if errors:
             worst = max(worst, max(abs(e) for e in errors))
+        # Count and span, which the interval metric alone cannot see: a dropped or collapsed
+        # train (e.g. an un-unrolled cache-pointer stream) merges to one region with no
+        # intervals, so the interval error is a misleading 0. The tell-tale is the hardware
+        # showing MORE pulses than the trace predicted -- `dropped` -- which means the tracer
+        # is missing pulses. (Measured FEWER than predicted is the opposite, benign case of
+        # two pulses merging into one region, e.g. stretch_then_pulse.)
+        span_m = (m[-1] - m[0]) if len(m) > 1 else 0.0
+        span_p = (p[-1] - p[0]) if len(p) > 1 else 0.0
         rows.append({"channel": label, "n_measured": len(m), "n_predicted": len(p),
+                     "count_ok": len(m) == len(p),
+                     # only where the tracer drew SOME pulses: a channel it (correctly) left
+                     # empty can still pick up a stray noise region, which is not a drop
+                     "dropped": (max(0, len(m) - len(p)) if len(p) > 0 else 0),
+                     "span_measured_ns": round(span_m, 1),
+                     "span_predicted_ns": round(span_p, 1),
+                     "span_error_ns": round(abs(span_m - span_p), 1),
                      # absolute first edge = the constant DAC->cable->ADC latency;
                      # only meaningful as a per-channel calibration constant
                      "first_edge_ns": round(m[0], 2) if m else None,
@@ -205,16 +230,41 @@ def compare(folder, verbose=True):
         "executed_blocks": len(trace.placements or trace.blocks),
         "worst_error_ns": round(worst, 2),
         "worst_error_cycles": round(worst / trace.ns_per_cycle, 3),
+        # channels where hardware shows more pulses than the trace drew: a structural miss
+        # (the tracer dropped pulses), separate from and invisible to the interval error
+        "pulses_dropped": [r["channel"] for r in rows if r["dropped"] > 0],
         "rows": rows,
     }
+
+    # Cache-pointer stream (rb_stream / randomized benchmarking) guard: the loop MUST be
+    # unrolled from the cache to the count the cache holds, and the post-loop blocks MUST sit
+    # after the train. This is exactly the regression the tracer fix prevents (a collapsed
+    # stream would leave one symbolic placeholder and drag the readout/tail up to the front).
+    if getattr(trace, "stream", None):
+        streamed = [p for p in trace.placements if getattr(p, "stream", False)]
+        gates = sum(len(p.commands) for p in streamed)
+        expected = int(trace.point_cache.get(trace.stream["count_word"], 0))
+        train_stop = max((p.stop for p in streamed), default=0)
+        after = any(not getattr(p, "stream", False) and p.start >= train_stop
+                    and any(c.pulse for c in p.commands) for p in trace.placements)
+        result["stream_gates"] = gates
+        result["stream_expected"] = expected
+        result["stream_ok"] = bool(gates == expected and expected > 0
+                                    and not result["pulses_dropped"] and after)
 
     if verbose:
         print(f"\n=== {folder}")
         print(f"    {trace.runtime_class}: {len(trace.blocks)} blocks, "
               f"gaps {result['gaps_ns']} ns")
         for row in rows:
-            flag = "" if not row["error_ns"] else (
-                "  OK" if max(abs(e) for e in row["error_ns"]) < 1.0 else "  <-- MISMATCH")
+            if row["dropped"] > 0:
+                flag = (f"  <-- DROPPED {row['dropped']} pulses "
+                        f"(meas {row['n_measured']} > pred {row['n_predicted']}, "
+                        f"span meas/pred {row['span_measured_ns']}/{row['span_predicted_ns']} ns)")
+            elif row["error_ns"] and max(abs(e) for e in row["error_ns"]) >= 1.0:
+                flag = "  <-- MISMATCH"
+            else:
+                flag = "  OK" if row["error_ns"] else ""
             print(f"    {row['channel']}  pulses meas/pred {row['n_measured']}/{row['n_predicted']}"
                   f"  measured {row['measured_intervals_ns']}"
                   f"  predicted {row['predicted_intervals_ns']}"
@@ -222,6 +272,10 @@ def compare(folder, verbose=True):
                   f"({row['error_cycles']} cyc){flag}")
         print(f"    worst error: {result['worst_error_ns']} ns "
               f"= {result['worst_error_cycles']} cycles")
+        if "stream_ok" in result:
+            print(f"    cache-pointer stream: {result['stream_gates']} gates unrolled "
+                  f"(cache says {result['stream_expected']}), tail after train: "
+                  f"{'OK' if result['stream_ok'] else '<-- FAIL (stream not unrolled)'}")
     return result
 
 
@@ -363,9 +417,19 @@ def main():
             note = KNOWN_SYSTEMATIC.get(case_dir.name)
             if not note:
                 worst_overall = max(worst_overall, result["worst_error_ns"])
-            flag = ("" if result["worst_error_ns"] < 1.0
-                    else "   <-- measurement systematic, see note" if note
-                    else "   <-- MISMATCH")
+            # dropped pulses / a collapsed cache-pointer stream are structural misses the
+            # interval error is blind to -- flag first, even when the interval error is small
+            if result.get("stream_ok") is False:
+                flag = (f"   <-- STREAM NOT UNROLLED "
+                        f"({result['stream_gates']}/{result['stream_expected']} gates)")
+            elif result["pulses_dropped"]:
+                flag = f"   <-- DROPPED PULSES on {','.join(result['pulses_dropped'])}"
+            elif result["worst_error_ns"] < 1.0:
+                flag = ""
+            elif note:
+                flag = "   <-- measurement systematic, see note"
+            else:
+                flag = "   <-- MISMATCH"
             print(f"{case_dir.name:22s} {result['blocks']:6d} "
                   f"{str(result['gaps_ns']):>22s} "
                   f"{result['worst_error_ns']:8.2f} ns{flag}")

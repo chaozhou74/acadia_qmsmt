@@ -192,7 +192,12 @@ def branch_regions(trace):
                             {"iteration": iteration,
                              "assumed": block.index in trace.assumed_paths,
                              "unsupported": block.index in getattr(
-                                 trace, "unsupported_paths", ())}])
+                                 trace, "unsupported_paths", ()),
+                             # an unrolled cache-pointer stream: gate count is resolved,
+                             # so the caption states it instead of "count data-dependent"
+                             "stream_count": (len(block.commands)
+                                              if getattr(block, "stream", False)
+                                              else None)}])
         previous = block.index
     return [(a, b, c, d) for a, b, c, d in regions]
 
@@ -213,6 +218,12 @@ def branch_caption(trace, context, info):
         return (f"loop {condition} — pass {info['iteration'] + 1} of "
                 f"{count if count else 'unbounded'}")
     if kind == "repeat_until":
+        # A cache-pointer pulse stream is fully unrolled -- its count is read from the
+        # per-point cache -- so say how many gates, not that the count is unknown.
+        count = info.get("stream_count")
+        if count is not None:
+            return (f"repeat_until({condition}) — {count} gates from cache "
+                    f"(this sweep point)")
         return (f"repeat_until({condition}) — 1 pass shown; "
                 f"real count is data-dependent")
     if kind == "test":

@@ -43,7 +43,7 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          "stretch_two_blocks", "stretch_two_blocks_same",
          "shape", "detune_pair", "phase_pair", "loop_2", "loop_3", "loop_2_double",
          "test_true", "test_false", "test_true_nospec", "test_false_nospec",
-         "barrier_single_channel",
+         "barrier_single_channel", "rb_stream",
          # KI_002 cases: these could not compile before the 2026-07-27 acadia pull
          "barrier_uneven_pulses", "barrier_uneven_2ch", "barrier_uneven")
 
@@ -71,6 +71,26 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     register_dwell: float = 300e-9    # used by register_dwell; written into the cache
     test_register_value: int = 0      # cache[0] for the test_* cases; 0 makes the
                                       # condition (REG == 0) true, anything else false
+    # rb_stream mirrors QubitRBRuntime on ch0: (0) an initial pulse, (1) the cache-pointer
+    # gate loop, (2) a readout-marker block, (3) the "8 basic gates" back-to-back. The loop
+    # plays one gate per entry of rb_pattern (indices into rb_gates); its LAST entry is the
+    # undo/recovery gate (played inside the loop, as in the real RB). Distinct-amplitude
+    # gates make the played sequence readable off the power trace. rb_num_pulses, if set,
+    # tiles rb_pattern to that length (so a scaling sweep needs only one number).
+    rb_gates: tuple = ("rb_gate_lo", "rb_gate_mid", "rb_gate_hi")
+    rb_pattern: tuple = (2, 0, 1, 2, 1)   # last entry = the undo/recovery gate
+    rb_num_pulses: int = None         # None -> len(rb_pattern); else tile to this length
+    rb_initial_pulse: str = "rb_gate_hi"   # block 0, mirrors the initial pi pulse
+    rb_readout_pulse: str = "test_pulse"   # readout-marker block after the loop (wide, distinct)
+    rb_final_pattern: tuple = (0, 1, 2, 0, 1, 2, 0, 1)  # the 8 basic gates, one block, back-to-back
+    rb_loop_gate: str = None          # if set, the loop plays only this gate (a single shape),
+                                      # for the pulse-length sweep that maps the ~110 ns floor
+    capture_length_override: float = None  # seconds; lengthen the ADC window past the yaml
+    capture_start_delay: float = 0.0  # seconds; dwell the ADC before it triggers, so the
+                                      # dead lead-in is skipped and more pulses fit the frame.
+                                      # Measured 1:1 (100/200/300/400 ns -> 100/200/300/400 ns
+                                      # frame shift); pulse_regions_ns uses a robust median/MAD
+                                      # baseline so a pulse shifted near t=0 stays detectable.
     run_delay: int = 200_000
     tail_trim_samples: int = 25       # see KI_001 note in loopback_multichannel.py
     use_dummy_channel: bool = True    # removes the KI_001 capture skew; keep True
@@ -87,13 +107,39 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         captures = [self.io(f"capture{i}") for i in range(4)]
         dummy_cap = self.io("capture_dummy") if self.use_dummy_channel else None
 
+        # Lengthen the ADC capture window past what the yaml declares, so a long rb_stream
+        # train fits. get_config reads self._config, so setting it here (before compile,
+        # before any get_waveform_memory) resizes both the capture memory and the stream.
+        if self.capture_length_override:
+            for cap in captures + ([dummy_cap] if dummy_cap else []):
+                mem = self.dummy_memory_name if cap is dummy_cap else self.capture_memory_name
+                cap.get_config("memories", mem)["length"] = float(self.capture_length_override)
+
         capture_length = captures[0].get_config("memories", self.capture_memory_name, "length")
+
+        # rb_stream: resolve the gate pattern (indices into rb_gates) and its length.
+        rb_pattern = list(self.rb_pattern)
+        if self.rb_num_pulses:
+            rb_pattern = [rb_pattern[k % len(rb_pattern)]
+                          for k in range(int(self.rb_num_pulses))]
+        rb_count = len(rb_pattern)
 
         # Cache-backed dwell length for the register_dwell case. The visualizer resolves
         # REG0 by finding the cache word it is loaded from and reading that word out of the
         # per-point snapshot, so this checks the auto-resolve against a measured interval
         # rather than only against the cache itself.
         cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
+
+        # rb_stream: the randomized-benchmarking idiom. A DSP holds a bus POINTER into a
+        # command cache and walks it, issuing each cached word straight to the DMA, until
+        # it reaches a final pointer held in a register. The pulse COUNT lives in
+        # rb_num_cache and each played command in rb_cmd_cache -- both captured per point,
+        # so both are recoverable off-hardware even though the tracer today drops them.
+        rb_cmd_cache = rb_num_cache = None
+        if self.case == "rb_stream":
+            rb_cmd_cache = self.acadia.CacheArray(shape=int(rb_count),
+                                                  dtype=np.dtype("<i4"))
+            rb_num_cache = self.acadia.CacheArray(shape=1, dtype=np.dtype("<i4"))
 
         for label in self._labels:
             self.data.add_group(f"trace_{label}", uniform=True)
@@ -255,6 +301,47 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                     for stim in stimuli:
                         stim.schedule_pulse(pulse)
 
+            elif self.case == "rb_stream":
+                # Mirror of QubitRBRuntime on ch0. Four DAC blocks matching the real RB:
+                #   (0) an initial pulse                       (the initial pi)
+                #   (1) the cache-pointer gate loop, last cache entry = the undo gate
+                #   (2) a readout-marker block                 (stands in for the measure)
+                #   (3) the 8 basic gates, one block, back-to-back
+                # The loop collapses in the tracer, so blocks (2) and (3) are what get
+                # dragged early -- this exercises the exact multi-block tail. The loop gates
+                # are fifo-almost-empty gated (period floors at ~110 ns), while the 8 final
+                # gates are pushed up front in one block (back-to-back at pulse length): the
+                # contrast confirms the floor is the loop's alone.
+                stim = stimuli[0]
+                with a.channel_synchronizer():                       # (0) initial pulse
+                    stim.schedule_pulse(self.rb_initial_pulse)
+
+                base = a._firmware.sequencer_bus_decoder["cache"].address().value()
+                pointer = a.sequencer().DSP()
+                pointer.load(base + rb_cmd_cache.index)
+                pointer.configure(mode="P+1", dsp_cep="reset")
+                final = a.sequencer().Register()
+                final.load(base + rb_cmd_cache.index + rb_num_cache[0])
+                with a.sequencer().test(pointer != final):          # (1) gate loop
+                    with a.sequencer().repeat_until(pointer == final):
+                        with a.sequencer().repeat_until(
+                                a.channel_is_fifo_almost_empty(stim.channel)):
+                            pass
+                        command = a.sequencer().bus_read(
+                            pointer, latency=a._bus_latency("cache"))
+                        with a.channel_synchronizer(block=False):
+                            a.schedule_direct(stim.channel, command)
+                        pointer.pulse_cep()
+                with a.sequencer().repeat_until(
+                        a.channel_is_fifo_almost_empty(stim.channel)):
+                    pass
+
+                with a.channel_synchronizer():                       # (2) readout marker
+                    stim.schedule_pulse(self.rb_readout_pulse)
+                with a.channel_synchronizer():                       # (3) the 8 basic gates
+                    for idx in self.rb_final_pattern:
+                        stim.schedule_pulse(self.rb_gates[idx])
+
             elif self.case == "barrier_single_channel":
                 # The barrier pattern real runtimes actually use: exactly ONE channel
                 # is active before the barrier, so acadia takes its single-element
@@ -305,9 +392,16 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         stim.schedule_pulse(pulse)
 
         def sequence(a: Acadia):
-            # 1. all four ADC captures triggered together, non-blocking, shared t=0
+            # 1. all four ADC captures triggered together, non-blocking, shared t=0.
+            #    capture_start_delay dwells each ADC before it triggers: block 0 is
+            #    non-blocking so it does not advance the sequencer for the DAC, hence the
+            #    DAC still starts at t=0 while the capture frame begins `delay` later --
+            #    which slides the fixed ~cable-latency lead-in out of view so more of the
+            #    pulse train lands inside the window.
             with a.channel_synchronizer(block=False):
                 for cap in captures:
+                    if self.capture_start_delay:
+                        cap.dwell(self.capture_start_delay)
                     self.acadia.stream_cmacc(
                         src=cap.channel,
                         dst=cap.get_waveform_memory(self.capture_memory_name),
@@ -320,6 +414,8 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                     )
                 if dummy_cap is not None:
                     # sacrificial 5th capture, triggered last, discarded (KI_001 workaround)
+                    if self.capture_start_delay:
+                        dummy_cap.dwell(self.capture_start_delay)
                     dummy_cap.capture_trace(self.dummy_memory_name)
 
             # 2. the DAC sequence under test
@@ -343,8 +439,18 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         "detune_pair": ["detune_10MHz", "detune_25MHz"],
                         "phase_pair": ["long_ramp_pulse", "phase_half_pi"]}.get(self.case, [])
 
-        for stim in stimuli:
-            for name in pulses_used:
+        # rb_stream plays its gate set, initial pulse and readout marker on ch0 only, so
+        # those extra pulses are allocated/loaded on stimulus0 alone (allocating them on the
+        # idle channels would just waste DAC memory).
+        rb_pulses = ([] if self.case != "rb_stream" else list(dict.fromkeys(
+            list(self.rb_gates) + [self.rb_initial_pulse, self.rb_readout_pulse]
+            + ([self.rb_loop_gate] if self.rb_loop_gate else []))))
+
+        def names_for(index):
+            return pulses_used + (rb_pulses if index == 0 else [])
+
+        for i, stim in enumerate(stimuli):
+            for name in names_for(i):
                 stim.get_waveform_memory(name)
 
         self.acadia.compile(sequence)
@@ -353,14 +459,25 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         self.acadia.assemble()
         self.acadia.load()
 
-        for stim in stimuli:
-            for name in pulses_used:
+        for i, stim in enumerate(stimuli):
+            for name in names_for(i):
                 stim.load_pulse(name)
 
         if self.case == "register_dwell":
             cache[0] = self.acadia.seconds_to_cycles(self.register_dwell)
         elif self.case.startswith("test_"):
             cache[0] = int(self.test_register_value)
+        elif self.case == "rb_stream":
+            # Load one DMA command per pattern slot: each is the cached word that plays
+            # that gate's waveform. Decoding it back to (address -> pulse, length) is
+            # exactly what the tracer fix will do off the captured cache.
+            rb_num_cache[0] = int(rb_count)
+            for k, gate_idx in enumerate(rb_pattern):
+                # rb_loop_gate (if set) forces every loop slot to one shape -- the
+                # length-sweep mode; otherwise each slot plays its patterned gate.
+                gate = self.rb_loop_gate or self.rb_gates[gate_idx]
+                rb_cmd_cache[k] = self.acadia.waveform_dma_command(
+                    stimuli[0].get_waveform_memory(gate))
 
         t_data = None
         configure_streams = True

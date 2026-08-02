@@ -15,8 +15,8 @@ board_ip: "10.0.0.1"
 loopback_data_root: "/path/to/test_loopback"
 
 # Optional: station config for the loopback board. Defaults to
-# test_config_teak.yaml next to timing_validation.py if omitted.
-# yaml_path: "/path/to/test_config_teak.yaml"
+# validation_board_config.yaml next to timing_validation.py if omitted.
+# yaml_path: "/path/to/validation_board_config.yaml"
 
 # Archived runs for the renderer regression (selftest.py): label -> data folder.
 # One folder per runtime class makes a good varied test set.

@@ -6,4 +6,5 @@ compiled.log
 assembled.log
 
 # machine/board-specific validation paths (copy paths.local.example.yaml)
-paths.local.yaml
+/validation/paths.local.yaml
+/validation/timing_validation_results.json
