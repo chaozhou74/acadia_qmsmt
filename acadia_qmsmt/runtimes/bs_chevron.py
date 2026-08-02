@@ -252,11 +252,14 @@ class BSChevronRuntime(QMsmtRuntime):
             bs50_config["flat"] = np.round((self.best_swap_time / 2 - swap_ramp / 4) / 5e-9) * 5e-9
 
             # apply the new config to designated pulses
+            available = self._ios["bs_stimulus"].get_config("pulses")
             for pulse in pulses:
-                if pulse in self._ios["bs_stimulus"].get_config("pulses"):
+                if pulse in available:
                     if pulse != "bs50":
+                        swap_config["use_stretch"] = available[pulse].get("use_stretch", False)
                         self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}", swap_config)
                     else:
+                        bs50_config["use_stretch"] = available[pulse].get("use_stretch", False)
                         self.update_io_yaml_field("bs_stimulus", f"pulses.bs50", bs50_config)
                 else:
                     logger.warning(f"Pulse {pulse} not found in bs_stimulus, not updated")
