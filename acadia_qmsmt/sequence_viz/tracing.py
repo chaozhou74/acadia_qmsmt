@@ -20,6 +20,7 @@ from typing import Optional
 import numpy as np
 
 from acadia.system import DMASynchronizer
+from acadia.sequencer import STP, Destination
 
 from .dryrun import (StopDryRun, already_traced, branch_recorder,
                      hardware_stubbed, preserved_runtime_state)
@@ -32,10 +33,8 @@ KIND = {
     DMASynchronizer.DIRECT: "DIRECT",
 }
 
-# Markers identifying the two instructions that bracket a blocking block's wait,
-# as emitted by DMASynchronizer.__exit__ / Sequencer.repeat_until.
-TRIGGER_MARKER = "; Trigger DMAs"
-DMA_POLL_MARKER = "PC (absolute hold) if BUS_DATA AND MASK != 0"
+# The compiled program is read through structured STP fields (see `decode_program` and the
+# `_is_*` predicates below), not by matching `instruction.pprint()` text.
 
 # Measured, not derived. The three terms below (detect + issue + propagate) come out one
 # cycle short of hardware at every blocking block boundary. Established on the 4-channel
@@ -57,13 +56,9 @@ MEASURED_BOUNDARY_OFFSET = 1
 # body 21 against 12. The counting tracks the body exactly; only this constant is extra.
 MEASURED_BRANCH_PENALTY = 3
 
+# `test` condition strings come from dryrun's branch_recorder (a rendering of the Python
+# condition object), NOT from the compiled program -- so this stays a small text match.
 CONDITION_RE = re.compile(r"^(REG\d+)\s*(==|!=|<=|>=|<|>)\s*(\S+)$")
-BRANCH_MARKER = "-> PC (absolute branch)"
-# Two spellings of a branch target appear in the compiled program, depending on how the
-# target instruction was referenced: a loop back-edge prints "SequenceInstruction @ 00000059",
-# a `test` skip prints "Symbol(assigned=True, value=0x7B)". Missing the second form silently
-# cost the whole skip-edge gap (the blocks butted together instead).
-BRANCH_TARGET_RE = re.compile(r"(?:@\s*|value=0x)([0-9A-Fa-f]+)")
 
 
 @dataclass
@@ -172,6 +167,11 @@ class SequenceTrace:
     stream: Optional[dict] = None
     addr_names: dict = field(default_factory=dict)   # (channel num, word addr) -> (io, pulse)
     point_cache: dict = field(default_factory=dict)  # this point's full cache, word -> value
+    # Phase 2 execution-model layout (sequence_viz/machine.py), run in parallel behind a
+    # `drain_blocks` maps a block=False batch's trigger index (nth) to the issue span of its
+    # repeat_until(fifo_empty) drain -- the execution-model layout (machine.py) advances the
+    # sequencer clock to last-pulled + that boundary gap there.
+    drain_blocks: dict = field(default_factory=dict)
 
     @property
     def n_points(self):
@@ -209,112 +209,16 @@ class SequenceTrace:
         a sweep point is chosen, and a loop body is compiled once but executed many times.
         Each executed pass gets its own :class:`Placement` with its own command copies, so a
         loop body appears once per iteration on the timeline.
+
+        The layout is done by the execution model in ``sequence_viz/machine.py``: it runs the
+        compiled program through a per-channel DMA-FIFO two-clock model, so ``block=False``
+        FIFO batching, cache-pointer streams and re-sync drains all fall out of one engine
+        (hardware-validated on the loopback; see validation/). Intra-block subschedule/barrier
+        layout, loop unrolling via :meth:`execution_plan`, and the boundary-gap constants are
+        shared here.
         """
-        fallback = int(self.resolve_indeterminate)
-        self.unresolved = 0
-        self.placements = []
-        self.assumed_paths = set()
-        self.unsupported_paths = set()
-
-        # trigger-list index per block, in compiled order: gaps are costed against the
-        # compiled program, so an executed edge is (from nth trigger -> to nth trigger)
-        nth_of_block, nth = {}, -1
-        for index, block in enumerate(self.blocks):
-            if block.trigger:
-                nth += 1
-                nth_of_block[index] = nth
-
-        plan = self.execution_plan()
-
-        # The sequencer is a single instruction stream: `t_seq` is when it reaches the
-        # current block. A blocking block waits for its DMAs, so it advances t_seq for
-        # everyone; a non-blocking one only queues into each channel's FIFO, so following
-        # blocks resume from that channel's own cursor.
-        cursor, t_seq = {}, 0
-        for step, (index, iteration) in enumerate(plan):
-            block = self.blocks[index]
-            placement = Placement(index=index, iteration=iteration,
-                                  trigger=block.trigger, blocking=block.blocking,
-                                  conditional=block.conditional)
-            channels = {c.channel for c in block.commands}
-            placement.start = max([t_seq] + [cursor.get(c, 0) for c in channels])
-
-            stream_here = False
-            t_sub = placement.start
-            for i_sub, group in enumerate(block.subschedules):
-                per_channel, sub_len = {}, 0
-                for command in group:
-                    if self._is_stream_command(command):
-                        # a cache-pointer pulse stream: unroll it into one concrete command
-                        # per cached word (randomized benchmarking), spaced by the period
-                        stream_here = True
-                        start = per_channel.get(command.channel, t_sub)
-                        end = self._expand_stream(command, placement, start)
-                        per_channel[command.channel] = end
-                        sub_len = max(sub_len, end - t_sub)
-                        continue
-                    length = command.length
-                    resolution = command.resolution
-                    if command.symbolic:
-                        # an explicit override wins over the cache, which wins over the
-                        # blanket resolve_indeterminate fallback
-                        override = self.register_overrides.get(command.symbolic)
-                        resolved = self.register_cycles.get(command.symbolic)
-                        value = (override if override is not None else
-                                 resolved if resolved is not None else fallback)
-                        length = int(value)
-                        resolution = ("override" if override is not None
-                                      else "cache" if resolved is not None
-                                      else "fallback")
-                        self.unresolved += 1
-                    start = per_channel.get(command.channel, t_sub)
-                    placement.commands.append(replace(
-                        command, start=start, length=length, resolution=resolution))
-                    per_channel[command.channel] = start + length
-                    sub_len = max(sub_len, per_channel[command.channel] - t_sub)
-                t_sub += sub_len
-                if i_sub < len(block.subschedules) - 1:
-                    placement.barriers.append(t_sub)
-
-            placement.length = t_sub - placement.start
-            placement.stream = stream_here
-
-            # gap to whatever executes NEXT, which for a loop back-edge is not the
-            # textually-following block
-            if placement.blocking and step + 1 < len(plan):
-                from_nth = nth_of_block.get(index)
-                to_nth = nth_of_block.get(plan[step + 1][0])
-                if from_nth is not None and to_nth is not None:
-                    edge = edge_gap(self.control_flow, from_nth, to_nth)
-                    if edge:
-                        detect = self.gap_terms.get("detect", 3)
-                        propagate = self.gap_terms.get("propagate", 2)
-                        total = (detect + edge["issue"] + propagate
-                                 + MEASURED_BOUNDARY_OFFSET + edge["branch_penalty"])
-                        placement.gap_after = total
-                        placement.gap_breakdown = {
-                            "total": total, "detect": detect, "issue": edge["issue"],
-                            "propagate": propagate,
-                            "measured_offset": MEASURED_BOUNDARY_OFFSET,
-                            "branch_penalty": edge["branch_penalty"],
-                            "edge": edge["kind"]}
-
-            if placement.blocking or stream_here:
-                # A cache-pointer stream is non-blocking per se, but the runtime waits for
-                # its DAC FIFO to drain (the post-loop fifo-almost-empty poll) before the
-                # next block, which holds the whole sequencer -- so, like a blocking block,
-                # it advances t_seq for every channel, not just its own. Without this the
-                # readout (on other channels) would be drawn on top of the gate train.
-                t_seq = placement.stop + placement.gap_after
-                for ch in channels:
-                    cursor[ch] = t_seq
-            else:
-                for ch in channels:
-                    own = [c.stop for c in placement.commands if c.channel == ch]
-                    cursor[ch] = max(own, default=placement.stop)
-
-            self.placements.append(placement)
-        return self
+        from .machine import machine_layout
+        return machine_layout(self)
 
     def _is_stream_command(self, command):
         """True for the direct DMA command of a cache-pointer stream on its channel.
@@ -341,6 +245,7 @@ class SequenceTrace:
         cache = self.point_cache or {}
         count = int(cache.get(meta["count_word"], 0))
         floor = int(meta["floor"])
+        post_span = int(meta.get("post_span", floor))
         cnum = meta["channel_num"]
         cursor = start
         for k in range(count):
@@ -351,12 +256,14 @@ class SequenceTrace:
             placement.commands.append(replace(
                 command, start=cursor, length=length, symbolic=None,
                 resolution="cache", pulse=pulse, io_name=io_name, address=address))
-            cursor += max(length, floor)      # advance by the per-pulse period
-        # The loop runs `count` full period slots, so the train ends `count` periods in --
-        # the last slot's refill gap is where the loop does its exit check and the post-loop
-        # fifo drains before the next block. Ending at the last pulse's stop instead would
-        # butt the next block against the final gate and merge them (which the hardware,
-        # separated by that drain, does not). The residual (~one refill gap) is small.
+            # Gates are spaced by the per-gate period (max of the pulse length and the push-
+            # cadence floor). The LAST gate has no next gate to refill for, so its trailing is
+            # the counted post-loop span instead -- the loop exit + drain + next block's push/
+            # trigger -- which is where the following block actually begins. (Ending at the bare
+            # last-pulse stop would merge the next block into the gate; ending a full floor past
+            # it, as before, put the next block ~one refill gap too late.)
+            trailing = max(length, floor) if k < count - 1 else max(length, post_span)
+            cursor += trailing
         return cursor
 
     @property
@@ -521,7 +428,7 @@ class SequenceTrace:
 
     @property
     def dead_time_ns(self):
-        """Total inter-block dead time -- see :func:`sequencer_block_gaps`."""
+        """Total inter-block dead time -- the boundary gaps from :func:`edge_gap`."""
         return sum(b.gap_after for b in (self.placements or self.blocks)) * self.ns_per_cycle
 
     def summary(self):
@@ -767,65 +674,96 @@ def _snapshot(runtime, pool):
     return {"memories": memories, "cache": _cache_words(runtime)}
 
 
-def sequencer_block_gaps(acadia):
-    """Dead time between one blocking block's last sample and the next block's first.
+@dataclass
+class Instr:
+    """One compiled STP instruction, read from its fields (not ``pprint()`` text).
 
-    Standalone diagnostic for the straight-line case, kept as the readable reference
-    for the gap model (see README). The live layout no longer calls this -- it uses
-    :func:`edge_gap` via :meth:`SequenceTrace.relayout`, which generalises the same
-    count to loop/``test`` edges. Not wired into the trace; call it directly.
-
-    A blocking ``channel_synchronizer`` does not hand off seamlessly. At block
-    exit ``DMASynchronizer.__exit__`` emits, in order: the DMA trigger, a
-    ``bus_read`` of ``dma_running``, and a ``repeat_until`` that holds the PC
-    until the mask clears. Only once that poll releases does the sequencer push
-    the next block's DMA commands, pad with the FIFO-latency NOPs from
-    ``calculate_trigger_delay``, and trigger again. Every one of those cycles is
-    dead air on every channel.
-
-    Three contributions, keyed to where they come from:
-
-    ``detect``
-        ``Acadia._bus_latency("dma_running")`` -- the poll reads a value that
-        stale, so the deassertion is seen that many cycles late.
-    ``issue``
-        counted exactly out of the compiled program: instructions from the poll
-        instruction through the next ``Trigger DMAs``. This is where a block with
-        many pulses, or one preceded by datamover configuration, costs more.
-    ``propagate``
-        trigger-to-DMA-load: ``dma_trigger_dataport`` pipelining plus the one
-        cycle the DMA takes to latch the FIFO output (see the ``calculate_trigger_delay``
-        docstring). Counted once, since it applies equally to both blocks.
-
-    Non-blocking blocks get no entry: their commands queue in the DMA FIFO and
-    play back-to-back, which is exactly why batching with ``block=False`` avoids
-    this cost.
-
-    :return: ``{nth triggering block: {"total", "detect", "issue", "propagate"}}``
+    ``d1``/``d2`` are the two destination-slot major names ("BUS_ADDR", "REG", "PC", "DSP_AB",
+    "DSP_C", "DSP_CFG", "BUS_DATA", "MASK", "NONE"), with the paired source major in ``s1``/``s2``
+    and immediate in ``imm1``/``imm2`` (slot 1 pairs dest1/src1/imm1). ``d1_minor`` is the port
+    index -- or, for a PC destination, the branch/hold code.
     """
-    text = [instruction.pprint()
-            for sequencer in acadia._sequencer_type.instances
-            for instruction in sequencer._compiled_program]
+    i: int
+    d1: Optional[str]
+    d1_minor: int
+    d2: Optional[str]
+    d2_minor: int
+    s1: Optional[str]
+    s2: Optional[str]
+    imm1: object
+    imm2: object
+    conditional: bool
+    condition_invert: bool
+    op: Optional[str]
+    comment: Optional[str]
 
-    triggers = [i for i, line in enumerate(text) if TRIGGER_MARKER in line]
-    detect = acadia._bus_latency("dma_running")
-    dataport = acadia._firmware["sequencer_bus"]["dma_trigger_dataport"]
-    propagate = (max(dataport["pipeline"])
-                 + (1 if dataport["bus_pipeline"] else 0)
-                 + 1)
 
-    gaps = {}
-    for nth, trigger in enumerate(triggers[:-1]):
-        following = triggers[nth + 1]
-        poll = next((j for j in range(trigger + 1, following)
-                     if DMA_POLL_MARKER in text[j]), None)
-        if poll is None:
-            continue                      # non-blocking: no wait, no gap
-        issue = following - poll + 1       # poll's last pass ... trigger inclusive
-        gaps[nth] = {"total": detect + issue + propagate + MEASURED_BOUNDARY_OFFSET,
-                     "detect": detect, "issue": issue, "propagate": propagate,
-                     "measured_offset": MEASURED_BOUNDARY_OFFSET}
-    return gaps
+def decode_program(acadia):
+    """The compiled program as :class:`Instr` records, flat across every sequencer instance
+    (the order ``pprint()`` walked). Reading the STP fields directly replaces the fragile
+    regexes that used to scan ``instruction.pprint()`` text."""
+    prog = []
+    for sequencer in acadia._sequencer_type.instances:
+        for ins in sequencer._compiled_program:
+            d1, d2 = ins.dest1, ins.dest2
+            prog.append(Instr(
+                i=len(prog),
+                d1=d1.major.name if d1 is not None else None,
+                d1_minor=int(d1.minor) if d1 is not None else 0,
+                d2=d2.major.name if d2 is not None else None,
+                d2_minor=int(d2.minor) if d2 is not None else 0,
+                s1=ins.src1.major.name if ins.src1 is not None else None,
+                s2=ins.src2.major.name if ins.src2 is not None else None,
+                imm1=ins.imm1, imm2=ins.imm2,
+                conditional=bool(ins.conditional),
+                condition_invert=bool(ins.condition_invert),
+                op=ins.op, comment=ins.comment))
+    return prog
+
+
+def _resolve_imm(imm):
+    """An instruction immediate (int / Symbol / referenced instruction) as a concrete int,
+    using acadia's own resolver -- e.g. a branch target or a bus address. None if unresolvable."""
+    try:
+        return int(STP.assemble_imm(imm))
+    except Exception:
+        return None
+
+
+def _is_trigger(r):
+    """The ``Trigger DMAs`` instruction that starts a block's queued DMAs playing."""
+    return r.comment == "Trigger DMAs"
+
+
+def _is_dma_poll(r):
+    """The blocking wait a block exit emits: PC-hold while ``BUS_DATA AND MASK != 0`` (the
+    dma_running poll). ``condition_invert`` False is the ``!= 0`` sense."""
+    return (r.d1 == "PC" and r.d1_minor == Destination.PC_ABSOLUTE_HOLD and r.conditional
+            and r.s2 == "BUS_DATA" and r.op == "and" and not r.condition_invert)
+
+
+def _is_branch(r):
+    """An absolute PC branch (loop back-edge or `test` skip); target is its slot-1 immediate."""
+    return r.d1 == "PC" and r.d1_minor == Destination.PC_ABSOLUTE_BRANCH
+
+
+def _bus_addr(r):
+    """The cache/bus address an instruction writes to BUS_ADDR (from an immediate), else None."""
+    if r.d1 == "BUS_ADDR" and r.s1 == "IMM":
+        return _resolve_imm(r.imm1)
+    if r.d2 == "BUS_ADDR" and r.s2 == "IMM":
+        return _resolve_imm(r.imm2)
+    return None
+
+
+def _bus_data_load(r, dests):
+    """If this instruction lands BUS_DATA into one of ``dests`` (a destination major), return
+    ``(major, minor)`` for that slot, else None -- e.g. a cache read into ``REG``/``DSP_AB``."""
+    if r.s1 == "BUS_DATA" and r.d1 in dests:
+        return (r.d1, r.d1_minor)
+    if r.s2 == "BUS_DATA" and r.d2 in dests:
+        return (r.d2, r.d2_minor)
+    return None
 
 
 def _pulse_address_map(runtime):
@@ -882,6 +820,11 @@ def _build_trace(runtime, raw_blocks, resolve):
     # cache in relayout; store the decode map and the stream descriptor here.
     trace.addr_names = addr_names
     try:
+        from .machine import drain_block_issue
+        trace.drain_blocks = drain_block_issue(acadia)
+    except Exception:
+        pass                    # the machine layout is opt-in; never fail the trace
+    try:
         stream = describe_cache_stream(acadia)
         if stream:
             for io in runtime._ios.values():
@@ -935,47 +878,39 @@ def _build_trace(runtime, raw_blocks, resolve):
     return trace
 
 
-LOAD_RE = re.compile(r"BUS_DATA -> (REG\d+|DSP_AB\d+)")
-BUS_ADDR_RE = re.compile(r"(?:0x([0-9A-Fa-f]+)|\b([0-9A-F]{8})\b)\s*->\s*BUS_ADDR")
-
-
 def sequencer_control_flow(acadia):
-    """Trigger/poll addresses and backward branches, for costing an executed edge.
+    """Trigger/poll addresses and branches, for costing an executed edge.
 
     Straight-line edges can be costed by counting instructions between the poll and the
     next trigger. A loop back-edge cannot: execution leaves the poll, reaches the branch,
     jumps to the branch target, and runs forward from there to that block's trigger. So the
     branch and its target address are needed as well.
 
-    :return: ``{"triggers": [addr], "polls": {nth trigger: addr},
+    :return: ``{"triggers": [addr], "polls": {nth trigger: addr}, "branches": [(addr, target)],
                 "back_branches": [(branch addr, target addr)]}``
     """
-    text = [instruction.pprint()
-            for sequencer in acadia._sequencer_type.instances
-            for instruction in sequencer._compiled_program]
+    prog = decode_program(acadia)
 
-    triggers = [i for i, line in enumerate(text) if TRIGGER_MARKER in line]
+    triggers = [r.i for r in prog if _is_trigger(r)]
     polls = {}
     for nth, trigger in enumerate(triggers):
-        limit = triggers[nth + 1] if nth + 1 < len(triggers) else len(text)
+        limit = triggers[nth + 1] if nth + 1 < len(triggers) else len(prog)
         poll = next((j for j in range(trigger + 1, limit)
-                     if DMA_POLL_MARKER in text[j]), None)
+                     if _is_dma_poll(prog[j])), None)
         if poll is not None:
             polls[nth] = poll
 
     # Both directions matter: a loop back-edge jumps backward, while a `test` whose
     # condition fails jumps FORWARD past the skipped body. Either way the executed path
-    # leaves the address order and has to be costed in two segments.
+    # leaves the address order and has to be costed in two segments. The target is the
+    # branch's own slot-1 immediate, so there is no risk of picking up a different
+    # instruction's address (the old text form quoted two spellings and had to guess).
     branches = []
-    for index, line in enumerate(text):
-        # the instruction's own destination is the TAIL of the line; a Symbol repr earlier
-        # in it quotes a different instruction and must not be mistaken for this one
-        head, marker, _ = line.rpartition(BRANCH_MARKER)
-        if not marker:
-            continue
-        targets = BRANCH_TARGET_RE.findall(head)
-        if targets:
-            branches.append((index, int(targets[-1], 16)))
+    for r in prog:
+        if _is_branch(r):
+            target = _resolve_imm(r.imm1)
+            if target is not None:
+                branches.append((r.i, target))
 
     return {"triggers": triggers, "polls": polls, "branches": branches,
             "back_branches": [(b, t) for b, t in branches if t < b]}
@@ -1036,9 +971,7 @@ def describe_registers(acadia):
 
     :return: ``{"REG0": {"source": "cache[0]", "cache_word": 0}, ...}``
     """
-    text = [instruction.pprint()
-            for sequencer in acadia._sequencer_type.instances
-            for instruction in sequencer._compiled_program]
+    prog = decode_program(acadia)
 
     decoder = acadia._firmware.sequencer_bus_decoder
     cache_base = decoder["cache"].address().value()
@@ -1052,20 +985,21 @@ def describe_registers(acadia):
             pass
 
     registers = {}
-    for index, line in enumerate(text):
-        loaded = LOAD_RE.search(line)
-        if not loaded:
+    for r in prog:
+        loaded = _bus_data_load(r, ("REG", "DSP_AB"))   # BUS_DATA -> REGn / DSP_ABn
+        if loaded is None:
             continue
         address = None
-        for previous in range(index - 1, max(index - 12, -1), -1):
-            found = BUS_ADDR_RE.search(text[previous])
-            if found:
-                address = int(found.group(1) or found.group(2), 16)
+        for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            found = _bus_addr(prog[j])
+            if found is not None:
+                address = found
                 break
         if address is None:
             continue
         # a DSP unit's output DSPn drives the command length, not DSP_ABn (its input)
-        name = re.sub(r"^DSP_AB(\d+)$", r"DSP\1", loaded.group(1))
+        major, minor = loaded
+        name = f"DSP{minor}" if major == "DSP_AB" else f"REG{minor}"
         if cache_base <= address < cache_base + cache_words:
             word = address - cache_base
             registers[name] = {"source": f"cache[{word}]", "cache_word": word}
@@ -1076,14 +1010,15 @@ def describe_registers(acadia):
     return registers
 
 
-# The randomized-benchmarking pulse stream, spelled in the compiled program:
-#   <addr> -> DSP_AB0                                   pointer's initial cache address
-#   mode='P+1' -> DSP_CFG0                              from now on it only increments
-#   BUS_DATA -> DSP_C1                                  final = pointer + cache[count word]
-#   BUS_DATA -> BUS_DATA ; Command DMA for <chan>       the played word, fetched at runtime
-STREAM_DIRECT_RE = re.compile(r"BUS_DATA -> BUS_DATA\b.*Command DMA for (\w+)")
-STREAM_PTR_CFG_RE = re.compile(r"mode='P\+1'.*->\s*DSP_CFG(\d+)")
-STREAM_C_RE = re.compile(r"BUS_DATA -> DSP_C\d+")
+def _dsp_pointer_config(r):
+    """The DSP index a ``P+1`` config is written to (the walking pointer), else None.
+    ``P+1`` means "from now on only increment", so this marks the cache-stream pointer DSP."""
+    for dest, minor, imm in ((r.d1, r.d1_minor, r.imm1), (r.d2, r.d2_minor, r.imm2)):
+        if dest == "DSP_CFG":
+            mode = getattr(imm, "mode", None)
+            if mode == "P+1" or getattr(mode, "name", None) == "P+1":
+                return minor
+    return None
 
 
 def describe_cache_stream(acadia):
@@ -1092,27 +1027,32 @@ def describe_cache_stream(acadia):
     A DSP holds a bus pointer into a command cache and walks it -- loaded once, then
     configured ``P+1`` and pulsed each iteration -- issuing each cached word straight to the
     DMA via ``schedule_direct`` until it reaches a final pointer. Off-hardware the played
-    word is unknown (it shows up as ``BUS_DATA -> BUS_DATA``), but the cache is captured per
-    point, so the whole train is recoverable: the pointer's initial address gives where the
-    command region starts, and the final pointer is ``start + cache[count word]``, so the
-    loop runs ``cache[count word]`` times.
+    word is unknown (it comes through as ``BUS_DATA -> BUS_DATA`` with a "Command DMA" note),
+    but the cache is captured per point, so the whole train is recoverable: the pointer's
+    initial address gives where the command region starts, and the final pointer is
+    ``start + cache[count word]``, so the loop runs ``cache[count word]`` times.
 
     :return: ``{"channel", "start_offset", "count_word", "floor"}`` (``channel_num`` is filled
         in by the caller from the runtime), or ``None`` when there is no such stream.
     """
-    text = [instruction.pprint()
-            for sequencer in acadia._sequencer_type.instances
-            for instruction in sequencer._compiled_program]
+    prog = decode_program(acadia)
 
-    direct = next(((i, m.group(1)) for i, line in enumerate(text)
-                   if (m := STREAM_DIRECT_RE.search(line))), None)
+    # the played command: BUS_DATA issued straight to a channel's DMA, named in the comment
+    direct = None
+    for r in prog:
+        if (r.comment and r.comment.startswith("Command DMA for")
+                and ((r.d1 == "BUS_DATA" and r.s1 == "BUS_DATA")
+                     or (r.d2 == "BUS_DATA" and r.s2 == "BUS_DATA"))):
+            match = re.match(r"Command DMA for (\w+)", r.comment)
+            if match:
+                direct = (r.i, match.group(1))
+                break
     if direct is None:
         return None
     direct_idx, channel = direct
 
     # the walking pointer: the DSP reconfigured P+1 (loaded once, then only incremented)
-    cfg = next((m.group(1) for line in text
-                if (m := STREAM_PTR_CFG_RE.search(line))), None)
+    cfg = next((c for r in prog if (c := _dsp_pointer_config(r)) is not None), None)
     if cfg is None:
         return None
 
@@ -1121,24 +1061,25 @@ def describe_cache_stream(acadia):
     cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
 
     # start_offset: the immediate loaded into that DSP's AB input (its first cache address)
-    ab_re = re.compile(rf"\b([0-9A-Fa-f]{{8}}) -> DSP_AB{cfg}\b")
     start_offset = None
-    for line in text:
-        found = ab_re.search(line)
-        if found:
-            addr = int(found.group(1), 16)
+    for r in prog:
+        addr = None
+        for dest, minor, src, imm in ((r.d1, r.d1_minor, r.s1, r.imm1),
+                                      (r.d2, r.d2_minor, r.s2, r.imm2)):
+            if dest == "DSP_AB" and minor == cfg and src == "IMM":
+                addr = _resolve_imm(imm)
+        if addr is not None:
             if cache_base <= addr < cache_base + cache_words:
                 start_offset = addr - cache_base
             break
 
     # count_word: the cache read feeding the AB+C 'count' term of the final-pointer DSP
     count_word = None
-    for i, line in enumerate(text):
-        if STREAM_C_RE.search(line):
-            for j in range(i - 1, max(i - 12, -1), -1):
-                found = BUS_ADDR_RE.search(text[j])
-                if found:
-                    addr = int(found.group(1) or found.group(2), 16)
+    for r in prog:
+        if _bus_data_load(r, ("DSP_C",)) is not None:
+            for j in range(r.i - 1, max(r.i - 12, -1), -1):
+                addr = _bus_addr(prog[j])
+                if addr is not None:
                     if cache_base <= addr < cache_base + cache_words:
                         count_word = addr - cache_base
                     break
@@ -1147,16 +1088,29 @@ def describe_cache_stream(acadia):
     # floor: the per-pulse period floor = the loop body's instruction span + the taken-branch
     # penalty (measured 22 cyc = ~110 ns, the fifo-refill floor). Use the back-edge whose span
     # contains the direct command.
-    floor = None
+    #
+    # post_span: the trailing the LAST gate pays before the block after the loop -- counted as
+    # the instruction span from the gate's own trigger to that next block's trigger, NOT another
+    # full floor. The floor is the push cadence *between* gates (each waits a loop-body span to
+    # refill for the next); the last gate has no next gate to refill for, so it only pays the
+    # loop exit + post-loop drain + the next block's push/trigger. Emergent from the program, so
+    # a stream followed by a batch (which starts exactly at this trailing) lands right, where a
+    # blanket count*floor put it ~one floor too late.
+    triggers = [r.i for r in prog if _is_trigger(r)]
+    gate_trigger = next((t for t in triggers if t > direct_idx), None)
+    floor = post_span = None
     for branch, target in sequencer_control_flow(acadia)["back_branches"]:
         if target <= direct_idx <= branch:
             floor = (branch - target + 1) + MEASURED_BRANCH_PENALTY
+            next_trigger = next((t for t in triggers if t > branch), None)
+            if gate_trigger is not None and next_trigger is not None:
+                post_span = next_trigger - gate_trigger
             break
 
     if start_offset is None or count_word is None or floor is None:
         return None
-    return {"channel": channel, "start_offset": start_offset,
-            "count_word": count_word, "floor": floor}
+    return {"channel": channel, "start_offset": start_offset, "count_word": count_word,
+            "floor": floor, "post_span": post_span if post_span is not None else floor}
 
 
 INT16_FULL_SCALE = 2 ** 15 - 1

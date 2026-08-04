@@ -69,6 +69,19 @@ Two corollaries used throughout:
   (DMA push count, loop-body size). If the residual stays put while the count-driven term moves
   as predicted, the counting is right and the residual is a real constant.
 
+**Edge detection vs. amplitude-varying back-to-back trains (measurement systematic).** The rising
+edge is taken at 50% of the *merged region's* peak — deliberate, because it is robust to ramp shape
+and pulse length (a low fixed threshold re-introduces the ramp bias above). But when back-to-back
+pulses of *different amplitude* merge into one region (e.g. `rb_stream`'s "8 basic gates" =
+lo/mid/hi), the low/mid gates never cross the high gate's half-max, so the detected edge latches
+onto the first *high* gate — the region reads late by (leading low gates) × (gate period). This is
+a **measurement** artifact, not a model error: the region *start* (first above-threshold sample)
+still matches the tracer to a few ns. Amplitude variation exists for gate-**identity** readability,
+which is orthogonal to timing — so for **timing** of a back-to-back train, use one amplitude
+(`rb_final_gate` makes the 8 final gates uniform; `rb_final_gate="rb_gate_hi"` validates to ~0–5 ns
+where the varying pattern reads ~70 ns late). Fixing the detector itself would need per-sub-pulse
+segmentation and would trade a well-understood artifact for a subtler one; not worth it.
+
 ## Timing (straight-line + barriers)
 
 The model was initially one cycle short at every blocking boundary. Varying the DMA push count

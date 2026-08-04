@@ -66,6 +66,13 @@ KNOWN_SYSTEMATIC = {
         "same slow-ramp edge limit as phase_pair, plus SSB imbalance ripple that differs "
         "between the 10 MHz and 25 MHz pulses and perturbs the plateau peak the half level "
         "is taken from. Timing conclusions rest on the fast-ramp cases.",
+    "rb_stream":
+        "the final '8 basic gates' block plays lo/mid/hi amplitudes back-to-back, merging into "
+        "one region; the 50%-of-region-peak rising edge then latches onto the first HIGH gate, "
+        "reading the block ~70 ns (2 gates) late. Measurement systematic, not a model error -- "
+        "the region START matches the tracer to ~5 ns. The amplitude variation is for gate "
+        "IDENTITY; for timing of that block, set rb_final_gate to one shape (rb_stream_uniform / "
+        "rb_final_gate='rb_gate_hi' validates to ~0-5 ns). The stream unroll itself is exact.",
 }
 
 

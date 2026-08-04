@@ -43,9 +43,16 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          "stretch_two_blocks", "stretch_two_blocks_same",
          "shape", "detune_pair", "phase_pair", "loop_2", "loop_3", "loop_2_double",
          "test_true", "test_false", "test_true_nospec", "test_false_nospec",
-         "barrier_single_channel", "rb_stream",
+         "barrier_single_channel", "rb_stream", "rb_stream_uniform", "batch_resync",
+         "simulbus_transition", "batch_two_channels", "batch_uneven", "batch_interleaved",
+         "loop_batch", "stream_then_batch", "batch_concurrent_blocking",
          # KI_002 cases: these could not compile before the 2026-07-27 acadia pull
          "barrier_uneven_pulses", "barrier_uneven_2ch", "barrier_uneven")
+
+# Cases built on the cache-pointer stream idiom: they share the command-cache setup, the
+# rb-pulse allocation, and the cache fill. rb_stream_uniform is rb_stream with uniform-amplitude
+# final gates (clean timing of the back-to-back block; see README on the edge-detection artifact).
+STREAM_CASES = ("rb_stream", "rb_stream_uniform", "stream_then_batch")
 
 
 class LoopbackTimingCaseRuntime(QMsmtRuntime):
@@ -83,8 +90,16 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     rb_initial_pulse: str = "rb_gate_hi"   # block 0, mirrors the initial pi pulse
     rb_readout_pulse: str = "test_pulse"   # readout-marker block after the loop (wide, distinct)
     rb_final_pattern: tuple = (0, 1, 2, 0, 1, 2, 0, 1)  # the 8 basic gates, one block, back-to-back
+    rb_final_gate: str = None         # if set, the 8 final gates all use this ONE shape (uniform
+                                      # amplitude) instead of rb_final_pattern. The varying pattern
+                                      # is for gate-IDENTITY readability, but it defeats the edge
+                                      # detector on the merged back-to-back region (see README:
+                                      # the 50%-of-region-peak edge latches onto the first HIGH
+                                      # gate). Set this for TIMING validation of the final block.
     rb_loop_gate: str = None          # if set, the loop plays only this gate (a single shape),
                                       # for the pulse-length sweep that maps the ~110 ns floor
+    batch_resync_pulses: int = 8      # batch_resync: how many pulses the block=False batches play
+                                      # before the dwell(pulse_length) + barrier + readout re-sync
     capture_length_override: float = None  # seconds; lengthen the ADC window past the yaml
     capture_start_delay: float = 0.0  # seconds; dwell the ADC before it triggers, so the
                                       # dead lead-in is skipped and more pulses fit the frame.
@@ -102,6 +117,12 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         if self.case not in CASES:
             raise ValueError(f"unknown case {self.case!r}; expected one of {CASES}")
 
+        # rb_stream_uniform is rb_stream with the 8 final gates forced to one amplitude, so the
+        # merged back-to-back region's edge is the true first gate (see README). Set it here,
+        # before pulse allocation reads rb_final_gate, and treat it as rb_stream below.
+        if self.case == "rb_stream_uniform" and not self.rb_final_gate:
+            self.rb_final_gate = "rb_gate_hi"
+
         self._labels = ["ch0", "ch1", "ch2", "ch3"]
         stimuli = [self.io(f"stimulus{i}") for i in range(4)]
         captures = [self.io(f"capture{i}") for i in range(4)]
@@ -116,6 +137,11 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 cap.get_config("memories", mem)["length"] = float(self.capture_length_override)
 
         capture_length = captures[0].get_config("memories", self.capture_memory_name, "length")
+
+        # batch_resync: the dwell that waits for the last queued pulse, sized flat + ramp,
+        # exactly as the SWAP runtime computes bs_pulse_length.
+        resync_dwell = (stimuli[0].get_config("pulses", self.stimulus_pulse_name, "flat")
+                        + stimuli[0].get_config("pulses", self.stimulus_pulse_name, "ramp"))
 
         # rb_stream: resolve the gate pattern (indices into rb_gates) and its length.
         rb_pattern = list(self.rb_pattern)
@@ -136,7 +162,7 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # rb_num_cache and each played command in rb_cmd_cache -- both captured per point,
         # so both are recoverable off-hardware even though the tracer today drops them.
         rb_cmd_cache = rb_num_cache = None
-        if self.case == "rb_stream":
+        if self.case in STREAM_CASES:
             rb_cmd_cache = self.acadia.CacheArray(shape=int(rb_count),
                                                   dtype=np.dtype("<i4"))
             rb_num_cache = self.acadia.CacheArray(shape=1, dtype=np.dtype("<i4"))
@@ -301,7 +327,7 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                     for stim in stimuli:
                         stim.schedule_pulse(pulse)
 
-            elif self.case == "rb_stream":
+            elif self.case in ("rb_stream", "rb_stream_uniform"):
                 # Mirror of QubitRBRuntime on ch0. Four DAC blocks matching the real RB:
                 #   (0) an initial pulse                       (the initial pi)
                 #   (1) the cache-pointer gate loop, last cache entry = the undo gate
@@ -340,7 +366,212 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                     stim.schedule_pulse(self.rb_readout_pulse)
                 with a.channel_synchronizer():                       # (3) the 8 basic gates
                     for idx in self.rb_final_pattern:
-                        stim.schedule_pulse(self.rb_gates[idx])
+                        # rb_final_gate (if set) makes every final gate one shape -- uniform
+                        # amplitude, so the merged region's leading edge is the true first gate
+                        stim.schedule_pulse(self.rb_final_gate or self.rb_gates[idx])
+
+            elif self.case == "batch_resync":
+                # Mirror the SWAP-calibration idiom (BSAmpNcoSweepPulseNcoBlobsRuntime): N
+                # pulses queued back-to-back with block=False in batches of 5, each batch
+                # drained by repeat_until(channel_is_fifo_empty); then dwell(pulse_length) to
+                # "wait for the last queued pulse to finish", a barrier, and the readout on
+                # ANOTHER channel. With block=False the fifo empties when the last command is
+                # PULLED (while the last pulse still plays), so that dwell runs concurrently
+                # with the last pulse -- the question this case answers is whether the readout
+                # lands right after the last pulse (dwell concurrent) or a pulse-length later
+                # (the tracer draws the latter). A reference marker on the readout channel,
+                # fired with the flip, makes the readout position measurable within-channel.
+                bs, ro = stimuli[0], stimuli[1]
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)           # the flip
+                    ro.schedule_pulse(pulse)           # reference marker (t0 on the ro channel)
+                n = int(self.batch_resync_pulses)
+                for idx in range(n)[::5]:
+                    with a.channel_synchronizer(block=False):
+                        for _ in range(idx, min(idx + 5, n)):
+                            bs.schedule_pulse(pulse)
+                    with a.sequencer().repeat_until(a.channel_is_fifo_empty(bs.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    bs.dwell(resync_dwell)             # wait for the last queued pulse (flat+ramp)
+                    a.barrier()
+                    ro.schedule_pulse(pulse)           # the "readout"
+
+            elif self.case == "simulbus_transition":
+                # Mirror SimulBus's batch-train -> multi-channel transition, the ONE place
+                # the execution-model layout (machine.py) diverges from relayout on a real
+                # runtime. A block=False batch train plays on ch0 (each batch drained by
+                # repeat_until(channel_is_fifo_empty)); ch2 stays IDLE with only a reference
+                # marker at t0. After the train, a blocking block plays a pulse on ch0 (which
+                # WAS batched) AND on ch2 (which was idle). relayout starts the whole block --
+                # including the ch2 pulse -- only after ch0's train fully drains; the machine
+                # starts the ch2 pulse at last-pulled + one boundary gap, because an idle
+                # channel plays its own FIFO when triggered rather than waiting for ch0's tail.
+                # The ch2 reference->post-train interval measures which model is right.
+                bs, idle = stimuli[0], stimuli[2]
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)           # ch0: start-of-train marker
+                    idle.schedule_pulse(pulse)         # ch2: reference marker (t0)
+                n = int(self.batch_resync_pulses)
+                for idx in range(n)[::5]:
+                    with a.channel_synchronizer(block=False):
+                        for _ in range(idx, min(idx + 5, n)):
+                            bs.schedule_pulse(pulse)
+                    with a.sequencer().repeat_until(a.channel_is_fifo_empty(bs.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)           # ch0: post-train pulse (was batched)
+                    idle.schedule_pulse(pulse)         # ch2: post-train pulse (the discriminator)
+
+            elif self.case == "batch_two_channels":
+                # TWO channels batched together (block=False) and drained together, then a
+                # post-train block on both batched channels AND a fresh idle channel. Stresses
+                # per-channel FIFO cursors when several channels desync at once (simulbus_
+                # transition desynced only one). The idle channel's ref->post-train interval
+                # is the discriminator, measurable within-channel.
+                a_ch, b_ch, idle = stimuli[0], stimuli[1], stimuli[2]
+                with a.channel_synchronizer():
+                    a_ch.schedule_pulse(pulse)
+                    b_ch.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 reference marker (t0)
+                n = int(self.batch_resync_pulses)
+                for idx in range(n)[::5]:
+                    with a.channel_synchronizer(block=False):
+                        for _ in range(idx, min(idx + 5, n)):
+                            a_ch.schedule_pulse(pulse)
+                            b_ch.schedule_pulse(pulse)
+                    with a.sequencer().repeat_until(a.channel_is_fifo_empty(a_ch.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    a_ch.schedule_pulse(pulse)
+                    b_ch.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 discriminator
+
+            elif self.case == "batch_uneven":
+                # A batch whose pulses ALTERNATE length (long test_pulse vs short rb_gate_hi),
+                # so the LAST descriptor's length -- which sets last-pulled = playout_end -
+                # last_len for the drain -- differs from the others. Checks the machine reads
+                # the correct per-drain last_len rather than assuming a uniform pulse length.
+                bs, idle = stimuli[0], stimuli[2]
+                shapes = [pulse, "rb_gate_hi"]         # long, short
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 reference marker (t0)
+                n = int(self.batch_resync_pulses)
+                for idx in range(n)[::5]:
+                    with a.channel_synchronizer(block=False):
+                        for k in range(idx, min(idx + 5, n)):
+                            bs.schedule_pulse(shapes[k % 2])
+                    with a.sequencer().repeat_until(a.channel_is_fifo_empty(bs.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 discriminator
+
+            elif self.case == "batch_interleaved":
+                # Batch on ch0 (drain), then a SEPARATE batch on ch1 (drain), then a block
+                # touching ch0, ch1 and idle ch2. ch0 and ch1 desync by DIFFERENT amounts --
+                # the hardest test of independent per-channel FIFO cursors. Both ch0 and ch1
+                # carry a reference marker so each channel's post-train interval is measurable.
+                c0, c1, idle = stimuli[0], stimuli[1], stimuli[2]
+                with a.channel_synchronizer():
+                    c0.schedule_pulse(pulse)
+                    c1.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 reference marker (t0)
+                with a.channel_synchronizer(block=False):
+                    for _ in range(5):
+                        c0.schedule_pulse(pulse)
+                with a.sequencer().repeat_until(a.channel_is_fifo_empty(c0.channel)):
+                    pass
+                with a.channel_synchronizer(block=False):
+                    for _ in range(3):
+                        c1.schedule_pulse(pulse)
+                with a.sequencer().repeat_until(a.channel_is_fifo_empty(c1.channel)):
+                    pass
+                with a.channel_synchronizer():
+                    c0.schedule_pulse(pulse)
+                    c1.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 discriminator
+
+            elif self.case == "loop_batch":
+                # A loop whose body is a block=False batch + a fifo_empty drain, so the DRAIN
+                # BLOCK REPEATS. drain_blocks is keyed by the compiled trigger index and reused
+                # each unrolled iteration, so this checks the machine advances the sequencer
+                # clock to last-pulled + gap correctly on every pass, not just the first. Idle
+                # ch2 gets a reference marker before the loop and a readout after it.
+                bs, idle = stimuli[0], stimuli[2]
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 reference marker (t0)
+                with a.sequencer().loop(2):
+                    with a.channel_synchronizer(block=False):
+                        for _ in range(3):
+                            bs.schedule_pulse(pulse)
+                    with a.sequencer().repeat_until(a.channel_is_fifo_empty(bs.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    bs.schedule_pulse(pulse)
+                    idle.schedule_pulse(pulse)         # ch2 discriminator
+
+            elif self.case == "stream_then_batch":
+                # The RB cache-pointer stream, but followed IMMEDIATELY by a block=False batch
+                # (drained) instead of a blocking readout. Tests the stream's trailing-period
+                # cursor feeding into a following batch, plus a real fifo_empty drain right
+                # after the stream's own almost_empty drain. Idle ch2 carries a reference marker
+                # (t0) and the post-batch discriminator.
+                stim, idle = stimuli[0], stimuli[2]
+                with a.channel_synchronizer():
+                    stim.schedule_pulse(self.rb_initial_pulse)   # ch0 initial pulse
+                    idle.schedule_pulse(pulse)                   # ch2 reference marker (t0)
+                base = a._firmware.sequencer_bus_decoder["cache"].address().value()
+                pointer = a.sequencer().DSP()
+                pointer.load(base + rb_cmd_cache.index)
+                pointer.configure(mode="P+1", dsp_cep="reset")
+                final = a.sequencer().Register()
+                final.load(base + rb_cmd_cache.index + rb_num_cache[0])
+                with a.sequencer().test(pointer != final):       # the gate loop
+                    with a.sequencer().repeat_until(pointer == final):
+                        with a.sequencer().repeat_until(
+                                a.channel_is_fifo_almost_empty(stim.channel)):
+                            pass
+                        command = a.sequencer().bus_read(
+                            pointer, latency=a._bus_latency("cache"))
+                        with a.channel_synchronizer(block=False):
+                            a.schedule_direct(stim.channel, command)
+                        pointer.pulse_cep()
+                with a.sequencer().repeat_until(
+                        a.channel_is_fifo_almost_empty(stim.channel)):
+                    pass
+                with a.channel_synchronizer(block=False):        # NEW: a batch right after
+                    for _ in range(5):
+                        stim.schedule_pulse(pulse)
+                with a.sequencer().repeat_until(a.channel_is_fifo_empty(stim.channel)):
+                    pass
+                with a.channel_synchronizer():
+                    stim.schedule_pulse(pulse)         # ch0 post-batch pulse
+                    idle.schedule_pulse(pulse)         # ch2 discriminator
+
+            elif self.case == "batch_concurrent_blocking":
+                # A block=False batch on ch0 (drained), then a BLOCKING pulse on ch1 -- which
+                # the sequencer cannot issue until ch0's fifo_empty drain releases (last pulse
+                # pulled), so ch1's pulse plays CONCURRENTLY with ch0's still-draining last
+                # batch pulse. relayout, blind to the drain, fires ch1 right after its own
+                # reference instead. ch1's ref->pulse interval discriminates; idle ch2 gets a
+                # final readout too.
+                c0, c1, idle = stimuli[0], stimuli[1], stimuli[2]
+                with a.channel_synchronizer():
+                    c0.schedule_pulse(pulse)
+                    c1.schedule_pulse(pulse)           # ch1 reference marker (t0)
+                    idle.schedule_pulse(pulse)
+                with a.channel_synchronizer(block=False):
+                    for _ in range(8):
+                        c0.schedule_pulse(pulse)       # long batch on ch0
+                with a.sequencer().repeat_until(a.channel_is_fifo_empty(c0.channel)):
+                    pass
+                with a.channel_synchronizer():
+                    c1.schedule_pulse(pulse)           # ch1 blocking pulse (concurrent w/ ch0 tail)
+                with a.channel_synchronizer():
+                    idle.schedule_pulse(pulse)         # ch2 discriminator
 
             elif self.case == "barrier_single_channel":
                 # The barrier pattern real runtimes actually use: exactly ONE channel
@@ -442,9 +673,11 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # rb_stream plays its gate set, initial pulse and readout marker on ch0 only, so
         # those extra pulses are allocated/loaded on stimulus0 alone (allocating them on the
         # idle channels would just waste DAC memory).
-        rb_pulses = ([] if self.case != "rb_stream" else list(dict.fromkeys(
-            list(self.rb_gates) + [self.rb_initial_pulse, self.rb_readout_pulse]
-            + ([self.rb_loop_gate] if self.rb_loop_gate else []))))
+        rb_pulses = ([] if self.case not in STREAM_CASES
+                     else list(dict.fromkeys(
+                         list(self.rb_gates) + [self.rb_initial_pulse, self.rb_readout_pulse]
+                         + ([self.rb_loop_gate] if self.rb_loop_gate else [])
+                         + ([self.rb_final_gate] if self.rb_final_gate else []))))
 
         def names_for(index):
             return pulses_used + (rb_pulses if index == 0 else [])
@@ -467,7 +700,7 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             cache[0] = self.acadia.seconds_to_cycles(self.register_dwell)
         elif self.case.startswith("test_"):
             cache[0] = int(self.test_register_value)
-        elif self.case == "rb_stream":
+        elif self.case in STREAM_CASES:
             # Load one DMA command per pattern slot: each is the cached word that plays
             # that gate's waveform. Decoding it back to (address -> pulse, length) is
             # exactly what the tracer fix will do off the captured cache.

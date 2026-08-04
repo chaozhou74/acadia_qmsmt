@@ -189,7 +189,8 @@ test_false                  4      [95.0, 80.0]     0.10 ns     body skipped, ga
 
 Run `timing_validation.py --revalidate` for the full table.
 
-`sequencer_block_gaps()` reports four contributions per boundary:
+The boundary-gap model (`edge_gap()`, applied by the execution-model layout) has four
+contributions per blocking boundary:
 
 | term | where it comes from |
 |---|---|
