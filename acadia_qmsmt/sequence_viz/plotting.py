@@ -314,8 +314,10 @@ def _legend_labels(trace, colors, color_by, group_copies):
 
 
 def lane_label(trace, channel):
+    # One io per line: several ios sharing a physical channel joined with '/' ran wide and
+    # ate horizontal plot space, so stack them under the channel name instead.
     ios = trace.channel_ios.get(channel, [])
-    return f"{channel}\n{'/'.join(ios)}" if ios else channel
+    return "\n".join([channel, *ios]) if ios else channel
 
 
 def _hide_overflowing_labels(marks, ax):
