@@ -10,12 +10,15 @@ of an mmap, which keeps ``load_pulse``, ``load_windows`` and cache writes workin
 -- they simply write into host memory. Everything that talks to the RFDC, the
 NCOs or the sequencer GPIO is replaced with a no-op.
 """
+import logging
 import tempfile
 from contextlib import contextmanager
 
 import numpy as np
 
 from acadia.system import Acadia
+
+logger = logging.getLogger(__name__)
 
 
 class StopDryRun(Exception):
@@ -323,6 +326,42 @@ def hardware_stubbed(on_run, runtime=None, allow_instruments=False):
         patch(klass, "final_serve", noop)
     for klass in io_classes:
         patch(klass, "set_frequency", noop)
+
+    # InputOutput.__getattr__ forwards any unknown attribute to the underlying Channel -- a
+    # C extension type whose NCO/phase/frequency methods raise "... may only be called on
+    # RFSoC hardware" off the board. A runtime that calls a Channel method straight through
+    # the io in main() (e.g. MeasurableResonator.reset_nco_phase -> io.reset_nco_phase())
+    # bypasses the set_frequency stub above and aborts the trace. Channel is immutable so it
+    # can't be patched; instead swap __getattr__ for one that forwards as usual but turns a
+    # forwarded call hitting that guard into a no-op -- generically, for any such method.
+    warned = set()
+
+    def hardware_safe_getattr(self, name):
+        attr = getattr(self._channel, name)      # same lookup the real __getattr__ does
+        if not callable(attr):
+            return attr
+
+        def hardware_noop(*args, **kwargs):
+            try:
+                return attr(*args, **kwargs)
+            except SystemError as exc:
+                if "RFSoC hardware" in str(exc):
+                    if name not in warned:       # once per method, not once per call
+                        warned.add(name)
+                        logger.warning(
+                            "dry run: skipped RFSoC-only Channel.%s() (returned None); "
+                            "off-hardware trace only", name)
+                    return None
+                raise
+
+        return hardware_noop
+
+    getattr_classes = [_defining_class(InputOutput, "__getattr__")]
+    if runtime is not None:
+        for io in getattr(runtime, "_ios", {}).values():
+            getattr_classes.append(_defining_class(type(io), "__getattr__"))
+    for klass in dict.fromkeys(getattr_classes):     # de-dup, keep order
+        patch(klass, "__getattr__", hardware_safe_getattr)
 
     if not allow_instruments:
         def blocked(self, *a, **k):
