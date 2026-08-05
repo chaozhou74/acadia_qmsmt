@@ -191,8 +191,8 @@ class ResonatorSpectroscopyRuntime(QMsmtRuntime):
         else:
             filtered_freq = {"f_in_modified": np.round(self.fitted_f0.n)}
 
-        self.update_io_yaml_field("stimulus", "channel_config.nco_frequency", np.round(filtered_freq["f_in_modified"]))
-        self.update_io_yaml_field("capture", "channel_config.nco_frequency", np.round(filtered_freq["f_in_modified"]))
+        self.update_io_yaml_field("stimulus", "channel_config.nco_frequency", filtered_freq["f_in_modified"])
+        self.update_io_yaml_field("capture", "channel_config.nco_frequency", filtered_freq["f_in_modified"])
 
 
 

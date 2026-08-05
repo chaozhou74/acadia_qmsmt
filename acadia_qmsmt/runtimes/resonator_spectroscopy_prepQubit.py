@@ -120,6 +120,12 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         self.avg_iq_corrected = self.avg_iq * np.exp(1j * self.frequencies[:, np.newaxis] * e_delay * np.pi * 2)
         self.phase_corrected = np.array([np.unwrap(np.angle(iq)) for iq in self.avg_iq_corrected.T]).T
 
+        # max phase separation (circular distance)
+        phase_diff = np.abs(self.phase_corrected[:, 0] - self.phase_corrected[:, 1])
+        phase_diff_circ = np.minimum(phase_diff % (2 * np.pi), 2 * np.pi - phase_diff % (2 * np.pi))
+        self.max_sep_idx = np.argmax(phase_diff_circ)
+        self.f_max_sep = self.frequencies[self.max_sep_idx]
+
         if fit_type == "mag":
             from acadia_qmsmt.analysis.fitting import Lorentzian
             self.fit_g = Lorentzian(self.frequencies, np.abs(self.avg_iq[:, 0]))
@@ -159,18 +165,27 @@ class ResonatorSpectroscopyPrepQubitRuntime(QMsmtRuntime):
         for ax in axs:
             ax.grid(True)
 
+        colors = [line.get_color() for line in axs[0].get_lines()[:2]]
+        for ax in axs:
+            ax.axvline(self.fitted_f0_g.n, ls=":", color=colors[0], label=f"f0_g: {self.fitted_f0_g}")
+            ax.axvline(self.fitted_f0_e.n, ls=":", color=colors[1], label=f"f0_e: {self.fitted_f0_e}")
+            ax.axvline(self.f_max_sep, ls="--", color="gray", label=f"max sep: {self.f_max_sep:.6g} Hz")
+            
+            ax.legend()
         fig.tight_layout()
         return fig, axs
 
 
     @annotate_method(button_name="update readout freq")
-    def update_freq(self, ro_freq:Literal["ge center", "f_ro^g", "f_ro^e"]="ge center"):
-        if ro_freq == "ge center":
-            f0 = (self.fitted_f0_g + self.fitted_f0_e)/2
-        elif ro_freq == "f_ro^g":
-            f0 = self.fitted_f0_g
-        elif ro_freq == "f_ro^e":
-            f0 = self.fitted_f0_e
-        self.update_io_yaml_field("stimulus", f"channel_config.nco_frequency", f0.n)
-        self.update_io_yaml_field("capture", f"channel_config.nco_frequency", f0.n)
-
+    def update_freq(self, ro_freq:Literal["ge center", "f_ro^g", "f_ro^e", "max separation"]="ge center"):
+            if ro_freq == "ge center":
+                f0 = (self.fitted_f0_g + self.fitted_f0_e)/2
+            elif ro_freq == "f_ro^g":
+                f0 = self.fitted_f0_g
+            elif ro_freq == "f_ro^e":
+                f0 = self.fitted_f0_e
+            elif ro_freq == "max separation":
+                f0 = self.f_max_sep
+            f0_val = getattr(f0, 'n', f0)
+            self.update_io_yaml_field("stimulus", f"channel_config.nco_frequency", f0_val)
+            self.update_io_yaml_field("capture", f"channel_config.nco_frequency", f0_val)

@@ -62,6 +62,8 @@ class BSChevronRuntime(QMsmtRuntime):
         # delay value to the sequencer so that we don't have to reassemble every time
         cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
         prep_capture_mem = readout_capture_io.get_waveform_memory(self.capture_memory_name).duplicate()
+        swap_pulse_duplicate = bs_stimulus_io.duplicate_pulse(self.bs_pulse_name, "swap_pulse_duplicate",
+                                                              use_stretch=True)
 
         def sequence(a: Acadia):
             # Initialize a DSP to act as a counter
@@ -77,7 +79,7 @@ class BSChevronRuntime(QMsmtRuntime):
                 qubit.schedule_pulse(self.qubit_pulse_name)
                 qubit_stimulus_io.dwell(10e-9)
                 a.barrier()
-                bs_stimulus_io.schedule_pulse(self.bs_pulse_name, stretch_length=bs_length_reg)
+                bs_stimulus_io.schedule_pulse(swap_pulse_duplicate, stretch_length=bs_length_reg)
 
 
             with a.channel_synchronizer():
@@ -94,7 +96,7 @@ class BSChevronRuntime(QMsmtRuntime):
         qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
         my_bs_scale = self.bs_amp if self.bs_amp is not None else bs_stimulus_io.get_config("pulses", self.bs_pulse_name, "scale")
-        bs_stimulus_io.load_pulse(self.bs_pulse_name, scale=my_bs_scale)
+        bs_stimulus_io.load_pulse(swap_pulse_duplicate, scale=my_bs_scale)
 
         # Determine how many cycles each flat_length_list should be
         stretch_cycles = self.acadia.seconds_to_cycles(self.flat_length_list)

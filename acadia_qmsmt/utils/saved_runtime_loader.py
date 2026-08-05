@@ -156,7 +156,6 @@ def load_runtime_from_data_dir(data_directory: str, use_saved_qmsmt: bool = True
     return rt
 
 
-
 if __name__ == "__main__":
     # example usage:
     path = "/home/chao/Data/test_gui/AmpSweep/250414_183827"

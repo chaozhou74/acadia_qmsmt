@@ -1,0 +1,32 @@
+import numpy as np
+from acadia_qmsmt.analysis.fitting.fitter_base import FitterBase
+
+# Disclaimer: written by Claude -- JWOG
+class StretchedExpCosine(FitterBase):
+    @staticmethod
+    def model(coordinates, A, f, phi, tau, beta, of) -> np.ndarray:
+        """A * cos(2 pi f x + phi) * exp(-(x / tau) ** beta) + of"""
+        return A * np.cos(f * np.pi * 2 * coordinates + phi) * np.exp(-((coordinates / tau) ** beta)) + of
+
+    @staticmethod
+    def guess(coordinates, data):
+        of = np.mean(data)
+        A = (np.max(data) - np.min(data)) / 2.0
+
+        fft_val = np.fft.rfft(data)[1:]
+        fft_frq = np.fft.rfftfreq(data.size, np.mean(coordinates[1:] - coordinates[:-1]))[1:]
+        idx = np.argmax(np.abs(fft_val))
+        f = fft_frq[idx]
+
+        # robust phase estimation
+        omega = 2 * np.pi * f * coordinates
+        cos_part = np.cos(omega)
+        sin_part = np.sin(omega)
+        B, C = np.linalg.lstsq(np.stack([cos_part, sin_part], axis=1), data - of, rcond=None)[0]
+        phi = np.arctan2(-C, B)
+
+        tau_ = (1 / 3.0) * (coordinates[-1] - coordinates[0])
+        tau = {"value": tau_, "min": (coordinates[1] - coordinates[0]) / 10}
+        beta = {"value": 1.0, "min": 0.1, "max": 5.0}
+
+        return dict(A=A, f=f, phi=phi, tau=tau, beta=beta, of=of)
