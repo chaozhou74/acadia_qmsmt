@@ -1,0 +1,26 @@
+# Machine- and board-specific paths for the sequence_viz validation harness.
+#
+# Copy this file to `paths.local.yaml` (which is gitignored) and fill in the
+# values for your station. Environment variables SEQVIZ_BOARD_IP and
+# SEQVIZ_LOOPBACK_DATA_ROOT override the corresponding keys.
+#
+# None of this is needed for `timing_validation.py --dryrun` or for the core
+# module -- only for deploying to a board, re-analysing archived runs, and
+# selftest.py.
+
+# Loopback board that timing cases are deployed to (--case / --all).
+board_ip: "10.0.0.1"
+
+# Where deployed loopback runs are archived, and what --revalidate / --analyse read.
+loopback_data_root: "/path/to/test_loopback"
+
+# Optional: station config for the loopback board. Defaults to
+# validation_board_config.yaml next to timing_validation.py if omitted.
+# yaml_path: "/path/to/validation_board_config.yaml"
+
+# Archived runs for the renderer regression (selftest.py): label -> data folder.
+# One folder per runtime class makes a good varied test set.
+selftest_folders:
+  # SimulBus: "/path/to/.../260713/100657"
+  # DR tomo:  "/path/to/.../005805"
+  # loopback: "/path/to/test_loopback/three_blocks/260727_023347"
