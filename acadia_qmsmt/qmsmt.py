@@ -1460,6 +1460,18 @@ class MeasurableResonator:
         """
         self._stimulus.load_pulse(pulse_name, pulse, zero_pad, **kwargs)
 
+    def reset_nco_phase(self):
+        """
+        Perform a simultaneous reset the NCO phase of the stimulus and the capture.
+        Useful for ensuring that the readout phase is consistent between runs, without having to worry about the
+        sub-milliHertz frequency misalignment between the two channels
+        """
+        self._stimulus.reset_nco_phase()
+        self._capture.reset_nco_phase()
+        self._stimulus._acadia.update_ncos_synchronized()
+        self._stimulus._acadia.update_ncos_synchronized()  # somehow this is needed to ensure that the nco update is actaully finished, and simply wating for extra 5us does not work
+
+
 class Qubit:
     """
     A collection of functions that are useful for manipulating and measuring a qubit.
