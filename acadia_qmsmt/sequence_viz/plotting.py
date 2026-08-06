@@ -197,7 +197,11 @@ def branch_regions(trace):
                              # so the caption states it instead of "count data-dependent"
                              "stream_count": (len(block.commands)
                                               if getattr(block, "stream", False)
-                                              else None)}])
+                                              else None),
+                             # a repeat_until whose count was resolved from its condition
+                             # register (see repeat_until_count) -- caption states it too
+                             "repeat_count": getattr(
+                                 trace, "repeat_counts", {}).get(block.index)}])
         previous = block.index
     return [(a, b, c, d) for a, b, c, d in regions]
 
@@ -224,6 +228,11 @@ def branch_caption(trace, context, info):
         if count is not None:
             return (f"repeat_until({condition}) — {count} gates from cache "
                     f"(this sweep point)")
+        # A counter loop whose target register resolved: draw and label the real count.
+        count = info.get("repeat_count")
+        if count is not None:
+            return (f"repeat_until({condition}) — pass {info['iteration'] + 1} "
+                    f"of {count} (this sweep point)")
         return (f"repeat_until({condition}) — 1 pass shown; "
                 f"real count is data-dependent")
     if kind == "test":

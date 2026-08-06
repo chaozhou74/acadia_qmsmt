@@ -59,6 +59,12 @@ MEASURED_BRANCH_PENALTY = 3
 # `test` condition strings come from dryrun's branch_recorder (a rendering of the Python
 # condition object), NOT from the compiled program -- so this stays a small text match.
 CONDITION_RE = re.compile(r"^(REG\d+)\s*(==|!=|<=|>=|<|>)\s*(\S+)$")
+# A counter-driven `repeat_until(counter == target)`: two operands (register/DSP names or
+# literals) around a comparison. Used to resolve how many times such a loop runs.
+COUNTER_RE = re.compile(r"^(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+)$")
+# The incrementing counter in that idiom is a DSP (loaded 0, +1 per pass); the other operand
+# is the target. `REG <op> literal` waits are NOT this -- their register is the varying side.
+COUNTER_NAME_RE = re.compile(r"DSP\d+")
 
 
 @dataclass
@@ -146,6 +152,7 @@ class SequenceTrace:
     placements: list = field(default_factory=list)   # what executes, loops unrolled
     control_flow: dict = field(default_factory=dict)
     loop_counts: dict = field(default_factory=dict)  # block index -> iterations to draw
+    repeat_counts: dict = field(default_factory=dict)  # block index -> resolved repeat_until count
     path_choices: dict = field(default_factory=dict)  # block index -> take test body?
     assumed_paths: set = field(default_factory=set)   # tests we could not decide
     unsupported_paths: set = field(default_factory=set)  # KI_004: speculation=False
@@ -304,13 +311,62 @@ class SequenceTrace:
                 "<": value < literal, "<=": value <= literal,
                 ">": value > literal, ">=": value >= literal}.get(operator)
 
+    def _operand_value(self, token):
+        """Resolve a condition operand to an int, or None.
+
+        A literal, or a register pinned by an override / fed from this point's cache.
+        Counters (DSPs) and anything unknown return None.
+        """
+        try:
+            return int(token, 0)
+        except ValueError:
+            pass
+        if token in self.register_overrides:
+            return int(self.register_overrides[token])
+        value = self.register_cycles.get(token)
+        return int(value) if value is not None else None
+
+    def repeat_until_count(self, context):
+        """Iterations a counter-driven ``repeat_until`` runs, or None if not resolvable.
+
+        The idiom (DR_RB.py, the RepeatTomo runtimes): a DSP counter loaded 0 and
+        incremented +1 per pass, ``repeat_until(DSP_counter == target)`` where ``target`` is
+        a register fed from the per-point cache (or pinned via an override) or a literal. The
+        counter reaches ``target`` after exactly ``target`` passes, so the drawn count is the
+        target's value.
+
+        Only that form resolves: exactly one operand must be the ``DSPn`` counter, and the
+        other must resolve to a value. Everything else -- a fifo-empty drain, a countdown or
+        wait register compared to a literal (``REG1 == 0``, whose register value is *not*
+        statically known so the literal is not the count), a ``<``/``>`` bound -- returns
+        None, and the caller falls back to drawing one data-dependent pass.
+        """
+        if context.get("kind") != "repeat_until":
+            return None
+        match = COUNTER_RE.match((context.get("condition") or "").strip())
+        if not match or match.group(2) != "==":
+            return None
+        left, right = match.group(1), match.group(3)
+        left_dsp = bool(COUNTER_NAME_RE.fullmatch(left))
+        right_dsp = bool(COUNTER_NAME_RE.fullmatch(right))
+        if left_dsp == right_dsp:            # need exactly one DSP counter operand
+            return None
+        count = self._operand_value(right if left_dsp else left)
+        if count is None or count < 0:
+            return None
+        return count
+
     def execution_plan(self):
         """``[(block index, iteration), ...]`` in the order the sequencer runs them.
 
         Consecutive blocks sharing the same innermost ``loop``/``repeat_until`` context form
-        one body, repeated ``loop_counts[first block]`` times (default: the loop's own count
-        for ``loop``, 1 for ``repeat_until``, whose count is data-dependent).
+        one body. A ``loop`` repeats its own deterministic count. A ``repeat_until`` repeats
+        the count :meth:`repeat_until_count` resolves from its condition register/literal
+        (recorded in :attr:`repeat_counts`); when that can't be resolved the count is
+        data-dependent, so one pass is drawn. A user ``loop_counts[first block]`` overrides
+        either.
         """
+        self.repeat_counts = {}
         plan, index = [], 0
         while index < len(self.blocks):
             block = self.blocks[index]
@@ -346,9 +402,20 @@ class SequenceTrace:
                         self.assumed_paths.add(index)
                 if taken:
                     plan.extend((member, 0) for member in body)
+            elif context["kind"] == "repeat_until":
+                # count from the loop's condition register/literal when resolvable
+                # (recorded so the caption can state it); else data-dependent -> one pass.
+                count = self.loop_counts.get(index)
+                if count is None:
+                    count = self.repeat_until_count(context)
+                    if count is not None:
+                        self.repeat_counts[index] = int(count)
+                if count is None:
+                    count = 1
+                for iteration in range(max(int(count), 0)):
+                    plan.extend((member, iteration) for member in body)
             else:
-                # loop: deterministic count, unrolled. repeat_until: count is
-                # data-dependent, so one pass, labelled as such by the renderer.
+                # loop: deterministic count, unrolled.
                 count = self.loop_counts.get(index, context.get("count") or 1)
                 for iteration in range(max(int(count), 1)):
                     plan.extend((member, iteration) for member in body)
@@ -378,7 +445,8 @@ class SequenceTrace:
         * cache-fed registers resolve themselves from the per-point cache, so
           their value is shown but not settable. One may drive a command length
           (``is_length``, shown in cycles/ns) or only a ``test``/``repeat_until``
-          condition (shown as the raw register value).
+          condition (shown as the raw register value -- which, when it is a loop
+          target, is the count the loop is drawn for; it follows the sweep point).
         * register/DSP-driven command *lengths* not recoverable from the cache
           (``resolution`` "fallback"/"override") -- the only thing worth setting,
           via :attr:`register_overrides`.
