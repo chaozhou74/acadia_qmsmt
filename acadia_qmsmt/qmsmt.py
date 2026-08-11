@@ -1,22 +1,29 @@
+import re
 import sys
 import shutil
 import os
+import zipfile
 from typing import Callable, Literal, Dict, List, Any, Union, Literal, Tuple
 from pathlib import Path
 import json
 import logging
 import math
 import functools
+import uuid
+import time
 
 import numpy as np
+import requests
 from numpy.typing import NDArray
 from scipy.signal.windows import hann as scipy_hann
 
 from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Operation
 from acadia.compiler import ManagedResource, Symbol
 from acadia.sample_arithmetic import complex_to_sample
+from acadia.data import DataManager
 
 from itertools import product
+from datetime import datetime
 
 ##############################################################
 # Todo: IN ACADIA_QMSMT
@@ -1170,12 +1177,15 @@ class QMsmtRuntime(Runtime):
         new_cfg = update_yaml(yaml_path, {f"{yaml_key}.{config_field}": value}, verbose=verbose)
         logger.info(f"!! updated yaml file `{yaml_path}`: {yaml_key}.{config_field}: {value}")
         return new_cfg
+    
 
     
-    def wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = True):
+    def _wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = False):
         """
         wait for the deployment to complete by joining the event loop.
-        :param suppress_data_sync_warnings: If True, suppress warnings related to data synchronization.
+        :param suppress_data_sync_warnings: If True, hide ALL data-sync warnings for the whole
+            wait. Off by default: deploy() already hides the normal start-up chatter for a few
+            seconds, so a genuine, persistent sync problem still reaches you.
         """
         from acadia_qmsmt.utils import suppress_data_sync_messages
         try:
@@ -1187,7 +1197,91 @@ class QMsmtRuntime(Runtime):
             self.finalize()
             logger.info("Cleanup complete.")
 
-    def deploy(self, *args, no_backup: bool = False, **kwargs):
+
+    def _get_local_dir_from_job_id(self, server_url: str = "http://10.66.152.190:8000/",
+                                    job_id: str = None) -> str:
+        """
+        Look up the directory where a job's data is (or will be) saved, by its
+        `client_job_id`. Checks the server's completed jobs, its current
+        (running/waiting) job, and its recent errors, in that order. This is
+        the path as the SERVER's filesystem sees it — not necessarily the
+        same path the client would use to reach the same location (e.g. over
+        a network mount).
+
+        :param server_url: The HTTP address of the FastAPI queue server. Must
+            match the `server_url` passed to `deploy()`.
+        :param job_id: The client-generated job ID to look up. Defaults to
+            this instance's `_job_id` (the most recently deployed job).
+        :raises RuntimeError: If no job_id is available, or no job with this
+            ID (and a recorded save path) is found on the server.
+        :return: The absolute save-path on the server for this job's data.
+        """
+        if job_id is None:
+            if not hasattr(self, "_job_id"):
+                raise RuntimeError("No job has been deployed yet; call `deploy()` before "
+                                   "looking up its local directory.")
+            job_id = self._job_id
+
+        response = requests.get(f"{server_url}/status")
+        status = response.json()
+
+        candidates = (
+            list(status.get("completed_jobs", []))
+            + [status.get("current_job") or {}]
+            + list(status.get("recent_errors", []))
+        )
+        for job in candidates:
+            if job.get("client_job_id") == job_id:
+                save_path = job.get("save_path")
+                if save_path is None:
+                    raise RuntimeError(f"Job '{job_id}' was found on the server, but it has "
+                                       "no recorded save_path yet.")
+                return save_path
+
+        raise RuntimeError(f"No job with client_job_id '{job_id}' found on the server.")
+
+    def wait_for_deploy_completion(self, server_url: str = "http://10.66.152.190:8000/",
+                                      poll_interval: float = 1.0) -> dict:
+        """
+        Block until the job most recently submitted via `deploy()` finishes on
+        the server, by polling the server's `/status` endpoint for this
+        instance's `_job_id`. Unlike `_wait_for_deploy_completion`, this works
+        on the client, since it does not rely on the server's `_event_loop`.
+
+        :param server_url: The HTTP address of the FastAPI queue server. Must
+            match the `server_url` passed to `deploy()`.
+        :param poll_interval: Seconds to wait between polls of `/status`.
+        :raises RuntimeError: If `deploy()` has not been called yet, or if the
+            job fails on the server (status "Failed/Error").
+        :return: The job's entry from the server's `completed_jobs` list
+            (contains `status`, `duration_s`, `completed_at`, etc.).
+        """
+        if not hasattr(self, "_job_id"):
+            raise RuntimeError("No job has been deployed yet; call `deploy()` before "
+                               "waiting on server completion.")
+
+        job_id = self._job_id
+        while True:
+            response = requests.get(f"{server_url}/status")
+            status = response.json()
+
+            for error in status.get("recent_errors", []):
+                if error.get("client_job_id") == job_id:
+                    raise RuntimeError(
+                        f"Job '{job_id}' failed on the server: {error.get('error')}\n"
+                        f"{error.get('traceback', '')}"
+                    )
+
+            for completed in status.get("completed_jobs", []):
+                if completed.get("client_job_id") == job_id:
+                    local_dir = self._get_local_dir_from_job_id(server_url=server_url, job_id=job_id)
+                    self.data_manager = DataManager()
+                    self.data_manager.load(local_dir)
+                    return completed
+
+            time.sleep(poll_interval)
+
+    def _deploy(self, *args, no_backup: bool = False, **kwargs):
         """
         Call Runtime.deploy with the same arguments and then create a
         '.no_backup_flag' file in the resulting local data directory.
@@ -1207,7 +1301,31 @@ class QMsmtRuntime(Runtime):
             except Exception as e:
                 logger.warning("Failed to create .no_backup_flag in %s: %s", getattr(self, "local_directory", "?"), e)
 
-        
+    def _compute_job_id(self, current_time: datetime, username: str, base_save_path: str, id_len: int = 12) -> str:
+        """
+        Deterministically derive a 12-hex-char job ID from this runtime's
+        class, its fields (the same ones `_dump_fields` would serialize), and
+        its destination, salted with the deploy timestamp (down to the
+        microsecond). Reproducible given the exact same inputs, but two
+        back-to-back deploys of an otherwise-identical runtime still get
+        distinct IDs since the timestamp differs between them.
+        """
+        fields = {}
+        for name, type_hint in self._get_fields().items():
+            if type_hint is IOConfig:
+                fields[name] = self._ios[name]._config
+            else:
+                fields[name] = getattr(self, name)
+
+        name_string = repr((
+            self.__class__.__name__,
+            username,
+            base_save_path,
+            make_hash(fields),
+            current_time.isoformat(),
+        ))
+        return uuid.uuid5(uuid.NAMESPACE_OID, name_string).hex[:id_len]
+
 
 
 class MeasurableResonator:
