@@ -152,7 +152,19 @@ def update_yaml(yaml_path: str, new_param_dict: dict, verbose=False):
         if not allow_new_key and items[-1] not in root:
             raise KeyError(f"Key '{items[-1]}' does not exist in path: {'.'.join(items)}")
 
-        root[items[-1]] = value
+        key = items[-1]
+        # If both the existing and new values are dicts, update the existing mapping
+        # in place instead of replacing it, so ruamel's attached comments/blank lines
+        # (stored on the CommentedMap object itself) are preserved.
+        if isinstance(value, dict) and isinstance(root.get(key), dict):
+            existing = root[key]
+            for k in list(existing.keys()):
+                if k not in value:
+                    del existing[k]
+            for k, v in value.items():
+                existing[k] = v
+        else:
+            root[key] = value
 
 
     def float_representer(dumper, data):

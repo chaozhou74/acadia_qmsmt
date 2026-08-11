@@ -2,28 +2,22 @@ import re
 import sys
 import shutil
 import os
-import zipfile
 from typing import Callable, Literal, Dict, List, Any, Union, Literal, Tuple
 from pathlib import Path
 import json
 import logging
 import math
 import functools
-import uuid
-import time
 
 import numpy as np
-import requests
 from numpy.typing import NDArray
 from scipy.signal.windows import hann as scipy_hann
 
 from acadia import Acadia, Channel, Runtime, WaveformMemory, WaveformMemory, Operation
 from acadia.compiler import ManagedResource, Symbol
 from acadia.sample_arithmetic import complex_to_sample
-from acadia.data import DataManager
 
 from itertools import product
-from datetime import datetime
 
 ##############################################################
 # Todo: IN ACADIA_QMSMT
@@ -54,8 +48,11 @@ def make_hash(val):
     if val is None:
         return None
     elif isinstance(val, dict):
-        # Convert dict to a sorted tuple of (key, value) pairs, recursively hashable
-        return ("__dict__", tuple((k, make_hash(v)) for k, v in sorted(val.items())))
+        # Convert dict to a sorted tuple of (key, value) pairs, recursively hashable.
+        # Sort by repr() of the key rather than the key itself: dict keys aren't
+        # guaranteed to be a single, mutually-orderable type (e.g. a mix of str
+        # and None keys), but repr() always is.
+        return ("__dict__", tuple((k, make_hash(v)) for k, v in sorted(val.items(), key=lambda item: repr(item[0]))))
     elif isinstance(val, np.ndarray):
         # Store bytes, dtype, shape as metadata
         return ("__ndarray__", val.tobytes(), str(val.dtype), val.shape)
@@ -812,8 +809,7 @@ class InputOutput:
             # when decimate, the capture cycles need to be scaled to capture the full trace
             length_cycles = length_cycles * (decimation //4)
 
-        capture_dict = self.get_waveform_memory("readout_trace").__dict__
-        logger.debug(f"output_size_bytes {output_size_bytes}, capture_dict: {capture_dict}, length_cycles: {length_cycles}")
+        logger.debug(f"output_size_bytes {output_size_bytes}, capture_dict: {dst.__dict__}, length_cycles: {length_cycles}")
 
         self._acadia.stream(configuration=dsp_stream_config, 
                     dst=dst,
@@ -1180,12 +1176,12 @@ class QMsmtRuntime(Runtime):
     
 
     
-    def _wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = False):
+    def wait_for_deploy_completion(self, suppress_data_sync_warnings: bool = False):
         """
         wait for the deployment to complete by joining the event loop.
         :param suppress_data_sync_warnings: If True, hide ALL data-sync warnings for the whole
             wait. Off by default: deploy() already hides the normal start-up chatter for a few
-            seconds, so a genuine, persistent sync problem still reaches you.
+            seconds, so a genuine, persistent sync problem still reaches.
         """
         from acadia_qmsmt.utils import suppress_data_sync_messages
         try:
@@ -1197,91 +1193,7 @@ class QMsmtRuntime(Runtime):
             self.finalize()
             logger.info("Cleanup complete.")
 
-
-    def _get_local_dir_from_job_id(self, server_url: str = "http://10.66.152.190:8000/",
-                                    job_id: str = None) -> str:
-        """
-        Look up the directory where a job's data is (or will be) saved, by its
-        `client_job_id`. Checks the server's completed jobs, its current
-        (running/waiting) job, and its recent errors, in that order. This is
-        the path as the SERVER's filesystem sees it — not necessarily the
-        same path the client would use to reach the same location (e.g. over
-        a network mount).
-
-        :param server_url: The HTTP address of the FastAPI queue server. Must
-            match the `server_url` passed to `deploy()`.
-        :param job_id: The client-generated job ID to look up. Defaults to
-            this instance's `_job_id` (the most recently deployed job).
-        :raises RuntimeError: If no job_id is available, or no job with this
-            ID (and a recorded save path) is found on the server.
-        :return: The absolute save-path on the server for this job's data.
-        """
-        if job_id is None:
-            if not hasattr(self, "_job_id"):
-                raise RuntimeError("No job has been deployed yet; call `deploy()` before "
-                                   "looking up its local directory.")
-            job_id = self._job_id
-
-        response = requests.get(f"{server_url}/status")
-        status = response.json()
-
-        candidates = (
-            list(status.get("completed_jobs", []))
-            + [status.get("current_job") or {}]
-            + list(status.get("recent_errors", []))
-        )
-        for job in candidates:
-            if job.get("client_job_id") == job_id:
-                save_path = job.get("save_path")
-                if save_path is None:
-                    raise RuntimeError(f"Job '{job_id}' was found on the server, but it has "
-                                       "no recorded save_path yet.")
-                return save_path
-
-        raise RuntimeError(f"No job with client_job_id '{job_id}' found on the server.")
-
-    def wait_for_deploy_completion(self, server_url: str = "http://10.66.152.190:8000/",
-                                      poll_interval: float = 1.0) -> dict:
-        """
-        Block until the job most recently submitted via `deploy()` finishes on
-        the server, by polling the server's `/status` endpoint for this
-        instance's `_job_id`. Unlike `_wait_for_deploy_completion`, this works
-        on the client, since it does not rely on the server's `_event_loop`.
-
-        :param server_url: The HTTP address of the FastAPI queue server. Must
-            match the `server_url` passed to `deploy()`.
-        :param poll_interval: Seconds to wait between polls of `/status`.
-        :raises RuntimeError: If `deploy()` has not been called yet, or if the
-            job fails on the server (status "Failed/Error").
-        :return: The job's entry from the server's `completed_jobs` list
-            (contains `status`, `duration_s`, `completed_at`, etc.).
-        """
-        if not hasattr(self, "_job_id"):
-            raise RuntimeError("No job has been deployed yet; call `deploy()` before "
-                               "waiting on server completion.")
-
-        job_id = self._job_id
-        while True:
-            response = requests.get(f"{server_url}/status")
-            status = response.json()
-
-            for error in status.get("recent_errors", []):
-                if error.get("client_job_id") == job_id:
-                    raise RuntimeError(
-                        f"Job '{job_id}' failed on the server: {error.get('error')}\n"
-                        f"{error.get('traceback', '')}"
-                    )
-
-            for completed in status.get("completed_jobs", []):
-                if completed.get("client_job_id") == job_id:
-                    local_dir = self._get_local_dir_from_job_id(server_url=server_url, job_id=job_id)
-                    self.data_manager = DataManager()
-                    self.data_manager.load(local_dir)
-                    return completed
-
-            time.sleep(poll_interval)
-
-    def _deploy(self, *args, no_backup: bool = False, **kwargs):
+    def deploy(self, *args, no_backup: bool = False, **kwargs):
         """
         Call Runtime.deploy with the same arguments and then create a
         '.no_backup_flag' file in the resulting local data directory.
@@ -1290,6 +1202,11 @@ class QMsmtRuntime(Runtime):
         """
 
         super().deploy(*args, **kwargs)
+
+        # Hide the normal DataManager connect chatter for the first few seconds
+        # of the run; a persistent connection problem will still surface after.
+        from acadia_qmsmt.utils import add_data_sync_log_filter
+        add_data_sync_log_filter()
 
         # Create the flag file in the local data directory
         if no_backup:
@@ -1301,31 +1218,18 @@ class QMsmtRuntime(Runtime):
             except Exception as e:
                 logger.warning("Failed to create .no_backup_flag in %s: %s", getattr(self, "local_directory", "?"), e)
 
-    def _compute_job_id(self, current_time: datetime, username: str, base_save_path: str, id_len: int = 12) -> str:
-        """
-        Deterministically derive a 12-hex-char job ID from this runtime's
-        class, its fields (the same ones `_dump_fields` would serialize), and
-        its destination, salted with the deploy timestamp (down to the
-        microsecond). Reproducible given the exact same inputs, but two
-        back-to-back deploys of an otherwise-identical runtime still get
-        distinct IDs since the timestamp differs between them.
-        """
-        fields = {}
-        for name, type_hint in self._get_fields().items():
-            if type_hint is IOConfig:
-                fields[name] = self._ios[name]._config
-            else:
-                fields[name] = getattr(self, name)
 
-        name_string = repr((
-            self.__class__.__name__,
-            username,
-            base_save_path,
-            make_hash(fields),
-            current_time.isoformat(),
-        ))
-        return uuid.uuid5(uuid.NAMESPACE_OID, name_string).hex[:id_len]
+    def stop(self):
+        try:
+            super().stop()
+        except Exception as e:
+            logger.warning(f"Exception during stop: {e}. Trying remote stop with .stop() file")
+            directory = Path(self.local_directory)
+            directory.mkdir(parents=True, exist_ok=True)  # Create directory if needed
+            file = directory / ".stop"
+            file.touch()
 
+        
 
 
 class MeasurableResonator:
@@ -1555,6 +1459,18 @@ class MeasurableResonator:
         Load a pulse into the stimulus.
         """
         self._stimulus.load_pulse(pulse_name, pulse, zero_pad, **kwargs)
+
+    def reset_nco_phase(self):
+        """
+        Perform a simultaneous reset the NCO phase of the stimulus and the capture.
+        Useful for ensuring that the readout phase is consistent between runs, without having to worry about the
+        sub-milliHertz frequency misalignment between the two channels
+        """
+        self._stimulus.reset_nco_phase()
+        self._capture.reset_nco_phase()
+        self._stimulus._acadia.update_ncos_synchronized()
+        self._stimulus._acadia.update_ncos_synchronized()  # somehow this is needed to ensure that the nco update is actaully finished, and simply wating for extra 5us does not work
+
 
 class Qubit:
     """
@@ -2068,6 +1984,7 @@ class DRCavity:
 
         self.swap_pulse_name = swap_pulse_name
         self.bs50_pulse_name = bs50_pulse_name
+
 
     def measure_via_swap_1qb(self, readout_pulse_name:str, capture_memory_names:List[str], capture_window_name:str,
                             qubit:Qubit=None, qubit_swap_stimulus:InputOutput=None, qubit_swap_pulse_name:str=None,

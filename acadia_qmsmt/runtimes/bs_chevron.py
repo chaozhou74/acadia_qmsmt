@@ -1,4 +1,5 @@
 from typing import Union, Annotated
+from copy import deepcopy
 
 import numpy as np
 
@@ -31,7 +32,7 @@ class BSChevronRuntime(QMsmtRuntime):
 
     readout_pulse_name: str = "readout"
     capture_memory_name: str = "readout_accumulated"
-    capture_window_name: str = "boxcar"
+    capture_window_name: str = "matched"
 
     cool_swap_pulse_name: str = "swap"
     cool_qm_rounds: int = 2
@@ -61,6 +62,8 @@ class BSChevronRuntime(QMsmtRuntime):
         # delay value to the sequencer so that we don't have to reassemble every time
         cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
         prep_capture_mem = readout_capture_io.get_waveform_memory(self.capture_memory_name).duplicate()
+        swap_pulse_duplicate = bs_stimulus_io.duplicate_pulse(self.bs_pulse_name, "swap_pulse_duplicate",
+                                                              use_stretch=True)
 
         def sequence(a: Acadia):
             # Initialize a DSP to act as a counter
@@ -76,7 +79,7 @@ class BSChevronRuntime(QMsmtRuntime):
                 qubit.schedule_pulse(self.qubit_pulse_name)
                 qubit_stimulus_io.dwell(10e-9)
                 a.barrier()
-                bs_stimulus_io.schedule_pulse(self.bs_pulse_name, stretch_length=bs_length_reg)
+                bs_stimulus_io.schedule_pulse(swap_pulse_duplicate, stretch_length=bs_length_reg)
 
 
             with a.channel_synchronizer():
@@ -92,8 +95,8 @@ class BSChevronRuntime(QMsmtRuntime):
         readout_stimulus_io.load_pulse(self.readout_pulse_name)
         qubit_stimulus_io.load_pulse(self.qubit_pulse_name)
 
-        my_bs_scale = self.bs_amp if self.bs_amp is not None else bs_stimulus_io.get_config("pulses", self.bs_pulse_name, "scale")                                        
-        bs_stimulus_io.load_pulse(self.bs_pulse_name, scale=my_bs_scale)
+        my_bs_scale = self.bs_amp if self.bs_amp is not None else bs_stimulus_io.get_config("pulses", self.bs_pulse_name, "scale")
+        bs_stimulus_io.load_pulse(swap_pulse_duplicate, scale=my_bs_scale)
 
         # Determine how many cycles each flat_length_list should be
         stretch_cycles = self.acadia.seconds_to_cycles(self.flat_length_list)
@@ -179,9 +182,9 @@ class BSChevronRuntime(QMsmtRuntime):
             logger.warning(f"Failed to fit chevron fft result, {e}", exc_info=True)
             self.best_swap_time = None
             self.best_swap_freq = None
-        
-        self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")    
-        self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")    
+
+        self.bs_scale = self.bs_amp if self.bs_amp is not None else self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name, "scale")
+        self.bs_vop =self._ios["bs_stimulus"].get_config("channel_config", "vop")
         return completed_iterations
 
 
@@ -202,7 +205,16 @@ class BSChevronRuntime(QMsmtRuntime):
     def plot_linecut(self, axs=None):
         fig, axs = self.chevron_analysis.plot_linecut_fit(ax=axs, figsize=self.figsize)
         return fig, axs
-    
+
+    @annotate_method(plot_name="time axis averaged", axs_shape=(1,1))
+    def plot_time_meaned(self, axs=None):
+        from acadia_qmsmt.plotting import prepare_plot_axes
+        fig, ax = prepare_plot_axes(axs)
+        ax.plot(self.bs_frequencies, np.mean(self.avg_shots, axis=1))
+        ax.grid(True)
+        ax.set_xlabel("frequency")
+        return fig, ax
+
     # generate plots for each prep dynamically
     @annotate_method(is_customizer=True)
     def _generate_plots(self):
@@ -222,13 +234,34 @@ class BSChevronRuntime(QMsmtRuntime):
             setattr(self, "plot_prep_msmts", plot_factory("prep msmts"))
 
     
-    @annotate_method(button_name="coarse_swap_update")
-    def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable")):
+    @annotate_method(button_name="coarse_swap_and_bs50_update")
+    def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable", "bs50")):
         # Find the center frequency from the FFT data, use that for frequency
         if (self.best_swap_freq is not None) and (self.best_swap_time is not None):
+            # update NCO first
             self.update_io_yaml_field("bs_stimulus", f"channel_config.nco_frequency", self.best_swap_freq)
             if type(pulses)==str:
                 pulses = [pulses]
+
+            # take the pulse used for chevron, update its parameters based on the calibration
+            swap_config = deepcopy(self._ios["bs_stimulus"].get_config("pulses", self.bs_pulse_name))
+            swap_config["scale"] = self.bs_scale
+            swap_config["flat"] = self.best_swap_time
+
+            # bs50 uses half of the effective total time
+            bs50_config = deepcopy(swap_config)
+            swap_ramp = swap_config["ramp"] # ramp part is counted as half effective power
+            bs50_config["flat"] = np.round((self.best_swap_time / 2 - swap_ramp / 4) / 5e-9) * 5e-9
+
+            # apply the new config to designated pulses
+            available = self._ios["bs_stimulus"].get_config("pulses")
             for pulse in pulses:
-                self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.scale", self.bs_scale)
-                self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}.flat", self.best_swap_time)
+                if pulse in available:
+                    if pulse != "bs50":
+                        swap_config["use_stretch"] = available[pulse].get("use_stretch", False)
+                        self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}", swap_config)
+                    else:
+                        bs50_config["use_stretch"] = available[pulse].get("use_stretch", False)
+                        self.update_io_yaml_field("bs_stimulus", f"pulses.bs50", bs50_config)
+                else:
+                    logger.warning(f"Pulse {pulse} not found in bs_stimulus, not updated")
