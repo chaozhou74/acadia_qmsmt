@@ -13,6 +13,7 @@ NCOs or the sequencer GPIO is replaced with a no-op.
 import logging
 import tempfile
 from contextlib import contextmanager
+from itertools import count
 
 import numpy as np
 
@@ -166,6 +167,7 @@ def branch_recorder(stack):
     from acadia.sequencer import Sequencer
 
     originals = {}
+    entry_counter = count()
 
     def wrap(name, describe):
         original = getattr(Sequencer, name)
@@ -173,7 +175,15 @@ def branch_recorder(stack):
 
         @contextmanager
         def wrapped(self, *args, **kwargs):
-            stack.append(describe(args, kwargs))
+            context = describe(args, kwargs)
+            # One id per `with` entry, so two control-flow blocks that describe IDENTICALLY are
+            # still distinguishable. Sibling loops with the same condition are routine: cooling
+            # two qubits emits two `repeat_until(DSP0 == 1)` blocks in a row, and without an id
+            # SequenceTrace.execution_plan would merge them into one body and replay the pair
+            # together instead of each on its own count. The bodies run once here, at compile
+            # time, so one id per entry is exactly one id per control-flow block.
+            context["id"] = next(entry_counter)
+            stack.append(context)
             try:
                 with original(self, *args, **kwargs) as value:
                     yield value

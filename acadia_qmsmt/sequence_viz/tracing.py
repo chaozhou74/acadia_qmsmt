@@ -359,28 +359,54 @@ class SequenceTrace:
     def execution_plan(self):
         """``[(block index, iteration), ...]`` in the order the sequencer runs them.
 
-        Consecutive blocks sharing the same innermost ``loop``/``repeat_until`` context form
-        one body. A ``loop`` repeats its own deterministic count. A ``repeat_until`` repeats
-        the count :meth:`repeat_until_count` resolves from its condition register/literal
-        (recorded in :attr:`repeat_counts`); when that can't be resolved the count is
-        data-dependent, so one pass is drawn. A user ``loop_counts[first block]`` overrides
-        either.
+        Control flow NESTS, so this expands the block list depth by depth. At each depth,
+        consecutive blocks sharing that depth's context form one body -- and a body includes
+        everything nested INSIDE it, which is then expanded recursively for every pass. A
+        ``loop`` repeats its own deterministic count. A ``repeat_until`` repeats the count
+        :meth:`repeat_until_count` resolves from its condition register/literal (recorded in
+        :attr:`repeat_counts`); when that can't be resolved the count is data-dependent, so one
+        pass is drawn. A user ``loop_counts[first block of the body]`` overrides either.
+
+        Grouping at the CONTEXT'S OWN DEPTH is what makes a nested body repeat with its parent.
+        Matching the *innermost* context instead (what this did before 2026-08-11) silently
+        dropped nested blocks out of the enclosing body: for feedback cooling inside
+        ``cool_modes`` -- ``repeat_until(mode_DSP == 3)`` wrapping {mode swap, then
+        ``repeat_until(qubit_DSP == 1)`` around the measure/reset} -- the swap block's body
+        stopped at the swap, so the plan drew THREE swaps back to back and then the cooling
+        ONCE, in the wrong order. The compiled program has one swap inside the loop; the
+        sequence was right and the drawing was wrong.
         """
         self.repeat_counts = {}
-        plan, index = [], 0
-        while index < len(self.blocks):
-            block = self.blocks[index]
-            context = block.conditional[-1] if block.conditional else None
-            if context is None:
-                plan.append((index, 0))
-                index += 1
+        return self._expand_contexts(list(range(len(self.blocks))), 0, 0)
+
+    def _expand_contexts(self, members, depth, iteration):
+        """Expand ``members`` (block indices, in address order) below control-flow ``depth``.
+
+        ``iteration`` is stamped on blocks that bottom out here (no context deeper than
+        ``depth``), so every placement reports the pass of its own innermost loop.
+        """
+        plan, i = [], 0
+        while i < len(members):
+            index = members[i]
+            stack = self.blocks[index].conditional
+            if len(stack) <= depth:          # not inside any context at this depth
+                plan.append((index, iteration))
+                i += 1
                 continue
 
-            body = [index]
-            while (body[-1] + 1 < len(self.blocks)
-                   and self.blocks[body[-1] + 1].conditional
-                   and self.blocks[body[-1] + 1].conditional[-1] == context):
-                body.append(body[-1] + 1)
+            context = stack[depth]
+            # The body is every consecutive member inside THIS context, nesting included.
+            # Identical sibling loops are told apart by the id branch_recorder stamps on each
+            # `with` entry (two cool_qubits calls both read `repeat_until(DSP0 == 1)`); when
+            # that id is absent -- an older trace -- this falls back to comparing the context
+            # by value, which merges such siblings into one body.
+            j = i + 1
+            while (j < len(members)
+                   and len(self.blocks[members[j]].conditional) > depth
+                   and self._same_context(self.blocks[members[j]].conditional[depth], context)):
+                j += 1
+            body = members[i:j]
+            first = body[0]
 
             if context["kind"] == "test" and context.get("speculation") is False:
                 # KI_004: with speculation=False the body is placed OUT OF LINE, so address
@@ -388,39 +414,47 @@ class SequenceTrace:
                 # apply -- measured 25 ns out on the taken arm, and the skipped arm hangs
                 # the sequencer outright. Draw the body but flag the path as unmodelled
                 # rather than assert a timeline we know is wrong.
-                self.assumed_paths.add(index)
-                self.unsupported_paths.add(index)
-                plan.extend((member, 0) for member in body)
+                self.assumed_paths.add(first)
+                self.unsupported_paths.add(first)
+                plan.extend(self._expand_contexts(body, depth + 1, 0))
             elif context["kind"] == "test":
                 # explicit choice wins; otherwise try to decide it from the cache;
                 # otherwise assume the body runs (and say so via `assumed_paths`)
-                taken = self.path_choices.get(index)
+                taken = self.path_choices.get(first)
                 if taken is None:
                     taken = self.evaluate_condition(context.get("condition"))
                     if taken is None:
                         taken = True
-                        self.assumed_paths.add(index)
+                        self.assumed_paths.add(first)
                 if taken:
-                    plan.extend((member, 0) for member in body)
+                    plan.extend(self._expand_contexts(body, depth + 1, 0))
             elif context["kind"] == "repeat_until":
                 # count from the loop's condition register/literal when resolvable
                 # (recorded so the caption can state it); else data-dependent -> one pass.
-                count = self.loop_counts.get(index)
+                count = self.loop_counts.get(first)
                 if count is None:
                     count = self.repeat_until_count(context)
                     if count is not None:
-                        self.repeat_counts[index] = int(count)
+                        self.repeat_counts[first] = int(count)
                 if count is None:
                     count = 1
-                for iteration in range(max(int(count), 0)):
-                    plan.extend((member, iteration) for member in body)
+                for pass_index in range(max(int(count), 0)):
+                    plan.extend(self._expand_contexts(body, depth + 1, pass_index))
             else:
                 # loop: deterministic count, unrolled.
-                count = self.loop_counts.get(index, context.get("count") or 1)
-                for iteration in range(max(int(count), 1)):
-                    plan.extend((member, iteration) for member in body)
-            index = body[-1] + 1
+                count = self.loop_counts.get(first, context.get("count") or 1)
+                for pass_index in range(max(int(count), 1)):
+                    plan.extend(self._expand_contexts(body, depth + 1, pass_index))
+            i = j
         return plan
+
+    @staticmethod
+    def _same_context(a, b):
+        """Is this the same control-flow block instance? Prefer the per-entry id."""
+        a_id, b_id = a.get("id"), b.get("id")
+        if a_id is not None and b_id is not None:
+            return a_id == b_id
+        return a == b
 
     @property
     def length_cycles(self):
