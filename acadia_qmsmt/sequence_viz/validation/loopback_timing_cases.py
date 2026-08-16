@@ -46,6 +46,25 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          "barrier_single_channel", "rb_stream", "rb_stream_uniform", "batch_resync",
          "simulbus_transition", "batch_two_channels", "batch_uneven", "batch_interleaved",
          "loop_batch", "stream_then_batch", "batch_concurrent_blocking",
+         # cooling shape: nested counter loops, and a test nested inside a loop
+         "nested_cool_2x2", "nested_cool_3x2", "test_in_loop_true", "test_in_loop_false",
+         # the readout path: measure(), two-round readout, active reset
+         "measure_readout", "measure_two_rounds", "feedback_reset", "measure_trace_case",
+         "measure_multi",
+         # parametric variants, for sweeps (see timing_validation --scan)
+         "loop_n", "nested_cool_n", "blocks_n", "dwell_n",
+         # COMPOSITIONS: the interactions, which is where the model broke before
+         "loop_with_measure", "batch_in_loop", "test_then_batch", "stretch_in_loop",
+         "three_deep_nest",
+         # isolate the stretch-length and FIFO-drain models from the loop model
+         "register_stretch", "batch_drain_twice", "three_deep_nest_reconfig",
+         # repeat_until and test, exhaustively
+         "repeat_until_op", "repeat_until_count_n", "test_nested",
+         "test_in_counter_loop", "counter_loop_in_test",
+         # the almost_empty drain -- the ONLY drain variant the real runtimes use
+         "batch_drain_almost", "batch_in_loop_almost",
+         # generated sequences: random compositions, and the exhaustive pair enumeration
+         "random_seq", "pair_seq",
          # KI_002 cases: these could not compile before the 2026-07-27 acadia pull
          "barrier_uneven_pulses", "barrier_uneven_2ch", "barrier_uneven")
 
@@ -53,6 +72,24 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
 # rb-pulse allocation, and the cache fill. rb_stream_uniform is rb_stream with uniform-amplitude
 # final gates (clean timing of the back-to-back block; see README on the edge-detection artifact).
 STREAM_CASES = ("rb_stream", "rb_stream_uniform", "stream_then_batch")
+
+# Cases that read out through MeasurableResonator. They need the resonator built BEFORE attach()
+# (its window/accumulation memories must exist to be mapped), one cmacc module of their own, and
+# so only two raw trace captures. Kept as one list because a case that is in some of those lists
+# and not others half-exists: self._resonator stays None, resonator.measure() raises
+# AttributeError inside a channel_synchronizer, and the synchronizer's __exit__ masks it with
+# "ValueError: Empty synchronizer" -- which is what happened when loop_with_measure was added.
+#: The scheduling alphabet: every construct the qudit runtimes build sequences out of, and
+#: that the timing model has a distinct term for. `pair_seq` enumerates the ordered PAIRS of
+#: these so every adjacency is covered exhaustively; `random_seq` composes them at random for
+#: longer-range interactions. Both `test` arms and both FIFO drain senses are listed separately
+#: because they are genuinely different scheduling events, not parameters of one event.
+PRIMITIVES = ("block", "batch", "batch_almost", "dwell", "reg_dwell",
+              "loop", "counter_loop", "test_taken", "test_skipped", "stretch")
+
+
+READOUT_CASES = ("measure_readout", "measure_two_rounds", "feedback_reset",
+                 "measure_trace_case", "loop_with_measure", "measure_multi")
 
 
 class LoopbackTimingCaseRuntime(QMsmtRuntime):
@@ -98,6 +135,17 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                                       # gate). Set this for TIMING validation of the final block.
     rb_loop_gate: str = None          # if set, the loop plays only this gate (a single shape),
                                       # for the pulse-length sweep that maps the ~110 ns floor
+    loop_count: int = 2               # loop_n / nested_cool_n: outer deterministic loop passes
+    inner_loop_count: int = 2         # nested_cool_n: inner passes per outer pass
+    n_blocks: int = 3                 # blocks_n: how many blocking blocks in a row
+    register_stretch: float = 100e-9   # stretch length driven from a register (see cache[0])
+    fuzz_seed: int = 0                # random_seq: seed for the generated sequence
+    pair_a: str = "block"             # pair_seq: first primitive of the ordered pair
+    pair_b: str = "block"             # pair_seq: second primitive
+    pair_c: str = ""                  # pair_seq: optional THIRD primitive (triple enumeration)
+    repeat_operator: str = "=="       # repeat_until_op: which comparison the loop comes out on
+    exclude_stretch: bool = False     # generated cases: leave `stretch` out of the alphabet
+    fuzz_steps: int = 6               # random_seq: how many primitive steps to compose
     batch_resync_pulses: int = 8      # batch_resync: how many pulses the block=False batches play
                                       # before the dwell(pulse_length) + barrier + readout re-sync
     capture_length_override: float = None  # seconds; lengthen the ADC window past the yaml
@@ -108,6 +156,14 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                                       # baseline so a pulse shifted near t=0 stays detectable.
     run_delay: int = 200_000
     tail_trim_samples: int = 25       # see KI_001 note in loopback_multichannel.py
+    trace_channels: tuple = (0, 1, 2, 3)   # which channels get a raw trace capture. Each costs
+                                      # one cmaccModule and the firmware has only 4, so a case
+                                      # that also runs MeasurableResonator.measure() (its own
+                                      # cmacc) must give one up -- otherwise compile fails with
+                                      # "instance limit reached for cmaccModule". The measure_*
+                                      # cases trace only the channels they read: ch0 (which is
+                                      # cabled to the resonator's stimulus, so it records the
+                                      # readout pulse) and ch2 (the reference marker).
     use_dummy_channel: bool = True    # removes the KI_001 capture skew; keep True
     dummy_memory_name: str = "dummy_trace"
     figsize: tuple = None
@@ -167,8 +223,14 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                                                   dtype=np.dtype("<i4"))
             rb_num_cache = self.acadia.CacheArray(shape=1, dtype=np.dtype("<i4"))
 
-        for label in self._labels:
-            self.data.add_group(f"trace_{label}", uniform=True)
+        # Only the channels actually captured. A uniform group that is declared and never
+        # written saves a 0-byte file that DataManager cannot parse -- here it aborted the deploy
+        # outright with "ValueError: Error loading number of groups" once trace_channels stopped
+        # covering all four (a MISSING group loads fine; an EMPTY one does not). Same failure the
+        # tomography runtimes hit with their confusion groups.
+        for idx, label in enumerate(self._labels):
+            if idx in self.trace_channels:
+                self.data.add_group(f"trace_{label}", uniform=True)
         self.data.add_group("t_data", uniform=False)
 
         def dac_sequence(a: Acadia):
@@ -276,6 +338,609 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                     with a.channel_synchronizer():
                         for stim in stimuli:
                             stim.schedule_pulse(pulse)
+
+            elif self.case in ("nested_cool_2x2", "nested_cool_3x2"):
+                # THE COOLING SHAPE, which is what CustomRuntime.cool_modes compiles and what no
+                # previous case covered: an OUTER counter loop whose body is {a pulse, then an
+                # INNER counter loop of its own}. 53 of the qudit runtimes build this via
+                # cool_modes/cool_qubits, and getting the nesting wrong is not hypothetical --
+                # SequenceTrace.execution_plan used to group a loop body by the blocks at the
+                # loop's OWN depth, so the outer body collapsed to just the swap and the inner
+                # cooling was drawn once, after all the swaps, instead of interleaved. Fixed
+                # 2026-08-11; this case is the hardware check of that fix.
+                #
+                # Structure per outer pass:   ch0 swap-marker, then N_inner x (ch1 cool-marker)
+                # so BOTH the outer period (ch0 interval) and the inner period (ch1 interval) are
+                # directly measurable within their own channel, and the two are independent.
+                # DSP counters + pulse_cep() are the same primitives _cool_single_qubit uses.
+                n_outer = 3 if self.case == "nested_cool_3x2" else 2
+                n_inner = 2
+                swap_ch, cool_ch = stimuli[0], stimuli[1]
+                outer = a.sequencer().DSP()
+                inner = a.sequencer().DSP()
+                outer.load(0)
+                outer.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(outer == n_outer):
+                    with a.channel_synchronizer():
+                        swap_ch.schedule_pulse(pulse)          # the "mode swap"
+                    inner.load(0)
+                    inner.configure(mode="P+1", dsp_cep="reset")
+                    with a.sequencer().repeat_until(inner == n_inner):
+                        with a.channel_synchronizer():
+                            cool_ch.schedule_pulse(pulse)      # the "cool round"
+                        inner.pulse_cep()
+                    outer.pulse_cep()
+
+            elif self.case in ("test_in_loop_true", "test_in_loop_false"):
+                # A `test` nested INSIDE a counter loop. BOTH arms are cases, because
+                # build_runtime picks the register from the case NAME ("true" in the name -> 0,
+                # which makes REG0 == 0 hold): _true runs the conditional body on every pass,
+                # _false skips it on every pass, and the loop must still unroll either way -- the other half of the cooling shape
+                # (_cool_single_qubit puts repeat_until(feedback == target) inside the round
+                # loop, and 46 runtimes use sequencer().test()). Checks that an unrolled loop
+                # and a conditional compose: the tracer must apply the loop count to a body that
+                # itself contains a branch, and the branch decision must not be re-evaluated
+                # per pass in a way that changes the count.
+                sel = a.sequencer().Register()
+                sel.load(cache[0])                              # test_register_value
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(counter == 2):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)        # unconditional, every pass
+                    with a.sequencer().test(sel == 0):
+                        with a.channel_synchronizer():
+                            stimuli[1].schedule_pulse(pulse)    # only when the register says so
+                    counter.pulse_cep()
+
+            elif self.case in READOUT_CASES:
+                # THE READOUT PATH. MeasurableResonator.measure() is used by 94 of the qudit
+                # runtimes and by no other loopback case -- every other case captures a raw trace
+                # via stream_cmacc, which is a different command shape (measure() schedules the
+                # readout pulse on the stimulus AND a capture_cmacc with a window on the capture).
+                #
+                # What is physically measured here is the readout PULSE: the resonator's stimulus
+                # is ch0's DAC, which is cabled to ch0's ADC, so the trace records it and the
+                # marker->readout->marker intervals are measurable within ch0. The resonator's own
+                # capture goes to ADC1 (capture_dummy), so it never contends with the four trace
+                # captures -- build_runtime sets use_dummy_channel=False for these cases.
+                resonator = self._resonator            # built before attach(); see main()
+                # Everything must land on a TRACED channel or it cannot be measured: these cases
+                # trace ch0 (the resonator's stimulus, so it records the readout pulses) and ch1
+                # (markers, the inter-round swap and the conditional reset). ch2/ch3 are not
+                # captured here -- their cmacc modules are what the resonator needs.
+                marker = stimuli[1]
+
+                if self.case == "measure_multi":
+                    # SIMULTANEOUS multi-resonator readout: two measure() calls inside ONE
+                    # channel_synchronizer, the shape readout_confusion and the joint dual-rail
+                    # readouts use. Distinct from measure_two_rounds, which is two readouts in
+                    # SEQUENCE on one line; here both fire in the same barrier, so the barrier
+                    # has to pad two independent capture_cmacc command chains against each other.
+                    # Both readout pulses land on traced DACs (ch0 and ch1), so both are measured.
+                    second = self._resonator2          # on stimuli[1]; built before attach()
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                        marker.schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        resonator.measure(pulse, "readout_accumulated", "boxcar")
+                        second.measure(pulse, "readout_accumulated", "boxcar")
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                        marker.schedule_pulse(pulse)
+
+                elif self.case == "loop_with_measure":
+                    # A readout INSIDE a counter loop -- repeated single-shot readout
+                    # (qubit_repeated_readout, cavity_temperature, the tomography confusion
+                    # rounds). Composes the loop unroll with measure()'s command shape, which no
+                    # other case did. Must live in this branch: `resonator` only exists here.
+                    counter = a.sequencer().DSP()
+                    counter.load(0)
+                    counter.configure(mode="P+1", dsp_cep="reset")
+                    with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                        with a.channel_synchronizer():
+                            marker.schedule_pulse(pulse)
+                        with a.channel_synchronizer():
+                            resonator.measure(pulse, "readout_accumulated", "boxcar")
+                        counter.pulse_cep()
+
+                elif self.case == "measure_trace_case":
+                    # measure_trace() instead of measure(): a raw windowed TRACE capture rather
+                    # than a CMACC accumulation. Used by readout_window_calibration (the runtime
+                    # that calibrates the kernel every other readout depends on), and a different
+                    # capture command shape from both measure() and the stream_cmacc traces.
+                    with a.channel_synchronizer():
+                        marker.schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        resonator.measure_trace(pulse, "dummy_trace")
+                    with a.channel_synchronizer():
+                        marker.schedule_pulse(pulse)
+
+                elif self.case == "measure_readout":
+                    # marker | readout | marker  -- the plain single-shot readout shape
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                        marker.schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        resonator.measure(pulse, "readout_accumulated", "boxcar")
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                        marker.schedule_pulse(pulse)
+
+                elif self.case == "measure_two_rounds":
+                    # TWO measures on ONE line with DISTINCT capture memories -- the two-round
+                    # dual-rail readout that 36 runtimes build (rule capture_memory_per_readout:
+                    # N readouts need N memories or the second overwrites the first). The second
+                    # memory is a duplicate, i.e. an OBJECT not a name, so its window must carry
+                    # real kernel data -- hence `matched` (see the config comment and failure_019).
+                    mem2 = self._resonator_mem2        # duplicated before attach()
+                    with a.channel_synchronizer():
+                        marker.schedule_pulse(pulse)               # t0 reference on ch2
+                    with a.channel_synchronizer():
+                        resonator.measure(pulse, "readout_accumulated", "matched")
+                    with a.channel_synchronizer():
+                        marker.schedule_pulse(pulse)               # the inter-round "swap"
+                    with a.channel_synchronizer():
+                        resonator.measure(pulse, mem2, "matched")
+
+                else:   # feedback_reset
+                    # measure -> get_measurement() -> test(quadrant) -> conditional pulse: the
+                    # active-reset shape 24 runtimes use (and what _cool_single_qubit does inside
+                    # its round loop). The branch decision comes from a real CMACC result, so the
+                    # tracer cannot resolve it statically -- it must report the block in
+                    # assumed_paths rather than silently drawing one arm as certain.
+                    feedback = a.sequencer().Register()
+                    with a.channel_synchronizer():
+                        marker.schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        resonator.measure(pulse, "readout_accumulated", "boxcar")
+                    feedback.load(resonator.get_measurement(classifier="quadrant"))
+                    resonator.wait_until_measurement_done()
+                    with a.sequencer().test(feedback == getattr(a, "CMACC_QUADRANT_1")):
+                        with a.channel_synchronizer():
+                            marker.schedule_pulse(pulse)          # the conditional reset pi
+                    # A SECOND unconditional readout, so ch0 always has a comparable interval
+                    # whichever way the branch goes -- the branch itself depends on a live CMACC
+                    # result, so its arm is legitimately unpredictable (reported in assumed_paths).
+                    with a.channel_synchronizer():
+                        resonator.measure(pulse, "readout_accumulated", "boxcar")
+
+            elif self.case == "loop_n":
+                # loop_2/loop_3 with the count as a PARAMETER, so the unrolled timeline can be
+                # swept instead of spot-checked. The back-edge gap must stay constant per pass and
+                # the period must be exactly linear in the count.
+                with a.sequencer().loop(int(self.loop_count)):
+                    with a.channel_synchronizer():
+                        for stim in stimuli:
+                            stim.schedule_pulse(pulse)
+
+            elif self.case == "nested_cool_n":
+                # nested_cool with BOTH counts parametric -- sweeps the cooling shape over the
+                # (outer, inner) grid instead of the two hand-written 2x2 / 3x2 points.
+                swap_ch, cool_ch = stimuli[0], stimuli[1]
+                outer, inner = a.sequencer().DSP(), a.sequencer().DSP()
+                outer.load(0)
+                outer.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(outer == int(self.loop_count)):
+                    with a.channel_synchronizer():
+                        swap_ch.schedule_pulse(pulse)
+                    inner.load(0)
+                    inner.configure(mode="P+1", dsp_cep="reset")
+                    with a.sequencer().repeat_until(inner == int(self.inner_loop_count)):
+                        with a.channel_synchronizer():
+                            cool_ch.schedule_pulse(pulse)
+                        inner.pulse_cep()
+                    outer.pulse_cep()
+
+            elif self.case == "blocks_n":
+                # two_blocks/three_blocks/four_blocks with the count as a parameter: the
+                # per-boundary gap must compound exactly linearly, which is the strongest test of
+                # the boundary model because the error would grow with n if a term were wrong.
+                for _ in range(max(int(self.n_blocks), 1)):
+                    with a.channel_synchronizer():
+                        for stim in stimuli:
+                            stim.schedule_pulse(pulse)
+
+            elif self.case == "dwell_n":
+                # dwell_between with the dwell as a parameter -- dwell() must honour its argument
+                # exactly across the whole range, not just at 200 ns.
+                with a.channel_synchronizer():
+                    for stim in stimuli:
+                        stim.schedule_pulse(pulse)
+                        stim.dwell(self.dwell_length)
+                        stim.schedule_pulse(pulse)
+
+            elif self.case == "batch_in_loop":
+                # A block=False batch inside a counter loop: the FIFO drain and the loop back-edge
+                # interact, and the drain releases when the last command is PULLED (not played).
+                # dualrail_rb / xeb stream batches inside their circuit loops.
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)          # marker for this pass
+                    with a.channel_synchronizer(block=False):
+                        for _ in range(3):
+                            stimuli[1].schedule_pulse(pulse)
+                    with a.sequencer().repeat_until(
+                            a.channel_is_fifo_empty(stimuli[1].channel)):
+                        pass
+                    counter.pulse_cep()
+
+            elif self.case == "test_then_batch":
+                # A conditional followed by a batch in the same pass: the skip branch and the
+                # non-blocking batch share a boundary, so the branch penalty and the "no gap for a
+                # non-blocking block" rule must both apply and not double-count.
+                sel = a.sequencer().Register()
+                sel.load(cache[0])
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+                with a.sequencer().test(sel == 0):
+                    with a.channel_synchronizer():
+                        stimuli[2].schedule_pulse(pulse)
+                with a.channel_synchronizer(block=False):
+                    for _ in range(3):
+                        stimuli[1].schedule_pulse(pulse)
+                with a.sequencer().repeat_until(a.channel_is_fifo_empty(stimuli[1].channel)):
+                    pass
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "register_stretch":
+                # A register-driven stretch with NO loop around it. This isolates the stretch
+                # length model from the loop model: stretch_in_loop failed by exactly 1 cycle per
+                # iteration, and a loop simply multiplies whatever a single pass gets wrong, so a
+                # per-iteration error and a per-stretch error are indistinguishable there. Here
+                # the interval marker->marker spans exactly ONE stretch, so any error is the
+                # stretch's own.
+                length_reg = a.sequencer().Register()
+                length_reg.load(cache[0])
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+                with a.channel_synchronizer():
+                    stimuli[1].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "batch_drain_twice":
+                # Two non-blocking batches, each drained by repeat_until(fifo_empty), with NO loop.
+                # The isolating counterpart to batch_in_loop for the same reason as above: the
+                # existing batch_* cases do have drains, but their measured intervals do not SPAN
+                # a drain release, so a wrong release point never showed up. Here the ch0 markers
+                # bracket each drain, so interval 1 and interval 2 each contain exactly one.
+                for _ in range(2):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                    with a.channel_synchronizer(block=False):
+                        for _ in range(3):
+                            stimuli[1].schedule_pulse(pulse)
+                    with a.sequencer().repeat_until(
+                            a.channel_is_fifo_empty(stimuli[1].channel)):
+                        pass
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case in ("batch_drain_almost", "batch_in_loop_almost"):
+                # THE DRAIN PRIMITIVE THE RUNTIMES ACTUALLY USE. An audit of all 121 qudit-branch
+                # runtimes found `channel_is_fifo_empty` in ZERO of them and
+                # `channel_is_fifo_almost_empty` in all 7 that stream (dualrail_rb, xeb_1DR/2DR/3DR,
+                # beamsplitter_amp_detune_calibration): they refill the FIFO while it still holds
+                # commands, so the release level -- and therefore the release TIME -- is different
+                # from a drain-to-empty. Every batch case here used the empty variant, so the
+                # variant production depends on was reached only via the stream cases.
+                #
+                # batch_in_loop_almost is dualrail_rb's exact shape: drain, issue, increment, repeat.
+                target = stimuli[1]
+                # Descriptor COUNT is scannable, because the release level depends on it: an
+                # almost_empty drain asserts with one word left, so a 2-descriptor batch releases
+                # at its own start while a 5-descriptor batch releases three descriptors in. The
+                # count was hard-coded at 3, which made `--scan batch_drain_almost:...` vacuous --
+                # every point deployed the identical sequence and reported a reassuring 0.10 ns.
+                n_batch = max(int(self.batch_resync_pulses), 2)
+                if self.case == "batch_in_loop_almost":
+                    counter = a.sequencer().DSP()
+                    counter.load(0)
+                    counter.configure(mode="P+1", dsp_cep="reset")
+                    with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                        with a.channel_synchronizer():
+                            stimuli[0].schedule_pulse(pulse)
+                        with a.channel_synchronizer(block=False):
+                            for _ in range(n_batch):
+                                target.schedule_pulse(pulse)
+                        with a.sequencer().repeat_until(
+                                a.channel_is_fifo_almost_empty(target.channel)):
+                            pass
+                        counter.pulse_cep()
+                else:
+                    for _ in range(2):
+                        with a.channel_synchronizer():
+                            stimuli[0].schedule_pulse(pulse)
+                        with a.channel_synchronizer(block=False):
+                            for _ in range(n_batch):
+                                target.schedule_pulse(pulse)
+                        with a.sequencer().repeat_until(
+                                a.channel_is_fifo_almost_empty(target.channel)):
+                            pass
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "stretch_in_loop":
+                # A register-stretched pulse inside a loop: an indeterminate length and a loop
+                # back-edge together (the chevron/rate-match shape run repeatedly).
+                length_reg = a.sequencer().Register()
+                length_reg.load(cache[0])
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+                    counter.pulse_cep()
+
+            elif self.case == "three_deep_nest":
+                # THREE levels of control flow, which is the deepest any qudit runtime reaches
+                # (cool_modes: mode loop -> qubit-round loop -> active-reset loop). Each level is a
+                # counter loop so every period is deterministic and measurable on its own channel.
+                l1, l2, l3 = (a.sequencer().DSP() for _ in range(3))
+                for dsp in (l1, l2, l3):
+                    dsp.load(0)
+                    dsp.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(l1 == 2):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                    l2.load(0)
+                    with a.sequencer().repeat_until(l2 == 2):
+                        with a.channel_synchronizer():
+                            stimuli[1].schedule_pulse(pulse)
+                        l3.load(0)
+                        with a.sequencer().repeat_until(l3 == 2):
+                            with a.channel_synchronizer():
+                                stimuli[2].schedule_pulse(pulse)
+                            l3.pulse_cep()
+                        l2.pulse_cep()
+                    l1.pulse_cep()
+
+            elif self.case in ("repeat_until_op", "repeat_until_count_n"):
+                # REPEAT_UNTIL, exhaustively. The tracer resolves exactly one form -- a DSP
+                # counter loaded 0, incremented +1 per pass, compared `== target` -- and draws a
+                # single data-dependent pass for everything else. Both halves of that claim need
+                # measuring: the resolved form must be right at every count (including the
+                # degenerate 0 and 1), and the UNRESOLVED forms must be honestly unresolved
+                # rather than confidently wrong.
+                #
+                # repeat_until_op sweeps the comparison operator with the same counter and
+                # target, so the only thing that changes is whether the tracer can resolve it.
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                target = int(self.loop_count)
+                # Only `==` and `!=` are legal here. acadia rejects every ordered comparison
+                # ("Less-than comparisons can only check x < 0 or 0 <= x"), and `<=` fails with
+                # a message that does not mention comparisons at all. Measured, not assumed --
+                # see ACADIA_FINDINGS.md.
+                condition = {"==": counter == target,
+                             "!=": counter != target}[self.repeat_operator]
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+                with a.sequencer().repeat_until(condition):
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse(pulse)
+                    counter.pulse_cep()
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "test_nested":
+                # A test INSIDE a test. Nothing in the runtimes nests conditionals, but the
+                # tracer's context walk is depth-based and a skipped OUTER arm must drop the
+                # inner one with it -- a body that survives its own parent being skipped would
+                # be drawn out of nothing.
+                outer = a.sequencer().Register()
+                outer.load(cache[0])
+                inner = a.sequencer().Register()
+                inner.load(cache[0])
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+                with a.sequencer().test(outer == int(self.test_register_value)):
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse(pulse)
+                    with a.sequencer().test(inner == int(self.test_register_value)):
+                        with a.channel_synchronizer():
+                            stimuli[2].schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse(pulse)
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "test_in_counter_loop":
+                # A conditional inside a counter loop: the branch cost is paid on EVERY pass, so
+                # a per-pass miscount compounds -- the shape that exposed the drain-in-loop bug.
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                sel = a.sequencer().Register()
+                sel.load(cache[0])
+                with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                    with a.sequencer().test(sel == int(self.test_register_value)):
+                        with a.channel_synchronizer():
+                            stimuli[1].schedule_pulse(pulse)
+                    counter.pulse_cep()
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "counter_loop_in_test":
+                # The mirror image: a whole counter loop inside a conditional arm. If the arm is
+                # skipped the loop must vanish entirely, not run once.
+                sel = a.sequencer().Register()
+                sel.load(cache[0])
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+                with a.sequencer().test(sel == int(self.test_register_value)):
+                    with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                        with a.channel_synchronizer():
+                            stimuli[1].schedule_pulse(pulse)
+                        counter.pulse_cep()
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "three_deep_nest_reconfig":
+                # three_deep_nest, but each counter is RE-CONFIGURED (not merely reloaded) every
+                # time its enclosing loop re-enters -- the pattern nested_cool_n uses and that
+                # works. three_deep_nest configures all three DSPs once up front and then only
+                # reloads them, and that version never returns from the board: repeated
+                # "Timeout occurred waiting for line", i.e. a loop that never terminates.
+                #
+                # The pair isolates ONE difference, so whichever runs tells us whether a counter's
+                # `configure` survives re-entry or has to be re-issued. Nothing in the qudit
+                # runtimes reaches three counter levels (cool_modes uses two counters plus a
+                # `test`), so this is about acadia's limits rather than about a shipped sequence.
+                l1, l2, l3 = (a.sequencer().DSP() for _ in range(3))
+                l1.load(0)
+                l1.configure(mode="P+1", dsp_cep="reset")
+                with a.sequencer().repeat_until(l1 == 2):
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                    l2.load(0)
+                    l2.configure(mode="P+1", dsp_cep="reset")
+                    with a.sequencer().repeat_until(l2 == 2):
+                        with a.channel_synchronizer():
+                            stimuli[1].schedule_pulse(pulse)
+                        l3.load(0)
+                        l3.configure(mode="P+1", dsp_cep="reset")
+                        with a.sequencer().repeat_until(l3 == 2):
+                            with a.channel_synchronizer():
+                                stimuli[2].schedule_pulse(pulse)
+                            l3.pulse_cep()
+                        l2.pulse_cep()
+                    l1.pulse_cep()
+
+            elif self.case in ("random_seq", "pair_seq"):
+                # GENERATED SEQUENCES. Everything above is a shape someone thought to write down;
+                # these compose the primitive alphabet mechanically, so coverage stops depending
+                # on imagination. Two modes share one emitter:
+                #
+                # * ``random_seq`` -- a seeded random composition (--fuzz-steps / fuzz_seed).
+                #   Covers long-range interactions no hand-written case would think to try.
+                # * ``pair_seq``   -- ONE ordered pair A-then-B (pair_a, pair_b). Enumerating the
+                #   pairs covers every primitive ADJACENCY exhaustively rather than probabilistically:
+                #   a random walk only *probably* produces "counter_loop immediately after a
+                #   drain", while the enumeration guarantees it. Scheduling bugs live exactly at
+                #   these joins -- both bugs found here (the almost_empty release level and the
+                #   drain/back-edge cost) are properties of what a construct is ADJACENT to.
+                #
+                # The alphabet is every primitive the qudit runtimes actually use and that the
+                # timing model has a term for: a blocking block, a non-blocking batch drained by
+                # either FIFO primitive, a literal dwell, a register dwell, a deterministic loop, a
+                # counter loop, a conditional (both arms), and a register-stretched pulse.
+                #
+                # Every step is bracketed by a marker pulse on ch0, so each step's duration is a
+                # within-channel interval on one channel -- the metric stays valid whatever the
+                # generator produced.
+                import random as _random
+                rng = _random.Random(int(self.fuzz_seed))
+                cycles = self.acadia.seconds_to_cycles(self.register_stretch)
+                length_reg = a.sequencer().Register()
+                length_reg.load(cache[0])
+                sel = a.sequencer().Register()
+                sel.load(cache[0])
+
+                def emit(kind, chans):
+                    """Lay down one primitive on `chans`. Shared by both generated cases."""
+                    if kind == "block":
+                        for _ in range(rng.randint(1, 3)):
+                            with a.channel_synchronizer():
+                                for stim in chans:
+                                    stim.schedule_pulse(pulse)
+                    elif kind in ("batch", "batch_almost"):
+                        # both drain senses -- they release at different FIFO levels
+                        target = chans[0]
+                        with a.channel_synchronizer(block=False):
+                            for _ in range(rng.randint(2, 5)):
+                                target.schedule_pulse(pulse)
+                        cond = (a.channel_is_fifo_almost_empty(target.channel)
+                                if kind == "batch_almost"
+                                else a.channel_is_fifo_empty(target.channel))
+                        with a.sequencer().repeat_until(cond):
+                            pass
+                    elif kind == "dwell":
+                        with a.channel_synchronizer():
+                            for stim in chans:
+                                stim.schedule_pulse(pulse)
+                                stim.dwell(rng.choice((50e-9, 100e-9, 250e-9, 500e-9)))
+                                stim.schedule_pulse(pulse)
+                    elif kind == "reg_dwell":
+                        with a.channel_synchronizer():
+                            for stim in chans:
+                                stim.schedule_pulse(pulse)
+                                stim.dwell(length_reg)
+                                stim.schedule_pulse(pulse)
+                    elif kind == "loop":
+                        with a.sequencer().loop(rng.randint(2, 4)):
+                            with a.channel_synchronizer():
+                                for stim in chans:
+                                    stim.schedule_pulse(pulse)
+                    elif kind == "counter_loop":
+                        dsp = a.sequencer().DSP()
+                        dsp.load(0)
+                        dsp.configure(mode="P+1", dsp_cep="reset")
+                        with a.sequencer().repeat_until(dsp == rng.randint(2, 4)):
+                            with a.channel_synchronizer():
+                                for stim in chans:
+                                    stim.schedule_pulse(pulse)
+                            dsp.pulse_cep()
+                    elif kind in ("test_taken", "test_skipped"):
+                        # Compare against the cache value itself (TAKEN) or a value it cannot
+                        # hold (SKIPPED). Both arms are separate primitives so the enumeration
+                        # covers each next to everything else.
+                        want = cycles if kind == "test_taken" else cycles + 7
+                        with a.sequencer().test(sel == want):
+                            with a.channel_synchronizer():
+                                for stim in chans:
+                                    stim.schedule_pulse(pulse)
+                    elif kind == "stretch":
+                        # stretch_pulse, deliberately. A same-ramp stretchable pulse was tried to
+                        # remove the ramp-mismatch systematic and made things WORSE (370 ns on the
+                        # board): shortening ramp/flat changes the half/hold/half stretch geometry
+                        # itself, so the cure was bigger than the disease. The systematic is
+                        # bounded and understood instead -- see KNOWN_SYSTEMATIC.
+                        with a.channel_synchronizer():
+                            chans[0].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+
+                def marker():
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+
+                if self.case == "pair_seq":
+                    # marker | A | marker | B | [marker | C] | marker -- each primitive's span is
+                    # an interval on ch0, and the joins between them are what is under test.
+                    # With pair_c set this is a TRIPLE: a pair only ever puts a construct next to
+                    # one neighbour, so it cannot catch anything that needs a particular
+                    # predecessor AND successor -- the batch_almost bug, for instance, only
+                    # surfaced once a marker block sat between the drain and the next batch.
+                    for kind in (k for k in (self.pair_a, self.pair_b, self.pair_c) if k):
+                        marker()
+                        emit(kind, list(stimuli[1:3]))
+                    marker()
+                else:
+                    # A generated sequence containing a stretchable pulse measures a 100 ns ramp
+                    # against 20 ns markers, which moves the 50%-of-power crossing and costs
+                    # ~25 ns of apparent error. That is a property of the MEASUREMENT, so a run
+                    # meant to test the timing MODEL is better off without it -- the stretch
+                    # length model is covered by the same-pulse cases instead.
+                    alphabet = ([p for p in PRIMITIVES if p != "stretch"]
+                                if self.exclude_stretch else list(PRIMITIVES))
+                    for _ in range(max(int(self.fuzz_steps), 1)):
+                        marker()
+                        emit(rng.choice(alphabet), rng.sample(stimuli[1:], rng.randint(1, 3)))
+                    marker()
 
             elif self.case == "register_dwell":
                 # dwell length comes from a Register loaded out of the cache, so it is
@@ -630,7 +1295,9 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             #    which slides the fixed ~cable-latency lead-in out of view so more of the
             #    pulse train lands inside the window.
             with a.channel_synchronizer(block=False):
-                for cap in captures:
+                for idx, cap in enumerate(captures):
+                    if idx not in self.trace_channels:
+                        continue
                     if self.capture_start_delay:
                         cap.dwell(self.capture_start_delay)
                     self.acadia.stream_cmacc(
@@ -654,8 +1321,9 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
 
             # 3. hold the program open until every capture has flushed its full trace
             with a.channel_synchronizer():
-                for cap in captures:
-                    cap.dwell(capture_length)
+                for idx, cap in enumerate(captures):
+                    if idx in self.trace_channels:
+                        cap.dwell(capture_length)
                 if dummy_cap is not None:
                     dummy_cap.dwell(capture_length)
 
@@ -686,6 +1354,24 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             for name in names_for(i):
                 stim.get_waveform_memory(name)
 
+        # The measure_*/feedback_* cases read out through MeasurableResonator. Build it HERE,
+        # not inside the sequence function: measure() allocates the CMACC window memory and the
+        # accumulating capture memory on first use, and a memory created after attach() is never
+        # mapped (attach only walks the instances that exist when it runs) -- which surfaces as
+        # "MemoryError: Attempted access of unattached memory" at load_windows(). Same reason the
+        # stimulus memories are touched above.
+        self._resonator = None
+        if self.case in READOUT_CASES:
+            from acadia_qmsmt import MeasurableResonator
+            self._resonator = MeasurableResonator(stimuli[0], self.io("capture_dummy"))
+            self._resonator_mem2 = self.io("capture_dummy").get_waveform_memory(
+                "readout_accumulated").duplicate()
+            # Second resonator for measure_multi, on the OTHER traced stimulus and its own
+            # capture IO. Built here for the same reason as the first: a memory allocated after
+            # attach() is never mapped.
+            self._resonator2 = (MeasurableResonator(stimuli[1], self.io("capture3"))
+                                if self.case == "measure_multi" else None)
+
         self.acadia.compile(sequence)
         self.acadia.attach()
         self.configure_channels()
@@ -696,9 +1382,26 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             for name in names_for(i):
                 stim.load_pulse(name)
 
+        if self._resonator is not None:
+            self._resonator.load_windows()      # fills the CMACC window memory
+        if getattr(self, "_resonator2", None) is not None:
+            self._resonator2.load_windows()
+
         if self.case == "register_dwell":
             cache[0] = self.acadia.seconds_to_cycles(self.register_dwell)
-        elif self.case.startswith("test_"):
+        elif self.case in ("register_stretch", "stretch_in_loop", "random_seq", "pair_seq"):
+            # The register-stretch cases MUST set this. They load their stretch length from
+            # cache[0], and an unset CacheArray is zero -- so the board was being asked to stretch
+            # by 0 cycles, the one length acadia cannot encode (command_dma writes `length - 1`,
+            # see compiled_log.parse). That degenerate fixture, not the loop, is what made
+            # stretch_in_loop miss by exactly 1 cycle per pass.
+            cache[0] = self.acadia.seconds_to_cycles(self.register_stretch)
+        elif (self.case.startswith("test_") or self.case in
+              ("counter_loop_in_test", "repeat_until_op", "repeat_until_count_n")):
+            # These compare a cached register against test_register_value, so the cache MUST
+            # carry it or only one arm is ever reachable -- counter_loop_in_test silently drew
+            # its skipped arm every time because cache[0] defaulted to 0 while the comparison
+            # asked for 1, which looks like a passing test of a branch that was never varied.
             cache[0] = int(self.test_register_value)
         elif self.case in STREAM_CASES:
             # Load one DMA command per pattern slot: each is the cached word that plays
@@ -718,7 +1421,9 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             self.acadia.run(minimum_delay=self.run_delay, configure_streams=configure_streams)
             configure_streams = False
 
-            for label, cap in zip(self._labels, captures):
+            for idx, (label, cap) in enumerate(zip(self._labels, captures)):
+                if idx not in self.trace_channels:
+                    continue          # never captured -> its memory was never attached
                 wf = cap.get_waveform_memory(self.capture_memory_name)
                 self.data[f"trace_{label}"].write(wf.array)
 
@@ -757,7 +1462,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         self.avg_trace_pwr = {}
 
         completed_iterations = None
-        for label in labels:
+        # only the captured channels have a group -- see trace_channels and the add_group note
+        for idx, label in enumerate(labels):
+            if idx not in self.trace_channels:
+                continue
             traces_iq = reshape_iq_data_by_axes(self.data[f"trace_{label}"].records(), t_data_full)
             if traces_iq is None:
                 return

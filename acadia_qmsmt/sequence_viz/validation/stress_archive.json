@@ -1,0 +1,93 @@
+{
+ "runs": 300,
+ "ok": 291,
+ "mismatch": 0,
+ "raised": 9,
+ "classes": {
+  "DualRailRBRuntime": 12,
+  "DualRailE1F0RBRuntime": 4,
+  "E1F0TwoRoundSingleShotDebugRuntime": 13,
+  "E1F0PrepReadoutDebugRuntime": 2,
+  "SidebandLengthRabiSweepRuntime": 31,
+  "SidebandLengthRabiRuntime": 21,
+  "QubitPulseAmplitudeCalibrationRuntime": 20,
+  "QubitT2XYRuntime": 24,
+  "QubitSpectroscopyDetuneRuntime": 10,
+  "ResonatorSpectroscopyPrepQubitRuntime": 4,
+  "ReadoutWindowCalibrationRuntime": 26,
+  "ReadoutFidelityRuntime": 14,
+  "ResonatorSpectroscopyRuntime": 3,
+  "RFSidebandSpectroscopy": 2,
+  "QubitSpectroscopyRuntime": 1,
+  "DualRailCCZGateTomographyBasisDebugRuntime": 3,
+  "DRCCZPhaseCalibrationRuntime": 1,
+  "DualRailCCZGateTomographyRuntime": 2,
+  "ReadoutConfusionRuntime": 2,
+  "QCDualRailErasureRuntime": 2,
+  "QubitQNDRuntime": 1,
+  "QubitRelaxationRuntime": 2,
+  "QubitT2Runtime": 6,
+  "QubitEFChevronRuntime": 4,
+  "CavityT1Runtime": 1,
+  "CCZPhaseCalibrationRuntime": 38,
+  "QCQCCZStateTomoRuntime": 1,
+  "QCQTomoTestRuntime": 1,
+  "QCQGateTomographyRuntime": 40
+ },
+ "problems": [
+  {
+   "folder": "/home/boson/data/sophia/20260715/DualRail_e1f0_prep_readout/prep_e1/260716/101535",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/20260715/DualRail_e1f0_prep_readout/prep_f0/260716/101722",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/20260715/rf_chevron/Q2C2/rff2/260716/134851",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/20260720/DualRail_RB/C3C4/260721/121922",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/20260720/e1f0_rf_chevron/rfb1/260721/202746",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/20260720/rf_chevron/Q1C1/rf1_/260721/212804",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/20260720/rf_chevron/Q3C4/rfb/260721/112422",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  },
+  {
+   "folder": "/home/boson/data/sophia/qcq_gate_tomo/CZ/260615/162614",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "TypeError: InputOutputWaveforms.hann() got an unexpected keyword argument 'detuning'"
+  },
+  {
+   "folder": "/home/boson/data/sophia/qcq_gate_tomo/f1_CCZ/260616/120200",
+   "kind": "raised",
+   "replayed_board_failure": true,
+   "error": "ValueError: Empty synchronizer"
+  }
+ ]
+}

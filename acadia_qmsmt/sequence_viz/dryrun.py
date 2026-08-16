@@ -221,6 +221,82 @@ def branch_recorder(stack):
             setattr(Sequencer, name, original)
 
 
+#: Set by :func:`numeric_check_shim` when it had to stand in for a stale ``acadia.is_numeric``.
+#: Read by the tracer so ``trace.acadia_shims`` / ``summary()`` can say the station needs updating.
+NUMERIC_CHECK_SHIM_NOTE = (
+    "installed acadia predates the fix for numeric checking of Operations with arbitrary "
+    "functions (acadia commit 370fc87, 2026-07-08). Without it, is_numeric() compares "
+    "Operation._op (a FUNCTION) against Operable.NUMERIC_OPERATORS (a dict keyed by STRINGS), so "
+    "NO Operation is ever numeric -- not even add/sub. A barrier that aligns 2+ occupied channels "
+    "emits Operation(max, len_a, len_b) as its alignment dwell; classified non-numeric it is "
+    "pushed onto a DSP, where max has no lowering, and compile dies with 'Unable to find a DSP "
+    "configuration for Operation(<built-in function max>, ...)'. The BOARD, running current "
+    "acadia, resolves that dwell as an assembly-time immediate and runs the sequence fine. "
+    "sequence_viz stood in for the fixed function FOR THIS TRACE ONLY, so the picture matches the "
+    "board -- but every other client-side acadia.compile() on this station still fails. "
+    "Fix the station: reinstall acadia from its source repo (e.g. "
+    "`$ACADIA_ENV/bin/pip install -e /path/to/acadia/pyacadia`), or copy the current "
+    "acadia/sequencer.py over the installed one -- it is the only pure-Python file that differs.")
+
+
+def _is_numeric_fixed(obj):
+    """``acadia.sequencer.is_numeric`` as of acadia commit 370fc87, reproduced verbatim in effect.
+
+    An ``Operation`` is numeric when all of its arguments are; the *function* is not required to be
+    in a whitelist (the point of that commit -- ``max``/``min`` and any other numeric callable are
+    legitimate). Deliberately a faithful stand-in rather than an improvement: this must not make
+    the trace disagree with a correctly-installed acadia.
+    """
+    from acadia.compiler import Operation
+    from acadia.sequencer import DSPConfiguration, ProcessorInstruction, Symbol
+
+    for t in (int, bool, DSPConfiguration, ProcessorInstruction):
+        if isinstance(obj, t) or (isinstance(obj, Symbol)
+                                  and (obj.value_type() is t
+                                       or t in obj.value_type().__bases__)):
+            return True
+    if isinstance(obj, Operation):
+        return (all(_is_numeric_fixed(a) for a in obj._args)
+                and all(_is_numeric_fixed(v) for v in obj._kwargs.values()))
+    try:
+        int(obj)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def numeric_check_shim(patch):
+    """Stand in for a STALE ``acadia.is_numeric`` for the duration of a dry run.
+
+    Returns the note describing what was shimmed, or ``None`` when the installed acadia is already
+    correct -- in which case nothing at all is patched.
+
+    Detected behaviourally, not by version: a correct ``is_numeric`` says ``Operation(sub, 1, 1)``
+    is numeric and the stale one does not. So this self-disables the moment the station is updated,
+    and it cannot mask a *future* acadia whose semantics differ for some other reason.
+
+    Patched in BOTH ``acadia.sequencer`` and ``acadia.system``: the internal call sites resolve the
+    module global at call time, but ``system.py`` does ``from .sequencer import is_numeric``, which
+    binds the function object at import -- so patching only the sequencer module would leave
+    ``system``'s copy stale.
+    """
+    from acadia import sequencer, system
+    from acadia.compiler import Operable, Operation
+
+    try:
+        probe = Operation(Operable.NUMERIC_OPERATORS["sub"], 1, 1)
+        if sequencer.is_numeric(probe):
+            return None                       # installed acadia is current -- patch nothing
+    except Exception:                         # unknown acadia shape; leave it alone
+        return None
+
+    logger.warning("sequence_viz: %s", NUMERIC_CHECK_SHIM_NOTE)
+    for module in (sequencer, system):
+        if getattr(module, "is_numeric", None) is not None:
+            patch(module, "is_numeric", staticmethod(_is_numeric_fixed).__func__)
+    return NUMERIC_CHECK_SHIM_NOTE
+
+
 def already_traced(runtime):
     """True if ``main()`` has already been run on this runtime's Acadia."""
     sequencers = getattr(getattr(runtime, "acadia", None), "_sequencer_type", None)
@@ -294,6 +370,12 @@ def hardware_stubbed(on_run, runtime=None, allow_instruments=False):
 
     noop = lambda self, *a, **k: None
 
+    # Compatibility, NOT a workaround for a defect in current acadia: if this station's acadia is
+    # older than the numeric-check fix, a legal barrier that the board runs fine cannot be compiled
+    # here at all. Restore the fixed behaviour for this trace so the picture matches the board, and
+    # warn so the station gets updated. Silent no-op on a current acadia.
+    numeric_check_shim(patch)
+
     runtime_classes = [QMsmtRuntime]
     acadia_classes = [Acadia]
     serve_classes = [_defining_class(QMsmtRuntime, "final_serve")]
@@ -334,6 +416,53 @@ def hardware_stubbed(on_run, runtime=None, allow_instruments=False):
     # never connect off-hardware -- 3.7M calls and ~5 s per trace
     for klass in serve_classes:
         patch(klass, "final_serve", noop)
+    # Stubbing `final_serve` is not enough: plenty of archived runtimes call `self.data.serve()`
+    # STRAIGHT from main()'s sweep loop (e.g. DualRail_echo .../runtime.py:1906), and that call
+    # BINDS A REAL SOCKET. A dry run is supposed to leave nothing behind, and this one did not --
+    # tracing two runtimes at once failed 17 of 153 times with "ValueError: Failed to bind to
+    # socket" while the same 17 passed alone, and a trace would equally fail whenever a live
+    # measurement holds the port.
+    #
+    # DataManager is an immutable C type, so its methods cannot be patched (attempting it raises
+    # "cannot set 'serve' attribute of immutable type"). Wrap the runtime's INSTANCE instead: a
+    # proxy that swallows serve/sync and forwards everything else untouched.
+    if runtime is not None and getattr(runtime, "data_manager", None) is not None:
+        real_manager = runtime.data_manager
+
+        class _QuietDataManager:
+            """Forwards to the real DataManager but never touches the network.
+
+            The dunders are spelled out on purpose: Python looks special methods up on the TYPE,
+            not through ``__getattr__``, and runtimes index the manager directly
+            (``self.data["q"].write(...)``), so a proxy without ``__getitem__`` breaks main()
+            rather than quietly forwarding.
+            """
+
+            def serve(self, *a, **k):
+                return None
+
+            def sync(self, *a, **k):
+                return None
+
+            def __getattr__(self, name):
+                return getattr(real_manager, name)
+
+            def __getitem__(self, key):
+                return real_manager[key]
+
+            def __setitem__(self, key, value):
+                real_manager[key] = value
+
+            def __contains__(self, key):
+                return key in real_manager
+
+            def __iter__(self):
+                return iter(real_manager)
+
+            def __len__(self):
+                return len(real_manager)
+
+        patch(runtime, "data_manager", _QuietDataManager())
     for klass in io_classes:
         patch(klass, "set_frequency", noop)
 

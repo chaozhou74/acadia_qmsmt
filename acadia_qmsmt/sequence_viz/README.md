@@ -69,9 +69,73 @@ and picks the label density, the ns/µs unit and whether to draw envelopes from 
 culling marks outside. That is what makes deep zoom useful — at a 200 ns window you
 can see that two readout pulses have different ramp lengths.
 
-Scriptable: `view.set_window(t0_ns, t1_ns)`, `view.reset()`, `view.xlim_ns`.
+Scriptable: `view.set_window(t0_ns, t1_ns)`, `view.set_lanes(y0, y1)`,
+`view.reset()`, `view.xlim_ns`, `view.ylim`. Lane coordinates count from the
+bottom — channel *i* of `trace.channels` sits at lane `len(channels) - 1 - i`, so
+the first channel is the top one — and `view.full_ylim` is the whole stack.
 matplotlib's own toolbar still works; this yields to it while its zoom/pan tool is
 armed.
+
+`on_viewport(xlim_ns)` and `on_lanes(ylim)` are called after every render, which is
+how acadia_gui keeps its two scrollbars in step with the view.
+
+### Why a gesture is not one render per event
+
+A frame is expensive — ~53 ms for a gesture frame and ~70 ms for a full one on a
+9-lane RB sequence, nearly all of it matplotlib rastering the figure. Gestures emit
+events far faster than that (a scrollbar drag, one per pixel of travel), so
+`SequenceView` never tries to render one per event:
+
+* **a pan is shown immediately, without rendering.** `_preview_pan` blits the last
+  drawn frame back shifted by the pan — a few ms — so the plot stays under the
+  handle instead of trailing it. The strip scrolling into view is painted with the
+  axes background until a real frame refills it. Measured on a 2-screens-per-second
+  drag: 54 fps and 4 px of lag, against 8 fps and 130 px before. Past
+  `MAX_PREVIEW_SHIFT` of the plot width the shift is mostly blank strip, so the
+  last complete frame is held instead.
+* **the time axis only.** A lane pan is not a translation of the picture: the gap
+  bands and the barrier and block-start lines span the full height in *axes*
+  coordinates, so they stay put while the lanes move past them. Shifting the image
+  would drag them along — measured 2 px out and a fifth of the plot wrong, against
+  0 px and 2% (half-pixel rounding) for a time pan.
+* frames are drawn no more often than one *measured* frame time apart
+  (`_on_draw` times request-to-drawn, which is the only honest measure since the
+  raster is deferred to the event loop); intermediate windows are dropped, never
+  queued;
+* frames drawn *during* a gesture pass `fast=True` to `draw()`, which skips the
+  per-window labels (53 ms against 70). The legend stays up: it costs 4.6 ms and is
+  the most conspicuous thing on the plot to have blinking on and off.
+* the full-detail frame follows one interval after the last event, so labels and
+  the hover index come back as soon as you let go;
+* hovering repaints only the tooltip and the readout, blitted over a snapshot of
+  the plot, instead of a full redraw per mouse-move.
+
+`draw()` reuses the axes rather than calling `ax.clear()`, which is what made those
+numbers reachable: clearing rebuilds the ticks, their labels and the spines from
+rcParams every frame — 75 artists and thousands of deepcopies for a window that
+owns nine bars, 44 ms of a 70 ms frame. It now replaces only the marks it drew
+(tracked on `ax._sequence_viz`) and rebuilds the chrome when the channels or the
+theme change. Anything else you add to those axes — the tooltip, the rubber band —
+is now yours to remove.
+
+Coalescing means there are **two windows at once**, and mixing them up is the one
+real trap here: `xlim_ns` is where the view is going, `_drawn_xlim` is what the axes
+currently show. Everything matplotlib hands back — an event's `xdata`, the hover
+index, the rubber band — is in the *drawn* frame's units, so it converts with
+`view.divisor` (defined on the drawn window for exactly this reason). Gestures
+compose onto the *pending* window instead and therefore work in pixels
+(`_x_to_ns`), which is unit-free. Scaling a drawn `xdata` by the pending window's
+divisor is out by 1000× whenever a scroll crosses the 5000 ns ns/µs boundary
+between frames — that bug sent the view to −2000 µs on a fast wheel.
+
+Zooming out and panning are clamped to the sequence: the window slides rather than
+clipping, so it keeps the zoom you asked for, and the scrollbars — which model the
+window as a slice of the sequence — stay well defined.
+
+`view.set_window(..., throttle=True)` and `view.set_lanes(..., throttle=True)` opt a
+caller into that pacing — what acadia_gui's two scrollbars use. Without it, dragging
+a scrollbar queued a full render per emitted value and the plot crawled along behind
+the handle.
 
 ## In acadia_gui
 
@@ -80,6 +144,14 @@ drives an ipympl canvas in a notebook and a `FigureCanvasQTAgg` in Qt — one im
 the zoom/pan behaviour to keep correct. The Qt wrapper that embeds it in acadia_gui lives
 **in acadia_gui** (`gui/sequence_view.py`), not in this package, which is why nothing here
 imports PyQt5.
+
+The wrapper adds one scrollbar per axis — time along the bottom, lanes down the right — each
+enabled only while that axis is zoomed in. Both show where you are (the handle is the
+visible fraction of the sequence, or of the channel stack) and let you walk along at a fixed
+zoom, which the mouse gestures alone cannot do. Both pan continuously: `QScrollBar` is
+int-only, so the time bar counts in whole nanoseconds and the lane bar in thousandths of a
+lane, each far finer than a pixel of canvas. The lane bar's value is measured downwards, as
+Qt counts a vertical bar: 0 is the top of the channel stack.
 
 That wrapper's `load_folder(path)` never raises — a non-data folder or a trace failure is
 reported in the widget. Folder loading goes through `acadia_qmsmt.utils.saved_runtime_loader`
@@ -163,10 +235,31 @@ FIFO-latency NOPs from `calculate_trigger_delay`, and trigger again. All of it i
 dead air on every channel, and the visualizer accounts for it.
 
 **Validated against hardware.** The 4-channel DAC→ADC loopback
-(`validation/timing_validation.py`) measures pulse intervals directly. Across
-**29 cases** — straight-line, barrier-padded, stretched, register-driven, looped and
-branched — every one agrees to **≤0.14 ns** (0.028 cycles), excluding three documented
-*measurement* systematics and the two KI_004 variants:
+(`validation/timing_validation.py`) measures pulse intervals directly. Coverage is in three
+layers, all deployed and measured on the board:
+
+* **62 hand-written cases** — straight-line, barrier-padded, stretched, register-driven, looped,
+  branched, batched behind either FIFO drain, and read out through `measure()` /
+  `measure_trace()` / two resonators at once;
+* **every ordered PAIR of the 10 scheduling primitives** (100 deploys) and **125 ordered
+  TRIPLES** over the FIFO/branch-stateful subset — exhaustive adjacency coverage, because
+  scheduling errors are properties of a JOIN rather than of a construct in isolation;
+* **randomly generated sequences** (`random_seq`), for interactions no hand-written case reaches.
+
+The triple sweep runs **0 failures at 0.23 ns worst**, and re-scoring every archived run against
+the model gives the same **0.23 ns**, with no residual above 1 ns that is not a classified
+systematic. Documented *measurement* systematics (the
+mixed-ramp stretch edge, slow-ramp edge jitter) and the two KI_004 variants are excluded and
+listed in `validation/README.md`, which also records the eight model bugs this net has caught and
+the one idiom (`REGn -> BUS_DATA` streaming, used by the multi-rail XEB runtimes) it does not yet
+resolve.
+
+A second harness, `validation/render_validation.py`, closes the other half of the chain: it
+renders a trace to a real figure, reads the patches back off the axes and checks every rectangle
+against the command it stands for. `board <-> trace` and `trace <-> drawing` are both measured.
+
+The older 29-case table below is kept because its per-case gap breakdown is still the clearest
+illustration of how the boundary gap is built up:
 
 ```
 case                   blocks         gaps (ns)   worst err

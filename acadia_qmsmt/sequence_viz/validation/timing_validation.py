@@ -43,7 +43,106 @@ REPORT = Path(__file__).parent / "timing_validation_results.json"
 
 CHANNEL_OF = {"ch0": "DAC0", "ch1": "DAC2", "ch2": "DAC4", "ch3": "DAC6"}
 
+#: A channel is treated as IDLE (no pulses at all) unless its peak stands this many baseline sigmas
+#: above the baseline. Measured on this station: a driven loopback channel peaks at 4.1e3-5.5e4
+#: counts, an undriven one at 0.4-0.7, so the true separation is ~5 orders of magnitude and any
+#: value in the tens is safe. Guards pulse_regions_ns, whose other thresholds are all relative to
+#: the channel's own maximum and therefore meaningless on a channel carrying only noise.
+SILENT_CHANNEL_SIGMAS = 30.0
+
+#: A region must peak at least this fraction of its channel's maximum to count as a pulse.
+#: Was 0.05, which admitted CROSSTALK: a pulse on one DAC shows up on a neighbouring cabled
+#: channel at ~7% of that channel's own maximum, and in feedback_reset such a blip stood in for a
+#: conditional reset pulse that never fired -- turning a missing pulse into a spurious 0.17 ns
+#: "OK". Chosen from the data, not guessed: over every archived loopback run the region peaks fall
+#: into two disjoint groups, 10 regions below 15% (all crosstalk) and 592 at 25% or above (all real
+#: pulses), with NOTHING between 15% and 25%. 0.20 sits in that empty band.
+REGION_FLOOR_FRACTION = 0.20
+
+#: A channel is IDLE if its peak is below this fraction of the LOUDEST channel's peak in the same
+#: run. The within-channel sigma test above is not enough on its own: an idle channel's noise
+#: distribution can be narrow in its lower band while still throwing outliers 30 sigma up, which
+#: left 6 phantom "pulses" on ch3 (peak 0.705) next to a driven ch2 at 5.5e4. Across channels the
+#: separation is unambiguous -- driven peaks measured 4.1e3-5.5e4, idle ones 0.37-0.71, i.e. 4-5
+#: orders of magnitude -- while the spread BETWEEN driven channels is only ~13x (different
+#: attenuation and NCO per channel), so 1e-3 sits far from both.
+IDLE_CHANNEL_FRACTION = 1e-3
+
+#: Seconds of ADC window to request, overriding the yaml's 1.2e-6. The yaml window records only
+#: 1070 ns, but these sequences run 2400-2610 ns, so more than half of every case -- including the
+#: post-batch discriminator pulses the batch cases exist to measure -- was never captured. Must
+#: cover the longest sequence plus the ~283 ns DAC->cable->ADC latency plus one pulse length.
+CAPTURE_WINDOW_S = 4.0e-6
+
 # Cases whose measured error is a known MEASUREMENT systematic, not a model error.
+#: Cases that must NOT be deployed by default. ``test_false_nospec`` HANGS the sequencer
+#: (KI_004: with speculation=False the body is relocated to the program tail, but the STACK->PC
+#: return lands on the guard's fall-through path, so the skip path pops an empty return stack and
+#: jumps to garbage). The board recovers on the next deploy, but the run produces no data and
+#: costs a power-cycle of confidence. --all used to include it, which contradicted the
+#: KNOWN_SYSTEMATIC note telling you not to re-deploy it. Opt in with --include-unsafe.
+UNSAFE_TO_DEPLOY = {
+    "test_false_nospec": "KI_004: hangs the sequencer (skipped arm returns to garbage)",
+    "three_deep_nest":
+        "never returns from the board -- repeated 'Timeout occurred waiting for line', i.e. a "
+        "counter loop that does not terminate. It configures all three DSP counters ONCE up "
+        "front and then only reloads them on re-entry; nested_cool_n (which works) re-issues "
+        "configure() as well as load() each time. three_deep_nest_reconfig is the same sequence "
+        "with that one difference and is the version to deploy. No qudit runtime reaches three "
+        "counter levels -- cool_modes uses two counters plus a test -- so nothing shipped is "
+        "affected.",
+}
+
+def systematic_note(name, trace=None):
+    """The note explaining a residual error, or None if it needs explaining.
+
+    Decided from what the sequence CONTAINS, not from what the folder is called. Name matching was
+    tried first and is the wrong shape for this: it only ever covers the cases someone already
+    thought to name, so a new case with the same physics reads as an unexplained failure while an
+    unrelated case that happens to match the pattern gets excused. Both of those happened -- a
+    generated sequence needed a second rule the moment the naming changed from `random_seq...` to
+    `novel_random...`, which is a rename, not a physical difference.
+
+    The two systematics have crisp physical signatures, so they are detected as such:
+
+    * a MIXED-RAMP pair -- the sequence measures a stretchable pulse against a marker with a
+      different ramp, so the 50%-of-power crossings sit at different points on the two edges;
+    * a TWO-DESCRIPTOR almost_empty drain -- the "one word left" level is reached as the batch
+      starts playing, so the poll never blocks and the gap terms (calibrated on drains that do
+      block) over-count.
+
+    Hand-written cases keep their explicit notes in KNOWN_SYSTEMATIC, which are about a fixture's
+    construction rather than about physics.
+    """
+    note = KNOWN_SYSTEMATIC.get(name)
+    if note:
+        return note
+    if trace is None:
+        return None
+
+    stretched = {c.pulse for c in trace.commands if c.pulse and "stretch" in str(c.pulse)}
+    plain = {c.pulse for c in trace.commands if c.pulse and "stretch" not in str(c.pulse)}
+    if stretched and plain:
+        return (f"mixed ramp shapes: this sequence measures {sorted(stretched)[0]} against "
+                f"{len(plain)} pulse(s) of a different shape, so the 50%-of-power crossing sits "
+                f"at a different point on each edge -- ~25 ns of apparent error from the "
+                f"MEASUREMENT, not the model. The same-pulse cases agree to 0.05 ns.")
+
+    for nth, drain in (trace.drain_blocks or {}).items():
+        if not drain.get("almost_empty"):
+            continue
+        # how many descriptors the drained block pushed: with two, `almost empty` is true as soon
+        # as the first is pulled, so the poll never blocks
+        block = next((b for i, b in enumerate(trace.blocks) if i == nth), None)
+        pushed = len([c for c in (block.commands if block else []) if c.pulse])
+        if pushed and pushed <= 2:
+            return (f"two-descriptor almost_empty drain (block {nth} pushed {pushed}): the "
+                    f"'one word left' level is reached as the batch starts playing, so the poll "
+                    f"never blocks and the gap terms over-count by 1-2 cycles. Confined to this "
+                    f"case by descriptor-count scans; no runtime batches two behind almost_empty.")
+    return None
+
+
 KNOWN_SYSTEMATIC = {
     "stretch_two_blocks":
         "mixed ramp shapes (50 ns stretch vs 10 ns test pulse): a 50%-of-power crossing "
@@ -66,6 +165,11 @@ KNOWN_SYSTEMATIC = {
         "same slow-ramp edge limit as phase_pair, plus SSB imbalance ripple that differs "
         "between the 10 MHz and 25 MHz pulses and perturbs the plateau peak the half level "
         "is taken from. Timing conclusions rest on the fast-ramp cases.",
+    "feedback_reset":
+        "the conditional-reset arm is DATA-DEPENDENT: whether the reset pulse fires depends on the "
+        "live CMACC quadrant of the loopback signal, which no static trace can know (the tracer "
+        "correctly reports the block in assumed_paths). Only ch0's unconditional readout pulses are "
+        "a timing result; a count mismatch on the conditional channel is expected, not an error.",
     "rb_stream":
         "the final '8 basic gates' block plays lo/mid/hi amplitudes back-to-back, merging into "
         "one region; the 50%-of-region-peak rising edge then latches onto the first HIGH gate, "
@@ -98,6 +202,20 @@ def pulse_regions_ns(runtime, label, threshold_sigmas=10.0):
     noise = float(band.std()) if band.size > 1 else float(y.std())
     if noise == 0.0:                                        # degenerate flat trace
         noise = 1.0
+    # SILENT-CHANNEL GUARD. Every threshold below is RELATIVE to this channel, so on a channel
+    # the case never drives, "5% of the maximum" is 5% of the noise floor and noise sails through:
+    # batch_uneven reported 7 "pulses" on ch1 whose peak was 0.37 counts against 4120 on the driven
+    # ch0 -- five orders of magnitude down -- which then looked like the tracer had put pulses on
+    # the wrong channels. A real loopback pulse sits thousands of sigma above baseline, so requiring
+    # a large dynamic range separates "driven" from "idle" without any absolute count threshold
+    # (which would depend on attenuation and ADC gain).
+    if y.max() < level + SILENT_CHANNEL_SIGMAS * noise:
+        return []
+    # only the channels that were actually captured (trace_channels); a case may trace a subset
+    loudest = max((float(np.asarray(trace).max())
+                   for trace in runtime.avg_trace_pwr.values()), default=0.0)
+    if loudest > 0 and y.max() < IDLE_CHANNEL_FRACTION * loudest:
+        return []
     above = np.where(y > level + threshold_sigmas * noise)[0]
     if not len(above):
         return []
@@ -111,7 +229,7 @@ def pulse_regions_ns(runtime, label, threshold_sigmas=10.0):
     # A baseline-sigma threshold alone lets single-sample noise through: on a quiet
     # channel it flagged a 1-sample "pulse" at peak 0.77 against a real peak of 4.8e4.
     # Require a real pulse to be at least 2 samples wide and 5% of the channel maximum.
-    floor = 0.05 * y.max()
+    floor = REGION_FLOOR_FRACTION * y.max()
     return [(float(t[a]), float(t[b]), float(y[a:b + 1].max()))
             for a, b in regions if b > a and y[a:b + 1].max() >= floor]
 
@@ -150,11 +268,81 @@ def measure(folder):
     # load_runtime_from_data_dir call.
     runtime = load_runtime_from_data_dir(str(folder))
     runtime.process_current_data()
-    return {label: pulse_edges_ns(runtime, label) for label in
-            ("ch0", "ch1", "ch2", "ch3")}
+    # A case that traced only some channels (trace_channels, e.g. the measure_* cases needing a
+    # cmacc for the resonator) has no data for the others -- report them empty rather than raising.
+    return {label: (pulse_edges_ns(runtime, label)
+                    if label in getattr(runtime, "avg_trace_pwr", {}) else [])
+            for label in ("ch0", "ch1", "ch2", "ch3")}
 
 
 # ---------------------------------------------------------------- prediction
+
+def measure_spans(folder):
+    """{label: [region width ns, ...]} -- the other measurable quantity.
+
+    A case with ONE region per channel has no interval, so the interval metric says nothing
+    (7 of the 45 cases were reporting a vacuous "0.0 ns"). Its claim is still testable: two
+    pulses butted together in one block MERGE into a single region of twice the width, so
+    predicting "no gap" predicts that width. Width is a within-channel measurement, so the
+    cable latency cancels exactly as it does for an interval.
+    """
+    from acadia_qmsmt.utils.saved_runtime_loader import load_runtime_from_data_dir
+
+    runtime = load_runtime_from_data_dir(str(folder))
+    runtime.process_current_data()
+    out = {}
+    for label in ("ch0", "ch1", "ch2", "ch3"):
+        if label not in getattr(runtime, "avg_trace_pwr", {}):
+            out[label] = []
+            continue
+        out[label] = [stop - start
+                      for start, stop, _peak in pulse_regions_ns(runtime, label)]
+    return out
+
+
+def regions_of(trace):
+    """{label: ([region start ns], [region width ns])} for the trace's CURRENT layout."""
+    starts, spans = {}, {}
+    for label, channel in CHANNEL_OF.items():
+        pulses = sorted((c for c in trace.commands
+                         if c.pulse and c.channel == channel), key=lambda c: c.start)
+        merged = []
+        for command in pulses:
+            if merged and command.start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], command.stop)
+            else:
+                merged.append([command.start, command.stop])
+        starts[label] = [r[0] * trace.ns_per_cycle for r in merged]
+        spans[label] = [(r[1] - r[0]) * trace.ns_per_cycle for r in merged]
+    return starts, spans
+
+
+def resolve_assumed_arm(trace, measured):
+    """Decide an undecidable ``test`` arm from the MEASURED region counts, and re-lay out.
+
+    A branch on a live measurement result (``test(reg == CMACC_QUADRANT_1)`` -- active reset, and
+    the same shape ``_cool_single_qubit`` uses) cannot be resolved off-hardware: it depends on what
+    the qubit did. The trace therefore guesses "taken" and records the block in ``assumed_paths``.
+
+    But the capture says which arm actually ran: the conditional pulse is either in the trace or it
+    is not, so the number of REGIONS on each channel distinguishes the arms. Selecting the arm from
+    region COUNTS and then scoring INTERVALS is not circular -- they are different observables. The
+    count fixes *which* timeline to check; the model still has to predict *when* every edge lands,
+    which is what gets scored.
+
+    Returns the chosen mapping (block -> taken) or None when neither arm reproduces the counts.
+    """
+    counts = {label: len(v) for label, v in measured.items()}
+    for taken in (False, True):
+        trace.path_choices = {block: taken for block in trace.assumed_paths}
+        trace.relayout()
+        starts, _ = regions_of(trace)
+        if all(len(starts[label]) == counts[label] for label in counts):
+            return {block: taken for block in trace.assumed_paths}
+    trace.path_choices = {}
+    trace.relayout()
+    return None
+
 
 def predict(folder):
     """{label: [region start ns, ...]} from sequence_viz's trace of the same folder.
@@ -168,7 +356,7 @@ def predict(folder):
     from acadia_qmsmt import sequence_viz as sv
 
     trace = sv.trace_folder(folder)
-    starts = {}
+    starts, spans = {}, {}
     for label, channel in CHANNEL_OF.items():
         pulses = sorted((c for c in trace.commands
                          if c.pulse and c.channel == channel),
@@ -180,7 +368,30 @@ def predict(folder):
             else:
                 merged.append([command.start, command.stop])
         starts[label] = [region[0] * trace.ns_per_cycle for region in merged]
-    return starts, trace
+        spans[label] = [((region[1] - region[0]) * trace.ns_per_cycle) for region in merged]
+
+    # Channels whose predicted pulses come from a block the tracer could NOT decide.
+    # `test(reg == CMACC_QUADRANT_1)` on a live measurement result is genuinely undecidable
+    # off-hardware -- the branch depends on what the qubit did -- so the tracer assumes the body
+    # runs and records the block in `assumed_paths`. Comparing such a channel scores the ASSUMPTION,
+    # not the model: feedback_reset's conditional-reset channel reported 165.05 ns purely because
+    # the shot did not take the branch the trace had to guess. An assumed path must never pass as a
+    # verified one (the same principle as capture_points in dry_run), and equally must never fail as
+    # one, so these channels are reported and excluded from the score rather than silently compared.
+    # The rule is TEMPORAL, not per-channel. A block the trace guessed wrong about does not
+    # merely misplace its own channel: if the branch is not taken, every later block slides
+    # earlier by the skipped duration, on EVERY channel. feedback_reset shows this exactly --
+    # the undecidable conditional sits on DAC2, yet the 165.05 ns error appeared on DAC0, whose
+    # second readout pulse simply started earlier than the guess implied. So everything at or
+    # after the earliest assumed block is unscorable.
+    assumed_start = min((pl.start for pl in (trace.placements or [])
+                         if pl.index in trace.assumed_paths), default=None)
+    assumed_labels = set()
+    if assumed_start is not None:
+        cutoff = assumed_start * trace.ns_per_cycle
+        assumed_labels = {label for label in starts
+                          if any(start >= cutoff for start in starts[label])}
+    return starts, trace, spans, assumed_labels
 
 
 # ---------------------------------------------------------------- comparison
@@ -188,17 +399,65 @@ def predict(folder):
 def compare(folder, verbose=True):
     """Predicted vs measured intervals for one run. Returns a result dict."""
     measured = measure(folder)
-    predicted, trace = predict(folder)
+    measured_spans = measure_spans(folder)
+    predicted, trace, predicted_spans, assumed_labels = predict(folder)
+    # An undecidable branch: ask the CAPTURE which arm ran, then re-lay out and score that
+    # timeline. Only if the data cannot distinguish the arms does the channel stay unscored.
+    resolved_arm = None
+    if assumed_labels and trace.assumed_paths:
+        resolved_arm = resolve_assumed_arm(trace, measured)
+        if resolved_arm is not None:
+            predicted, predicted_spans = regions_of(trace)
+            assumed_labels = set()
 
     rows, worst = [], 0.0
     for label in ("ch0", "ch1", "ch2", "ch3"):
         m, p = measured[label], predicted[label]
+        merged_note = False
         # intervals relative to the channel's own first pulse -- the latency cancels
         m_int = [x - m[0] for x in m[1:]] if len(m) > 1 else []
         p_int = [x - p[0] for x in p[1:]] if len(p) > 1 else []
-        n = min(len(m_int), len(p_int))
-        errors = [m_int[i] - p_int[i] for i in range(n)]
-        if errors:
+        # SEGMENTATION MUST AGREE BEFORE AN INTERVAL MEANS ANYTHING.
+        # These are two lists of REGION starts, and interval k is only the same physical gap on
+        # both sides if both sides split the signal into the same regions. When they disagree,
+        # pairing by position compares unrelated pulses and manufactures a huge "error" out of
+        # nothing: batch_uneven reported 549.83 ns purely because predict() merges the whole
+        # contiguous batch into ONE region (10 pulses -> 3 regions) while the detector resolved 9,
+        # so predicted region 2 (the post-batch discriminator, +835 ns) was compared against
+        # measured region 2 (the second batch pulse, +285 ns). The same shape flattered other
+        # cases: batch_resync/simulbus_transition/loop_batch each compared ZERO pairs and printed
+        # a reassuring "worst error 0.0 ns". So a count mismatch is now a reported verdict, never
+        # an error number, and it never feeds `worst`.
+        # MERGED REGIONS. predict() merges only pulses that exactly touch, but the detector
+        # merges any pair whose envelope never dips below REGION_FLOOR_FRACTION between them --
+        # so a small real gap (stretch_then_pulse's join, back-to-back batch pulses) is 2
+        # predicted regions against 1 measured. That is the measurement resolving less, not the
+        # model being wrong, and the case docstrings say as much ("the two merge into one
+        # above-threshold region, so this only confirms the join is seamless").
+        # Collapse consecutive PREDICTED regions that fall inside one measured region's span, so
+        # the comparison is between the same physical groups. Uses the measured spans, so there
+        # is no invented gap threshold; if it cannot align, the mismatch still stands.
+        if len(m) < len(p) and m and measured_spans[label]:
+            grouped, gi = [], 0
+            for start, width in zip(m, measured_spans[label]):
+                stop = start + width
+                members = [x for x in p[gi:] if x <= stop + 1.0]
+                if not members:
+                    break
+                grouped.append(members[0])          # the group's FIRST predicted region
+                gi += len(members)
+            if len(grouped) == len(m) and gi == len(p):
+                p = grouped
+                p_int = [x - p[0] for x in p[1:]] if len(p) > 1 else []
+                merged_note = True
+
+        segmentation_ok = len(m) == len(p)
+        if segmentation_ok:
+            n = min(len(m_int), len(p_int))
+            errors = [m_int[i] - p_int[i] for i in range(n)]
+        else:
+            errors = []
+        if errors and label not in assumed_labels:
             worst = max(worst, max(abs(e) for e in errors))
         # Count and span, which the interval metric alone cannot see: a dropped or collapsed
         # train (e.g. an un-unrolled cache-pointer stream) merges to one region with no
@@ -206,10 +465,24 @@ def compare(folder, verbose=True):
         # showing MORE pulses than the trace predicted -- `dropped` -- which means the tracer
         # is missing pulses. (Measured FEWER than predicted is the opposite, benign case of
         # two pulses merging into one region, e.g. stretch_then_pulse.)
+        # region WIDTHS, comparable whenever both sides found the same regions -- this is what
+        # makes a single-region case (single, two_same_block, stretch, shape, barrier_single_channel,
+        # batch_nonblocking, stretch_then_pulse) an actual test instead of a vacuous 0.0 ns.
+        mw, pw = measured_spans[label], predicted_spans[label]
+        width_errors = ([mw[i] - pw[i] for i in range(len(mw))]
+                        if segmentation_ok and len(mw) == len(pw) else [])
+        if width_errors:
+            worst_width = max(abs(e) for e in width_errors)
+        else:
+            worst_width = 0.0
         span_m = (m[-1] - m[0]) if len(m) > 1 else 0.0
         span_p = (p[-1] - p[0]) if len(p) > 1 else 0.0
         rows.append({"channel": label, "n_measured": len(m), "n_predicted": len(p),
-                     "count_ok": len(m) == len(p),
+                     "count_ok": segmentation_ok,
+                     "predicted_merged": merged_note,
+                     # what was actually checked: 0 means this channel proves nothing
+                     "n_compared": len(errors),
+                     "segmentation_ok": segmentation_ok,
                      # only where the tracer drew SOME pulses: a channel it (correctly) left
                      # empty can still pick up a stray noise region, which is not a drop
                      "dropped": (max(0, len(m) - len(p)) if len(p) > 0 else 0),
@@ -219,6 +492,12 @@ def compare(folder, verbose=True):
                      # absolute first edge = the constant DAC->cable->ADC latency;
                      # only meaningful as a per-channel calibration constant
                      "first_edge_ns": round(m[0], 2) if m else None,
+                     "measured_widths_ns": [round(x, 1) for x in mw],
+                     "predicted_widths_ns": [round(x, 1) for x in pw],
+                     "width_error_ns": [round(e, 2) for e in width_errors],
+                     "worst_width_error_ns": round(worst_width, 2),
+                     # this channel's pulses come from an undecidable branch: reported, not scored
+                     "assumed_path": label in assumed_labels,
                      "measured_intervals_ns": [round(x, 2) for x in m_int],
                      "predicted_intervals_ns": [round(x, 2) for x in p_int],
                      "error_ns": [round(e, 2) for e in errors],
@@ -235,6 +514,10 @@ def compare(folder, verbose=True):
         "gap_breakdowns": [p.gap_breakdown
                            for p in (trace.placements or trace.blocks) if p.gap_after],
         "executed_blocks": len(trace.placements or trace.blocks),
+        # which arm of an undecidable branch the capture showed, when it could be decided
+        "resolved_arm": resolved_arm,
+        # kept so a GENERATED sequence can be classified by what it scheduled, not by its name
+        "trace": trace,
         "worst_error_ns": round(worst, 2),
         "worst_error_cycles": round(worst / trace.ns_per_cycle, 3),
         # channels where hardware shows more pulses than the trace drew: a structural miss
@@ -264,21 +547,59 @@ def compare(folder, verbose=True):
         print(f"    {trace.runtime_class}: {len(trace.blocks)} blocks, "
               f"gaps {result['gaps_ns']} ns")
         for row in rows:
-            if row["dropped"] > 0:
-                flag = (f"  <-- DROPPED {row['dropped']} pulses "
-                        f"(meas {row['n_measured']} > pred {row['n_predicted']}, "
-                        f"span meas/pred {row['span_measured_ns']}/{row['span_predicted_ns']} ns)")
+            if not row["segmentation_ok"]:
+                # Not a timing result: the two sides split the signal differently, so no interval
+                # pair is the same physical gap. Say so instead of printing a bogus error.
+                flag = (f"  <-- SEGMENTATION MISMATCH: measured {row['n_measured']} regions vs "
+                        f"predicted {row['n_predicted']} (span meas/pred "
+                        f"{row['span_measured_ns']}/{row['span_predicted_ns']} ns) -- "
+                        f"NOT COMPARED")
+            elif row.get("assumed_path"):
+                # An undecidable branch: the trace had to guess which arm ran, so this channel
+                # says nothing about the timing model either way (see predict()).
+                flag = ("  <-- ASSUMED PATH (undecidable branch) -- REPORTED, NOT SCORED"
+                        f"; would read {max(abs(e) for e in row['error_ns']):.2f} ns"
+                        if row["error_ns"] else "  <-- ASSUMED PATH -- NOT SCORED")
             elif row["error_ns"] and max(abs(e) for e in row["error_ns"]) >= 1.0:
                 flag = "  <-- MISMATCH"
+            elif row["error_ns"]:
+                flag = (f"  OK ({row['n_compared']} intervals"
+                        + (", predicted regions merged to match the detector"
+                           if row["predicted_merged"] else "") + ")")
+            elif row["width_error_ns"]:
+                # NOT a pass. Region width is threshold-biased and cannot be scored: the measured
+                # width is where the envelope crosses REGION_FLOOR_FRACTION of the peak, while the
+                # prediction is the DMA command length, so the difference carries the ramp shape
+                # and the floor. Measured here at 5-25 ns for fast ramps and 445 ns for `stretch`
+                # (whose mid-pulse park dips under the floor) -- all artifact, no model content.
+                # Reported as a diagnostic so a single-region case is not silently "0.0 ns OK";
+                # such cases are verified STRUCTURALLY against compiled.log instead.
+                flag = (f"  NO INTERVAL -- width diag only "
+                        f"(meas {row['measured_widths_ns']} vs pred {row['predicted_widths_ns']} ns, "
+                        f"threshold-biased, NOT scored)")
             else:
-                flag = "  OK" if row["error_ns"] else ""
+                flag = "  <-- NOTHING COMPARED (no interval and no comparable region width)"
             print(f"    {row['channel']}  pulses meas/pred {row['n_measured']}/{row['n_predicted']}"
                   f"  measured {row['measured_intervals_ns']}"
                   f"  predicted {row['predicted_intervals_ns']}"
                   f"  error {row['error_ns']} ns "
                   f"({row['error_cycles']} cyc){flag}")
-        print(f"    worst error: {result['worst_error_ns']} ns "
-              f"= {result['worst_error_cycles']} cycles")
+        widths = sum(len(r["width_error_ns"]) for r in rows)
+        worst_w = max((r["worst_width_error_ns"] for r in rows), default=0.0)
+        if widths:
+            print(f"    region widths (diagnostic only, threshold-biased): "
+                  f"{widths} channels, worst {worst_w} ns")
+        compared = sum(r["n_compared"] for r in rows)
+        if compared:
+            print(f"    worst error: {result['worst_error_ns']} ns "
+                  f"= {result['worst_error_cycles']} cycles  ({compared} intervals compared)")
+        elif widths:
+            print(f"    NO TIMING RESULT: no interval exists on any channel. Region widths are "
+                  f"reported above as a diagnostic only -- they are threshold-biased and are not "
+                  f"a check. This case's claim is covered structurally (trace vs compiled.log).")
+        else:
+            print(f"    NO TIMING RESULT: 0 intervals and 0 widths compared "
+                  f"(worst error 0.0 would be vacuous)")
         if "stream_ok" in result:
             print(f"    cache-pointer stream: {result['stream_gates']} gates unrolled "
                   f"(cache says {result['stream_expected']}), tail after train: "
@@ -288,11 +609,14 @@ def compare(folder, verbose=True):
 
 # ---------------------------------------------------------------- running
 
+FUZZ_STEPS = None       # set from --fuzz-steps; applies to the random_seq generator only
+
+
 def build_runtime(case, iterations=5000, dwell_length=200e-9):
-    from loopback_timing_cases import (
+    from loopback_timing_cases import (READOUT_CASES,
         LoopbackTimingCaseRuntime)
 
-    return LoopbackTimingCaseRuntime(
+    runtime = LoopbackTimingCaseRuntime(
         stimulus0="stimulus0", stimulus1="stimulus1",
         stimulus2="stimulus2", stimulus3="stimulus3",
         capture0="capture0", capture1="capture1",
@@ -304,8 +628,17 @@ def build_runtime(case, iterations=5000, dwell_length=200e-9):
         # the test_* cases compare a cached register against 0, so 0 forces the
         # condition true and 1 forces it false
         test_register_value=0 if "true" in case else 1,
+        # the measure_* cases put the resonator's capture on ADC1, so the sacrificial dummy
+        # capture must release it
+        use_dummy_channel=case not in READOUT_CASES,
+        # measure()/feedback cases need a cmacc for the resonator, so they trace only the two
+        # channels they actually read (see trace_channels on the runtime)
+        trace_channels=((0, 1) if case in READOUT_CASES else (0, 1, 2, 3)),
         yaml_path=YAML_PATH,
     )
+    if FUZZ_STEPS is not None:
+        runtime.fuzz_steps = FUZZ_STEPS
+    return runtime
 
 
 def dry_run(case, **kwargs):
@@ -314,37 +647,282 @@ def dry_run(case, **kwargs):
     The dry run calls the real ``acadia.compile()``, so anything the board would
     reject at compile time is rejected here too -- barrier_uneven's multi-argument
     max() is the example.
+
+    ``capture_points`` is deliberately LEFT ON. It used to be False here, which looks like a
+    harmless speed-up (these cases have exactly one point) but silently disabled branch
+    resolution: ``evaluate_condition`` reads the ``test`` register out of the captured cache, so
+    with no cache every ``test`` body is *assumed taken*. ``test_false`` then printed
+    "5 blocks, gaps [80.0, 75.0, 80.0]" -- byte-identical to ``test_true`` -- instead of the
+    skipped-body "4 executed, gaps [95.0, 80.0]" that is the harness's strongest single result.
+    ``assumed``/``UNSUPPORTED`` are reported below for the same reason: an assumed path must never
+    pass as a verified one.
     """
     from acadia_qmsmt import sequence_viz as sv
 
-    trace = sv.trace_runtime(build_runtime(case, **kwargs), capture_points=False,
-                             envelopes=False)
+    trace = sv.trace_runtime(build_runtime(case, **kwargs), envelopes=False)
     # gaps live on placements (what executes), not on blocks (what was compiled)
     executed = trace.placements or trace.blocks
     gaps = [round(p.gap_after * trace.ns_per_cycle, 1) for p in executed if p.gap_after]
     unrolled = ("" if len(executed) == len(trace.blocks)
                 else f" -> {len(executed)} executed")
+    flags = ""
+    if trace.assumed_paths:
+        flags += f"  ASSUMED blocks {sorted(trace.assumed_paths)}"
+    if getattr(trace, "unsupported_paths", None):
+        flags += f"  UNSUPPORTED blocks {sorted(trace.unsupported_paths)}"
     print(f"  {case:20s} OK   {len(trace.blocks)} blocks{unrolled}, "
-          f"{trace.length_ns:.0f} ns, gaps {gaps} ns")
+          f"{trace.length_ns:.0f} ns, gaps {gaps} ns{flags}")
     return trace
+
+
+def unsafe_reason(runtime):
+    """Why this runtime must not be deployed, or None if it is fine.
+
+    Two pre-flight checks, both asked of the MODEL rather than of a list of case names -- which is
+    the point of having a model you trust, and which covers cases nobody has thought of yet.
+
+    Traced ONCE and both checks applied to that trace: a runtime can only be traced once (its Acadia
+    holds the compiled program afterwards), so asking two questions that each traced it meant the
+    second silently returned "fine" for every runtime in existence.
+    """
+    from acadia_qmsmt import sequence_viz as sv
+
+    try:
+        # capture_points=True is REQUIRED: the register value comes from the per-point cache, and
+        # without it every register length falls back to `resolve_indeterminate` (0) and looks
+        # like an underflow. That false positive would have skipped every valid stretch point.
+        trace = sv.trace_runtime(runtime, capture_points=True, envelopes=False)
+    except Exception:
+        return None                              # cannot trace it; let the deploy decide
+    return underflow_note(trace) or nontermination_note(trace)
+
+
+def nontermination_note(trace):
+    """Refuse a sequence containing a loop that cannot exit.
+
+    MEASURED 2026-08-14: ``repeat_until(counter == 0)`` on a counter loaded 0 and incremented +1
+    per pass never returns from the board -- "Timeout occurred waiting for line", repeating, until
+    the run is killed. The same scan at 1..8 measures clean, so this is the degenerate target, not
+    the case. It also settles the semantics: test-before-body and test-after-body both predict N
+    passes for every N >= 1 and differ only at 0, so a hang proves the body always runs at least
+    once and the counter can never come back to 0.
+
+    Costing minutes of board time to rediscover that is avoidable, so the model says no first.
+    """
+    stuck = [e for e in trace.control_flow_summary() if e.get("nonterminating")]
+    if not stuck:
+        return None
+    first = stuck[0]
+    return (f"{first['kind']} @{first['block']} exits when its counter reaches 0, but the counter "
+            f"starts at 0 and is incremented before the test is next evaluated, so it never can. "
+            f"The board hangs (measured 2026-08-14). Use a target of 1 or more.")
+
+
+def underflow_note(trace):
+    """A register-driven length of zero, which acadia emits as an all-ones length field.
+
+    ``Acadia.command_dma`` writes ``length - 1``, so 0 wraps to ~328 us for an ARB command and
+    ~21 s for a 32-bit dwell. Deploying it wedges the run (repeated "Timeout occurred waiting for
+    line") and costs minutes of board time for no data. Cheaper to ask the model.
+    """
+    if not trace.length_underflows:
+        return None
+    first = trace.length_underflows[0]
+    return (f"register {first['register']} on {first['channel']} resolves to a ZERO-length "
+            f"{first['kind']}, which acadia emits as {first['cycles']} cycles "
+            f"({first['cycles'] * 5e-9:.1f} s). Floor it at one cycle "
+            f"(see dual_rail_ramsey._delay_cycles) rather than sweeping to 0.")
+
+
+def underflow_reason(runtime):
+    """``unsafe_reason`` restricted to the length-underflow check, for callers that want only it."""
+    from acadia_qmsmt import sequence_viz as sv
+
+    try:
+        trace = sv.trace_runtime(runtime, capture_points=True, envelopes=False)
+    except Exception:
+        return None
+    return underflow_note(trace)
+
+
+def capture_window_for(runtime):
+    """Seconds of ADC window that will actually cover this runtime's sequence.
+
+    Sized from an off-hardware trace rather than a constant, because the window has to hold the
+    whole sequence plus the ~283 ns cable latency plus a final pulse -- and a generated sequence
+    (random_seq) or a swept count (blocks_n=10, loop_count=8) has no fixed length. A window
+    shorter than the sequence silently truncates the recording: the yaml's 1.2e-6 recorded only
+    1070 ns of 2400-2610 ns cases, which is why the post-batch discriminator pulses those cases
+    exist to measure were missing entirely.
+    """
+    from acadia_qmsmt import sequence_viz as sv
+
+    try:
+        trace = sv.trace_runtime(runtime, capture_points=False, envelopes=False)
+    except Exception:
+        return CAPTURE_WINDOW_S                      # fall back to the constant
+    return max(CAPTURE_WINDOW_S, (trace.length_ns + 1200.0) * 1e-9)
 
 
 def run_case(case, iterations=5000, dwell_length=200e-9):
     """Deploy one timing case to the board. Returns the local data directory."""
     board_ip = paths_local.require("board_ip")
     save_root = paths_local.require("loopback_data_root")
+    window = capture_window_for(build_runtime(case, iterations=10, dwell_length=dwell_length))
     runtime = build_runtime(case, iterations=iterations, dwell_length=dwell_length)
+    # Record the WHOLE sequence, not just its first 1070 ns.
+    if not runtime.capture_length_override:
+        runtime.capture_length_override = window
     runtime.deploy(board_ip, local_directory=f"{save_root}/{case}/%y%m%d_%H%M%S")
     runtime.wait_for_deploy_completion()
     return runtime.local_directory
 
 
+def run_scan(spec):
+    """Sweep one field of one case over values, deploying and checking each point.
+
+    ``spec`` is ``CASE:FIELD=v1,v2,...``. Reports every point plus the worst error over the whole
+    scan, so a constant offset is distinguishable from one that grows with the swept quantity --
+    the discrimination the whole timing model rests on (a miscount scales with what it counts; a
+    fixed hardware latency does not).
+    """
+    case, _, rest = spec.partition(":")
+    field, _, values = rest.partition("=")
+    # Cast to the FIELD's type, not to whatever the literal looks like. Parsing "0" as an int
+    # because it has no "." or "e" sent a bare 0 into a seconds-valued field, and
+    # seconds_to_cycles rejects a non-float outright ("must be a float or numpy array of
+    # floats") -- so the one scan point that mattered, a zero-length register command, died in
+    # the runtime instead of being measured.
+    probe_type = type(getattr(build_runtime(case, iterations=10), field, 0.0))
+    cast = float if probe_type is float else (int if probe_type is int else float)
+    points = [cast(v) for v in values.split(",") if v.strip()]
+    if not (case and field and points):
+        raise SystemExit(f"--scan needs CASE:FIELD=v1,v2,...; got {spec!r}")
+
+    board_ip = paths_local.require("board_ip")
+    save_root = paths_local.require("loopback_data_root")
+    print(f"scan: {case}.{field} over {points}\n")
+    rows, worst_overall = [], 0.0
+    for value in points:
+        probe = build_runtime(case, iterations=10)
+        setattr(probe, field, value)
+        unsafe = unsafe_reason(probe)
+        if unsafe:
+            # skip this POINT, not the scan: the rest of the sweep is still worth measuring
+            print(f"  {field}={value:<12g} SKIPPED -- {unsafe}")
+            continue
+        window = capture_window_for(probe)
+        runtime = build_runtime(case, iterations=5000)
+        setattr(runtime, field, value)
+        if not runtime.capture_length_override:
+            runtime.capture_length_override = window
+        tag = f"{field}_{value:g}".replace(".", "p").replace("-", "m")
+        runtime.deploy(board_ip, local_directory=f"{save_root}/{case}__{tag}/%y%m%d_%H%M%S")
+        runtime.wait_for_deploy_completion()
+        result = compare(runtime.local_directory, verbose=False)
+        worst = result["worst_error_ns"]
+        compared = sum(r["n_compared"] for r in result["rows"])
+        rows.append((value, worst, compared))
+        worst_overall = max(worst_overall, worst if compared else 0.0)
+        status = "OK" if (compared and worst < 0.5) else ("no interval" if not compared else "FAIL")
+        print(f"  {field}={value:<12g} worst {worst:7.2f} ns  ({compared} intervals)  {status}")
+    print(f"\nscan worst over {len(rows)} points: {worst_overall:.2f} ns")
+    return 0 if worst_overall < 0.5 else 1
+
+
+#: Triple enumeration defaults to the primitives whose timing depends on FIFO/branch state --
+#: the ones every bug found so far involved. 5**3 = 125 deploys, against 1000 for the full
+#: alphabet; the rest (block/dwell/stretch) are covered as neighbours by the pair sweep.
+TRIPLE_SUBSET = ("block", "batch", "batch_almost", "loop", "test_taken")
+
+
+def run_pairs(only=None, triples=None):
+    """Deploy every ordered pair of scheduling primitives and check each.
+
+    Exhaustive rather than probabilistic. Scheduling errors are properties of a JOIN -- what
+    runs immediately before or after a construct -- not of a construct in isolation: both bugs
+    this harness found were adjacency bugs (a drain followed by a loop back-edge, and a drain's
+    release level feeding whatever came next). A random walk only probably produces any given
+    join; enumerating the pairs guarantees every one of them is measured at least once.
+    """
+    from loopback_timing_cases import PRIMITIVES
+
+    board_ip = paths_local.require("board_ip")
+    save_root = paths_local.require("loopback_data_root")
+    if triples is not None:
+        alphabet = list(triples) if triples else list(TRIPLE_SUBSET)
+        pairs = [(a, b, c) for a in alphabet for b in alphabet for c in alphabet]
+    else:
+        pairs = [(a, b) for a in PRIMITIVES for b in PRIMITIVES
+                 if only is None or only in (a, b)]
+    print(f"enumeration: {len(pairs)} ordered "
+          f"{'triples' if triples is not None else 'pairs'}\n")
+
+    worst_overall, failures, skipped = 0.0, [], []
+    for index, combo in enumerate(pairs, 1):
+        first, second, third = (list(combo) + [""])[:3]
+        tag = "__".join(k for k in (first, second, third) if k)
+        try:
+            probe = build_runtime("pair_seq", iterations=10)
+            probe.pair_a, probe.pair_b, probe.pair_c = first, second, third
+            window = capture_window_for(probe)
+            runtime = build_runtime("pair_seq", iterations=5000)
+            runtime.pair_a, runtime.pair_b, runtime.pair_c = first, second, third
+            if not runtime.capture_length_override:
+                runtime.capture_length_override = window
+            runtime.deploy(board_ip,
+                           local_directory=f"{save_root}/pair_{tag}/%y%m%d_%H%M%S")
+            runtime.wait_for_deploy_completion()
+            result = compare(runtime.local_directory, verbose=False)
+        except Exception as exc:                      # a pair that will not build or deploy
+            skipped.append((tag, f"{type(exc).__name__}: {exc}"))
+            print(f"  [{index:3d}/{len(pairs)}] {tag:34s} SKIPPED ({type(exc).__name__})")
+            continue
+        worst = result["worst_error_ns"]
+        compared = sum(r["n_compared"] for r in result["rows"])
+        status = "OK" if (compared and worst < 0.5) else ("no interval" if not compared else "FAIL")
+        if status == "FAIL":
+            failures.append((tag, worst))
+        if compared:
+            worst_overall = max(worst_overall, worst)
+        print(f"  [{index:3d}/{len(pairs)}] {tag:34s} worst {worst:7.2f} ns "
+              f"({compared} intervals)  {status}")
+
+    print(f"\npairs: {len(pairs)}  worst {worst_overall:.2f} ns  "
+          f"failures {len(failures)}  skipped {len(skipped)}")
+    for tag, worst in failures:
+        print(f"   FAIL    {tag:34s} {worst:.2f} ns")
+    for tag, why in skipped:
+        print(f"   SKIPPED {tag:34s} {why}")
+    return 1 if failures else 0
+
+
 def main():
+    global FUZZ_STEPS
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", type=str, default=None)
     parser.add_argument("--cases", type=str, default=None,
                         help="comma-separated list, run in one invocation")
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--scan", default=None, metavar="CASE:FIELD=v1,v2,...",
+                        help="sweep one runtime field over values for one case, deploying and "
+                             "checking each. e.g. --scan dwell_n:dwell_length=100e-9,200e-9,300e-9 "
+                             "or --scan blocks_n:n_blocks=2,3,4,5,6. Turns a spot check into a "
+                             "curve: a model error that is a fixed offset and one that scales with "
+                             "the swept quantity look identical at a single point.")
+    parser.add_argument("--triples", default=None, metavar="P1,P2,...",
+                        help="deploy every ordered TRIPLE over the given primitives "
+                             "(default: the interaction-prone subset)")
+    parser.add_argument("--pairs-only", default=None, metavar="PRIMITIVE",
+                        help="restrict --pairs to ordered pairs involving this primitive")
+    parser.add_argument("--pairs", action="store_true",
+                        help="deploy EVERY ordered pair of scheduling primitives (exhaustive "
+                             "adjacency coverage; see PRIMITIVES in loopback_timing_cases)")
+    parser.add_argument("--fuzz-steps", type=int, default=None,
+                        help="random_seq: how many primitive steps to compose per sequence")
+    parser.add_argument("--include-unsafe", action="store_true",
+                        help="also deploy cases in UNSAFE_TO_DEPLOY (test_false_nospec hangs "
+                             "the sequencer -- see KI_004)")
     parser.add_argument("--analyse", type=str, default=None,
                         help="analyse an existing folder without deploying")
     parser.add_argument("--regions", type=str, default=None,
@@ -359,6 +937,15 @@ def main():
                         help="dump the compiled sequencer program for a case (dry run)")
     parser.add_argument("--iterations", type=int, default=5000)
     args = parser.parse_args()
+    if args.fuzz_steps is not None:
+        FUZZ_STEPS = args.fuzz_steps
+
+    if args.triples is not None:
+        subset = [s for s in args.triples.split(",") if s.strip()] or None
+        return run_pairs(triples=subset)
+
+    if args.pairs or args.pairs_only:
+        return run_pairs(only=args.pairs_only)
 
     if args.program:
         # Tagged dump of the compiled program, so control-flow edges can be read off.
@@ -421,7 +1008,7 @@ def main():
                 print(f"{case_dir.name:22s} {'-':>6s} {'-':>22s}  "
                       f"{type(exc).__name__}")
                 continue
-            note = KNOWN_SYSTEMATIC.get(case_dir.name)
+            note = systematic_note(case_dir.name, trace=result.get("trace"))
             if not note:
                 worst_overall = max(worst_overall, result["worst_error_ns"])
             # dropped pulses / a collapsed cache-pointer stream are structural misses the
@@ -498,12 +1085,26 @@ def main():
         return
 
     from loopback_timing_cases import CASES
+    if args.scan:
+        return run_scan(args.scan)
+
     if args.all:
-        cases = list(CASES)
+        cases = [c for c in CASES if c not in UNSAFE_TO_DEPLOY or args.include_unsafe]
+        for case, why in UNSAFE_TO_DEPLOY.items():
+            if case in CASES and not args.include_unsafe:
+                print(f"  SKIPPING {case} -- {why}. Use --include-unsafe to deploy it anyway.")
     elif args.cases:
         cases = [c.strip() for c in args.cases.split(",") if c.strip()]
     else:
         cases = [args.case or "two_blocks"]
+
+    if not args.include_unsafe:
+        blocked = [c for c in cases if c in UNSAFE_TO_DEPLOY]
+        if blocked:
+            raise SystemExit(
+                "refusing to deploy " + ", ".join(blocked) + ":\n  "
+                + "\n  ".join(f"{c}: {UNSAFE_TO_DEPLOY[c]}" for c in blocked)
+                + "\nPass --include-unsafe if you really mean to.")
 
     results = []
     for case in cases:

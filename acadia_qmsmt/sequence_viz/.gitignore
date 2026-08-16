@@ -8,3 +8,9 @@ assembled.log
 # machine/board-specific validation paths (copy paths.local.example.yaml)
 /validation/paths.local.yaml
 /validation/timing_validation_results.json
+# archive_sweep's class -> folder cache: absolute paths into this station's data root
+/validation/archive_classes.json
+# nesting_boxes.py / stress_campaign.py path caches: ~50k absolute paths into
+# this station's data root, regenerated on every run
+/validation/nesting_index.txt
+/validation/stress_index.txt
