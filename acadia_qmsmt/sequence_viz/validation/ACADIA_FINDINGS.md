@@ -1111,3 +1111,413 @@ What this establishes that the earlier sweeps did not:
 
 **No viewer-side problem found.**
 
+
+### Archive sweep  
+*2026-08-16 12:06*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 12:41*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 13:17*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 13:52*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 14:25*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 15:00*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 15:40*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 16:20*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 16:56*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 17:30*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 18:07*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 18:41*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 19:14*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 19:48*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 20:21*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 20:56*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 21:30*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 22:04*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 22:38*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 23:12*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-16 23:50*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 00:23*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 00:57*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 01:33*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 02:06*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 02:40*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 03:15*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 03:51*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 04:26*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 05:02*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 05:37*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 06:14*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 06:48*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 07:22*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 07:56*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 08:31*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 09:05*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 09:39*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 10:13*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 10:46*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
+
+### Archive sweep  
+*2026-08-17 11:20*
+
+- Traced **300** archived runs across **29** runtime classes.
+- `compiled.log` cross-check: **291 match, 0 mismatch**, 9 raised.
+- Of the 9 that raised, **9** were the original run failing the same way on the board (not viewer faults).
+
+**No viewer-side problem found.**
+
