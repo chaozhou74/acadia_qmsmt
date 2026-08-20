@@ -211,6 +211,14 @@ def machine_layout(trace):
     # passes took 12 s (100 000, which the panel's spin box allowed, never finished at all).
     executed_nths = {nth_of_block.get(entry[0]) for entry in plan}
     executed_nths.discard(None)
+    # Blocks with NO trigger of their own -- a `channel_synchronizer(trigger=False)` only queues,
+    # so nothing anchors it to a program address. `executed_nths` cannot speak for them, and a
+    # `test` arm built that way is invisible to the branch accounting unless it is named
+    # separately. Both are properties of the plan, so both are computed once (see the note above:
+    # rebuilding per placement made the layout quadratic).
+    executed_indices = {entry[0] for entry in plan}
+    unanchored_blocks = [i for i, b in enumerate(self.blocks)
+                         if nth_of_block.get(i) is None and (getattr(b, "conditional", ()) or ())]
     for step, (index, iteration, path) in enumerate(plan):
         block = self.blocks[index]
         placement = Placement(index=index, iteration=iteration, path=path,
@@ -375,9 +383,31 @@ def machine_layout(trace):
         drain_edge = None
         if (placement.blocking or nth_of_block.get(index) in drains) and step + 1 < len(plan):
             from_nth = nth_of_block.get(index)
-            to_nth = nth_of_block.get(plan[step + 1][0])
+            # The next block ANCHORED IN THE PROGRAM, not simply the next one executed. A
+            # `channel_synchronizer(trigger=False)` block emits no DMA trigger, so it has no
+            # trigger address and no entry here -- and the old lookup then found None and gave
+            # up, charging NOTHING for the whole stretch: the queued block's own command pushes,
+            # the `channel_trigger` bus write that fires them, and the condition-plus-branch of
+            # every `test` arm skipped along the way. Measured on the loopback (test_chain,
+            # trigger=False, arm 0 taken) the sequencer really spends 75 ns on that stretch with
+            # no skips at all, plus 25 ns for each arm skipped, while the model predicted a flat
+            # 305 ns for 1, 2, 4 and 8 arms alike. Looking ahead to the next block that DOES have
+            # a trigger puts those instructions back inside one edge, which is where the hardware
+            # pays them: the sequencer fetches straight through the queued blocks without
+            # stopping, because there is nothing to stop for until something is triggered.
+            to_nth, ahead = None, step + 1
+            while ahead < len(plan):
+                to_nth = nth_of_block.get(plan[ahead][0])
+                if to_nth is not None:
+                    break
+                ahead += 1
             if from_nth is not None and to_nth is not None:
-                edge = edge_gap(self.control_flow, from_nth, to_nth, executed_nths)
+                # Which trigger-less `test` arms lie on THIS stretch, and which of them ran.
+                # In program order, because the compiled branches are in program order too, so
+                # the k-th such branch the path walk meets is the k-th arm here.
+                arms = [i in executed_indices for i in unanchored_blocks
+                        if index < i < plan[ahead][0]]
+                edge = edge_gap(self.control_flow, from_nth, to_nth, executed_nths, arms)
                 drain_edge = edge
                 if edge and not placement.blocking:
                     pass          # a drain block carries no gap_after; it advances t_seq below

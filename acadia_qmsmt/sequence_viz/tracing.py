@@ -1441,7 +1441,73 @@ def sequencer_control_flow(acadia):
             "back_branches": [(b, t) for b, t in branches if t < b]}
 
 
-def edge_gap(control_flow, from_nth, to_nth, executed_nths=()):
+def _branch_is_taken(at, target, goal, triggers, executed, arms):
+    """Would the sequencer take this branch on the path it actually ran?
+
+    Decided from the program and from which blocks executed -- never from the branch's own
+    condition, which is a runtime value the compiled program does not carry.
+
+    ``arms`` is a mutable list of "did it run?" flags for the trigger-less `test` arms on this
+    stretch, in program order. A `channel_synchronizer(trigger=False)` arm emits no DMA trigger,
+    so its branch skips a range containing no trigger at all and there is nothing in the program
+    to match it against; the flags come from the execution plan instead and are consumed in the
+    order the walk meets them, which is program order for both.
+    """
+    if target < at:                       # backward: a loop back edge
+        return goal < at                  # the goal is behind us, so the edge is the only way
+    if at < goal < target:
+        return False                      # taking it would jump OVER the block we are going to
+    skipped = [t for t in triggers if at < t < target]
+    if not skipped:
+        if arms:
+            return not arms.pop(0)        # a queued arm: taken exactly when it did not run
+        return False                      # skips no block at all: not a body-skip branch
+    return not any(t in executed for t in skipped)
+
+
+def _executed_path(control_flow, poll, goal, executed_nths, arms=()):
+    """Instructions FETCHED walking from ``poll`` to ``goal``, and the branch penalty paid.
+
+    Counting an address range is only right while control stays in address order, and it does
+    not: a `test` arm whose condition fails is jumped over, and a loop takes its back edge. The
+    old code handled that by counting one range and then subtracting the one skipped body it
+    could find between the poll and the FIRST branch -- so a CHAIN of skipped arms (the prep
+    selector: one `test(sel == i)` per prep state, at most one taken) had every skip after the
+    first counted as though it had run. Measured on the loopback with test_chain, arm 0 taken:
+
+        arms      1     2     4     8
+        measured  365   390   440   540   ns      <- 25 ns per skipped arm, flat
+        old model 365   390   520   780   ns      <- +40 ns per skipped arm beyond the first
+
+    Walking the path has no such blind spot: every skip costs its own condition plus one taken
+    branch and nothing for the body it jumps over, which is what the hardware does and why the
+    measured slope does not care how big the arm is.
+
+    Returns ``(fetched, penalty)``, or ``None`` if the walk does not reach the goal -- in which
+    case the caller keeps the address-order count rather than trusting a partial walk.
+    """
+    triggers = control_flow["triggers"]
+    branch_at = dict(control_flow["branches"])
+    executed = {triggers[n] for n in (executed_nths or ()) if 0 <= n < len(triggers)}
+    limit = 4 * (max(triggers, default=0) + len(branch_at) + 2)
+    fetched = penalty = 0
+    pc = poll
+    pending = list(arms)                         # consumed in program order by the walk
+    for _ in range(limit):
+        if pc == goal:
+            return fetched + 1, penalty          # the goal instruction is fetched too
+        fetched += 1
+        target = branch_at.get(pc)
+        if target is not None and _branch_is_taken(pc, target, goal, triggers, executed,
+                                                   pending):
+            pc = target
+            penalty += MEASURED_BRANCH_PENALTY
+        else:
+            pc += 1
+    return None
+
+
+def edge_gap(control_flow, from_nth, to_nth, executed_nths=(), arms=()):
     """Dead cycles between two executed blocks, and how it breaks down.
 
     ``from_nth``/``to_nth`` index the compiled program's trigger list. A backward edge picks
@@ -1461,6 +1527,16 @@ def edge_gap(control_flow, from_nth, to_nth, executed_nths=()):
         issue = triggers[to_nth] - poll + 1
         penalty = 0
         kind = "fall-through"
+        # ...unless trigger-less `test` arms sit on this stretch. Then control does leave address
+        # order even though the next ANCHORED block is the very next one: each skipped arm's
+        # branch is taken, jumping over pushes the straight count would charge for. Measured on
+        # the loopback (test_chain, trigger=False): 25 ns per skipped arm, against the 15 ns a
+        # plain address count gives -- the branch is paid for and its 2 pushes are not.
+        if arms and not all(arms):
+            walked = _executed_path(control_flow, poll, triggers[to_nth], executed_nths, arms)
+            if walked is not None:
+                issue, penalty = walked
+                kind = f"fall-through, {sum(1 for a in arms if not a)} queued arm(s) skipped"
     else:
         # The executed path leaves address order: find the branch that redirects to a
         # point from which the target block's trigger is reached by running forward.
@@ -1475,6 +1551,21 @@ def edge_gap(control_flow, from_nth, to_nth, executed_nths=()):
         penalty = MEASURED_BRANCH_PENALTY
         kind = ("taken branch (loop back)" if target < branch
                 else "taken branch (skip)")
+
+        # Prefer WALKING the executed path over counting address ranges: the two agree while
+        # control stays in order and part ways as soon as more than one body is skipped on the
+        # way (see _executed_path). The address count stays as the fallback for a walk that
+        # cannot reach the target, so an unfamiliar program shape degrades to the old answer
+        # instead of to a wrong one.
+        walked = _executed_path(control_flow, poll, triggers[to_nth], executed_nths, arms)
+        if walked is not None:
+            issue, penalty = walked
+            skips = penalty // MEASURED_BRANCH_PENALTY
+            kind = ("taken branch (loop back)" if target < branch
+                    else "taken branch (skip)")
+            if skips > 1:
+                kind += f" x{skips}"
+            return {"issue": issue, "branch_penalty": penalty, "kind": kind}
 
         # A SKIPPED BLOCK on this stretch was counted as executed. The run above is a straight
         # instruction count from the poll to `branch`, but if a `test` body between them was

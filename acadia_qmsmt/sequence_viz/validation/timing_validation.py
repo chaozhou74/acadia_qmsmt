@@ -897,6 +897,18 @@ def run_pairs(only=None, triples=None):
     return 1 if failures else 0
 
 
+def reportable(result):
+    """A result without the live objects, for the JSON report.
+
+    ``compare()`` hands back the SequenceTrace itself so callers can ask it further questions
+    (systematic_note does). It is not serialisable, so every path that writes the report has to
+    drop it -- and `--case`/`--cases` did not, which raised TypeError AFTER the deploy and the
+    comparison had both succeeded: the measurement was done and thrown away at the last step.
+    Stripped here, at the one boundary where serialisation happens, rather than at each caller.
+    """
+    return {k: v for k, v in result.items() if k != "trace"}
+
+
 def main():
     global FUZZ_STEPS
     parser = argparse.ArgumentParser()
@@ -1117,7 +1129,7 @@ def main():
             results.append({"case": case, "error": f"{type(exc).__name__}: {exc}"})
 
     previous = json.loads(REPORT.read_text()) if REPORT.exists() else []
-    REPORT.write_text(json.dumps(previous + results, indent=2))
+    REPORT.write_text(json.dumps(previous + [reportable(r) for r in results], indent=2))
     print(f"\nwrote {REPORT}")
 
 

@@ -61,6 +61,9 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          # repeat_until and test, exhaustively
          "repeat_until_op", "repeat_until_count_n", "test_nested",
          "test_in_counter_loop", "counter_loop_in_test",
+         # a CHAIN of mutually exclusive tests -- the prep-selector shape: what a skipped
+         # test costs, and whether the deferred-trigger join dwell is load-bearing
+         "test_chain",
          # the almost_empty drain -- the ONLY drain variant the real runtimes use
          "batch_drain_almost", "batch_in_loop_almost",
          # generated sequences: random compositions, and the exhaustive pair enumeration
@@ -144,6 +147,16 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     pair_b: str = "block"             # pair_seq: second primitive
     pair_c: str = ""                  # pair_seq: optional THIRD primitive (triple enumeration)
     repeat_operator: str = "=="       # repeat_until_op: which comparison the loop comes out on
+    # test_chain: the PREP-SELECTOR shape -- N mutually exclusive tests on one register, at
+    # most one taken. `test_register_value` picks which arm is taken (>= chain_tests -> none).
+    chain_tests: int = 4              # how many tests in the chain
+    chain_sync: str = "blocking"      # "blocking" | "trigger_false" | "block_false"
+    chain_join: str = "dwell"         # trigger_false only: "dwell" (1-cycle join) | "none"
+    chain_after: str = "other"        # the block after the chain: "other" channel | "same"
+    chain_body: int = 1               # pulses scheduled per arm. A real prep arm is a whole
+                                      # pulse list, so this asks the question that decides
+                                      # whether a skip is O(1) or O(body): does the cost of
+                                      # NOT running an arm grow with what the arm contains?
     exclude_stretch: bool = False     # generated cases: leave `stretch` out of the alphabet
     fuzz_steps: int = 6               # random_seq: how many primitive steps to compose
     batch_resync_pulses: int = 8      # batch_resync: how many pulses the block=False batches play
@@ -754,6 +767,58 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         stimuli[1].schedule_pulse(pulse)
                 with a.channel_synchronizer():
                     stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "test_chain":
+                # The PREP-SELECTOR shape, from resonator_number_measurement: one
+                # `test(sel == i)` per prep state, at most one taken, the rest skipped.
+                #
+                # The question this measures is what a SKIPPED test costs. It is easy to
+                # assume "nearly nothing" -- the body is jumped over, so no pulse plays and
+                # no DMA is touched. But the sequencer still has to evaluate the condition
+                # and take a branch for every arm it skips, and those are instruction
+                # fetches at 5 ns each. A marker pulse before and after the chain makes the
+                # marker interval the chain's whole cost, so sweeping `chain_tests` reads
+                # the per-skipped-test overhead straight off the board:
+                #
+                #     --scan test_chain:chain_tests=1,2,4,8,16
+                #
+                # chain_sync selects which synchronizer the arms use, which is the choice a
+                # runtime actually has to make (see the KB pattern
+                # deferred_prep_trigger_removes_branch_dead_time); chain_join / chain_after
+                # answer whether the 1-cycle join dwell is load-bearing.
+                sel = a.sequencer().Register()
+                sel.load(cache[0])                      # = test_register_value
+                with a.channel_synchronizer():
+                    stimuli[0].schedule_pulse(pulse)    # marker A: the chain starts after this
+                for i in range(int(self.chain_tests)):
+                    with a.sequencer().test(sel == i):
+                        kw = ({"trigger": False} if self.chain_sync == "trigger_false"
+                              else {"block": False} if self.chain_sync == "block_false"
+                              else {})
+                        with a.channel_synchronizer(**kw):
+                            for _k in range(int(self.chain_body)):
+                                stimuli[1].schedule_pulse(pulse)
+                                if _k + 1 < int(self.chain_body):
+                                    a.barrier()          # one command per pulse, as a list does
+                if self.chain_sync == "trigger_false":
+                    # nothing has fired yet -- every arm only QUEUED its commands
+                    a.channel_trigger(stimuli[1].channel)
+                    if self.chain_join == "dwell":
+                        one_cycle = 1.0 / self.acadia.sequencer_clock_frequency()
+                        with a.channel_synchronizer():
+                            stimuli[1].dwell(one_cycle)
+                # marker B. By DEFAULT on the same channel as marker A and a DIFFERENT one
+                # from the arms: ch0 then carries both markers, so the marker interval is the
+                # chain's cost and is measurable WITHIN one channel (the harness compares
+                # intervals per channel -- markers on two different channels give no interval
+                # at all and the case scores nothing).
+                # It is also the case where the join matters: a blocking synchronizer only
+                # ever waits on its OWN channels, so a marker on ch0 is not held back by an
+                # arm still playing on ch1. "same" puts marker B on the arm's channel, where
+                # the DMA FIFO orders the two commands whether or not the sequencer waited.
+                after = stimuli[1] if self.chain_after == "same" else stimuli[0]
+                with a.channel_synchronizer():
+                    after.schedule_pulse(pulse)         # marker B
 
             elif self.case == "test_in_counter_loop":
                 # A conditional inside a counter loop: the branch cost is paid on EVERY pass, so
