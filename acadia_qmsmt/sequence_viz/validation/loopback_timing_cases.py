@@ -64,6 +64,16 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          # a CHAIN of mutually exclusive tests -- the prep-selector shape: what a skipped
          # test costs, and whether the deferred-trigger join dwell is load-bearing
          "test_chain",
+         # FPGA-LOOPED COUNTING ROUNDS (resonator_number_measurement design A/B).
+         # Q1 barrier survival, Q2 the register->duration law, Q3/Q4 whether a manual
+         # register dwell tracks a stretched or a STREAMED pulse, Q5 the zero wrap,
+         # Q6 the whole round body in an FPGA loop, both designs.
+         "stretch_barrier_twochan", "stretch_duration_law", "stretch_dwell_align",
+         "direct_dwell_align", "stretch_zero", "stretch_barrier_align",
+         # ...and the same comparison with a REAL measure() in the block, which is
+         # the shape resonator_number_measurement actually deploys
+         "stretch_measure_dwell", "stretch_measure_barrier",
+         "loop_measure_feedback", "loop_stream_feedback",
          # the almost_empty drain -- the ONLY drain variant the real runtimes use
          "batch_drain_almost", "batch_in_loop_almost",
          # generated sequences: random compositions, and the exhaustive pair enumeration
@@ -75,6 +85,17 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
 # rb-pulse allocation, and the cache fill. rb_stream_uniform is rb_stream with uniform-amplitude
 # final gates (clean timing of the back-to-back block; see README on the edge-detection artifact).
 STREAM_CASES = ("rb_stream", "rb_stream_uniform", "stream_then_batch")
+
+#: The FPGA-looped counting round (resonator_number_measurement). They share the caches:
+#: a per-round LENGTH in cycles, a per-round DMA command word for the streamed design,
+#: and a record array the sequencer writes the CMACC quadrant back into.
+COUNTING_CASES = ("stretch_barrier_twochan", "stretch_duration_law",
+                  "stretch_measure_dwell", "stretch_measure_barrier",
+                  "stretch_dwell_align", "stretch_barrier_align",
+                  "direct_dwell_align", "stretch_zero",
+                  "loop_measure_feedback", "loop_stream_feedback")
+#: ...of those, the ones that stream a DMA word instead of stretching a pulse.
+COUNTING_STREAM_CASES = ("direct_dwell_align", "loop_stream_feedback")
 
 # Cases that read out through MeasurableResonator. They need the resonator built BEFORE attach()
 # (its window/accumulation memories must exist to be mapped), one cmacc module of their own, and
@@ -92,7 +113,11 @@ PRIMITIVES = ("block", "batch", "batch_almost", "dwell", "reg_dwell",
 
 
 READOUT_CASES = ("measure_readout", "measure_two_rounds", "feedback_reset",
-                 "measure_trace_case", "loop_with_measure", "measure_multi")
+                 "measure_trace_case", "loop_with_measure", "measure_multi",
+                 # the counting-round body: swap -> readout -> quadrant -> conditional pi
+                 "loop_measure_feedback", "loop_stream_feedback",
+                 # a register-driven swap and a real readout in ONE block, dwell vs barrier
+                 "stretch_measure_dwell", "stretch_measure_barrier")
 
 
 class LoopbackTimingCaseRuntime(QMsmtRuntime):
@@ -153,6 +178,13 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     chain_sync: str = "blocking"      # "blocking" | "trigger_false" | "block_false"
     chain_join: str = "dwell"         # trigger_false only: "dwell" (1-cycle join) | "none"
     chain_after: str = "other"        # the block after the chain: "other" channel | "same"
+    # The counting-round cases. `count_cycles` is the register-driven flat length in CYCLES
+    # (design A) or the length written into the parallel cache (design B); `count_rounds` is how
+    # many loop passes to run.
+    count_cycles: int = 40            # flat length in sequencer cycles, from cache[0]
+    count_rounds: int = 3             # loop passes for the loop_* cases
+    count_ramp_grid: bool = True      # snap the manual readout dwell onto the cycle grid
+
     chain_body: int = 1               # pulses scheduled per arm. A real prep arm is a whole
                                       # pulse list, so this asks the question that decides
                                       # whether a skip is O(1) or O(body): does the cost of
@@ -230,10 +262,20 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # it reaches a final pointer held in a register. The pulse COUNT lives in
         # rb_num_cache and each played command in rb_cmd_cache -- both captured per point,
         # so both are recoverable off-hardware even though the tracer today drops them.
+        # The counting round's caches. length_cache carries one flat length (CYCLES) per round,
+        # record_cache is what the sequencer writes each round's CMACC quadrant into -- prefilled
+        # with -1 so "the loop never wrote" is distinguishable from "the loop wrote quadrant 0".
+        length_cache = record_cache = None
+        if self.case in COUNTING_CASES:
+            rounds = max(int(self.count_rounds), 1)
+            length_cache = self.acadia.CacheArray(shape=(rounds,), dtype=np.dtype("<i4"))
+            record_cache = self.acadia.CacheArray(shape=(rounds,), dtype=np.dtype("<i4"))
+
         rb_cmd_cache = rb_num_cache = None
-        if self.case in STREAM_CASES:
-            rb_cmd_cache = self.acadia.CacheArray(shape=int(rb_count),
-                                                  dtype=np.dtype("<i4"))
+        if self.case in STREAM_CASES or self.case in COUNTING_STREAM_CASES:
+            words = (max(int(self.count_rounds), 1)
+                     if self.case in COUNTING_STREAM_CASES else int(rb_count))
+            rb_cmd_cache = self.acadia.CacheArray(shape=words, dtype=np.dtype("<i4"))
             rb_num_cache = self.acadia.CacheArray(shape=1, dtype=np.dtype("<i4"))
 
         # Only the channels actually captured. A uniform group that is declared and never
@@ -249,6 +291,9 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         def dac_sequence(a: Acadia):
             """The part under test. Everything else is identical across cases."""
             pulse = self.stimulus_pulse_name
+            # the shortest legal dwell. ZERO cycles is not zero: command_dma emits `length - 1`,
+            # so 0 wraps to an all-ones field (~21 s) -- which is what stretch_zero probes.
+            one_cycle_s = 1.0 / self.acadia.sequencer_clock_frequency()
 
             if self.case == "single":
                 with a.channel_synchronizer():
@@ -425,7 +470,162 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 # captured here -- their cmacc modules are what the resonator needs.
                 marker = stimuli[1]
 
-                if self.case == "measure_multi":
+                if self.case in ("stretch_measure_dwell", "stretch_measure_barrier"):
+                    # THE shape resonator_number_measurement deploys: a register-driven swap and
+                    # the round's readout in ONE block, the readout waiting out the swap. The two
+                    # variants differ only in HOW that wait is expressed -- by hand, or left to a
+                    # barrier -- so the readout's arrival time is the whole comparison.
+                    #
+                    # The resonator's stimulus is ch0, so the swap goes on ch1: a barrier has to
+                    # pad the readout's DAC *and* its ADC capture chain against an indeterminate
+                    # length, which is strictly more than the two-channel case asks of it.
+                    length_reg = a.sequencer().Register()
+                    length_reg.load(cache[0])
+                    ramp = stimuli[1].get_config("pulses", "stretch_pulse", "ramp")
+                    ramp = float(self.acadia.seconds_to_cycles(
+                        ramp, rounding_raise=False)) / self.acadia.sequencer_clock_frequency()
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+                        if self.case == "stretch_measure_barrier":
+                            a.barrier()
+                        else:
+                            stimuli[0].dwell(ramp)
+                            stimuli[0].dwell(length_reg)
+                        resonator.measure(pulse, "readout_accumulated", "boxcar")
+
+                elif self.case in ("loop_measure_feedback", "loop_stream_feedback"):
+                    # Q6. The WHOLE counting round, inside an FPGA loop: length (or command) read
+                    # from a cache through a pointer DSP, the swap, a real readout, the CMACC
+                    # quadrant latched and written back through a second pointer, a conditional
+                    # reset, and both pointers advanced. Nothing in the suite combined a register
+                    # length OR a stream with a real measure() and a branch, so this is the shape
+                    # the runtime actually deploys and the one no case covered.
+                    #
+                    # `test(pointer != final)` outside `repeat_until(pointer == final)` is not
+                    # belt-and-braces: repeat_until is a DO-while, so with zero rounds the body
+                    # would still run once. The guard is what makes the loop able to run zero times.
+                    stream = self.case == "loop_stream_feedback"
+                    base = a._firmware.sequencer_bus_decoder["cache"].address().value()
+                    length_reg = a.sequencer().Register()
+                    feedback = a.sequencer().Register()
+                    final = a.sequencer().Register()
+                    length_pointer = a.sequencer().DSP()
+                    record_pointer = a.sequencer().DSP()
+                    command_reg = a.sequencer().Register() if stream else None
+                    # a THIRD pointer: the command word and the length live in different cache
+                    # arrays, so design B pays one more DSP than design A (5/8 vs 4/8)
+                    command_pointer = a.sequencer().DSP() if stream else None
+                    if stream:
+                        command_pointer.load(base + rb_cmd_cache.index)
+                        command_pointer.configure(mode="P+1", dsp_cep="reset")
+
+                    length_pointer.load(base + length_cache.index)
+                    length_pointer.configure(mode="P+1", dsp_cep="reset")
+                    record_pointer.load(base + record_cache.index)
+                    record_pointer.configure(mode="P+1", dsp_cep="reset")
+                    final.load(base + length_cache.index + int(self.count_rounds))
+
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse(pulse)         # t0 marker, before the loop
+                    with a.sequencer().test(length_pointer != final):
+                        with a.sequencer().repeat_until(length_pointer == final):
+                            length_reg.load(a.sequencer().bus_read(
+                                length_pointer, latency=a._bus_latency("cache")))
+                            if stream:
+                                # a SECOND bus_read: the port is live, not latched, so the command
+                                # word needs its own pointer and its own register (failure_018)
+                                command_reg.load(a.sequencer().bus_read(
+                                    command_pointer, latency=a._bus_latency("cache")))
+                            with a.channel_synchronizer():        # ONE block, NO barrier
+                                if stream:
+                                    a.schedule_direct(stimuli[0].channel, command_reg)
+                                else:
+                                    stimuli[0].schedule_pulse("stretch_pulse",
+                                                              stretch_length=length_reg)
+                                    stimuli[0].dwell(one_cycle_s)   # keeps the two designs' block
+                                                                    # command counts comparable
+                                resonator.measure(pulse, "readout_accumulated", "boxcar")
+                            feedback.load(resonator.get_measurement(classifier="quadrant"))
+                            resonator.wait_until_measurement_done()
+                            a.sequencer().bus_write(address=record_pointer, data=feedback)
+                            with a.sequencer().test(feedback != getattr(a, "CMACC_QUADRANT_1")):
+                                with a.channel_synchronizer():
+                                    stimuli[1].schedule_pulse(pulse)   # the conditional reset pi
+                            length_pointer.pulse_cep()
+                            record_pointer.pulse_cep()
+                            if stream:
+                                command_pointer.pulse_cep()
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse(pulse)         # t1 marker, after the loop
+
+                elif self.case == "test_in_counter_loop":
+                    # A conditional inside a counter loop: the branch cost is paid on EVERY pass, so
+                    # a per-pass miscount compounds -- the shape that exposed the drain-in-loop bug.
+                    counter = a.sequencer().DSP()
+                    counter.load(0)
+                    counter.configure(mode="P+1", dsp_cep="reset")
+                    sel = a.sequencer().Register()
+                    sel.load(cache[0])
+                    with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                        with a.channel_synchronizer():
+                            stimuli[0].schedule_pulse(pulse)
+                        with a.sequencer().test(sel == int(self.test_register_value)):
+                            with a.channel_synchronizer():
+                                stimuli[1].schedule_pulse(pulse)
+                        counter.pulse_cep()
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+
+                elif self.case == "counter_loop_in_test":
+                    # The mirror image: a whole counter loop inside a conditional arm. If the arm is
+                    # skipped the loop must vanish entirely, not run once.
+                    sel = a.sequencer().Register()
+                    sel.load(cache[0])
+                    counter = a.sequencer().DSP()
+                    counter.load(0)
+                    counter.configure(mode="P+1", dsp_cep="reset")
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+                    with a.sequencer().test(sel == int(self.test_register_value)):
+                        with a.sequencer().repeat_until(counter == int(self.loop_count)):
+                            with a.channel_synchronizer():
+                                stimuli[1].schedule_pulse(pulse)
+                            counter.pulse_cep()
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse(pulse)
+
+                elif self.case == "three_deep_nest_reconfig":
+                    # three_deep_nest, but each counter is RE-CONFIGURED (not merely reloaded) every
+                    # time its enclosing loop re-enters -- the pattern nested_cool_n uses and that
+                    # works. three_deep_nest configures all three DSPs once up front and then only
+                    # reloads them, and that version never returns from the board: repeated
+                    # "Timeout occurred waiting for line", i.e. a loop that never terminates.
+                    #
+                    # The pair isolates ONE difference, so whichever runs tells us whether a counter's
+                    # `configure` survives re-entry or has to be re-issued. Nothing in the qudit
+                    # runtimes reaches three counter levels (cool_modes uses two counters plus a
+                    # `test`), so this is about acadia's limits rather than about a shipped sequence.
+                    l1, l2, l3 = (a.sequencer().DSP() for _ in range(3))
+                    l1.load(0)
+                    l1.configure(mode="P+1", dsp_cep="reset")
+                    with a.sequencer().repeat_until(l1 == 2):
+                        with a.channel_synchronizer():
+                            stimuli[0].schedule_pulse(pulse)
+                        l2.load(0)
+                        l2.configure(mode="P+1", dsp_cep="reset")
+                        with a.sequencer().repeat_until(l2 == 2):
+                            with a.channel_synchronizer():
+                                stimuli[1].schedule_pulse(pulse)
+                            l3.load(0)
+                            l3.configure(mode="P+1", dsp_cep="reset")
+                            with a.sequencer().repeat_until(l3 == 2):
+                                with a.channel_synchronizer():
+                                    stimuli[2].schedule_pulse(pulse)
+                                l3.pulse_cep()
+                            l2.pulse_cep()
+                        l1.pulse_cep()
+
+                elif self.case == "measure_multi":
                     # SIMULTANEOUS multi-resonator readout: two measure() calls inside ONE
                     # channel_synchronizer, the shape readout_confusion and the joint dual-rail
                     # readouts use. Distinct from measure_two_rounds, which is two readouts in
@@ -820,72 +1020,118 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 with a.channel_synchronizer():
                     after.schedule_pulse(pulse)         # marker B
 
-            elif self.case == "test_in_counter_loop":
-                # A conditional inside a counter loop: the branch cost is paid on EVERY pass, so
-                # a per-pass miscount compounds -- the shape that exposed the drain-in-loop bug.
-                counter = a.sequencer().DSP()
-                counter.load(0)
-                counter.configure(mode="P+1", dsp_cep="reset")
-                sel = a.sequencer().Register()
-                sel.load(cache[0])
-                with a.sequencer().repeat_until(counter == int(self.loop_count)):
+            elif self.case in ("stretch_barrier_twochan", "stretch_duration_law",
+                               "stretch_dwell_align", "stretch_barrier_align",
+                               "direct_dwell_align", "stretch_zero"):
+                # ---- the FPGA-looped counting round, taken apart ----------------------
+                # resonator_number_measurement wants each counting round to play a swap whose
+                # LENGTH comes from a register, with the readout waiting out that swap in the
+                # SAME block. Five separate things have to be true for that to work, and each
+                # gets its own case here rather than being bundled -- a bundled failure tells
+                # you the round is broken but not which half.
+                length_reg = a.sequencer().Register()
+                length_reg.load(cache[0])            # = count_cycles, in CYCLES
+                ramp = stimuli[1].get_config("pulses", "stretch_pulse", "ramp")
+                # dwell() dispatches on TYPE: a float is seconds, an int raises. Snapping to the
+                # cycle grid matters because the ramp is what places the readout relative to the
+                # swap, and a ramp that is not a whole number of cycles puts a constant skew on
+                # every round (count_ramp_grid=False measures exactly that).
+                if self.count_ramp_grid:
+                    ramp = float(self.acadia.seconds_to_cycles(
+                        ramp, rounding_raise=False)) / self.acadia.sequencer_clock_frequency()
+
+                if self.case == "stretch_barrier_twochan":
+                    # Q1. A BARRIER in a block that also holds a register-driven length. The KB
+                    # has two rules that disagree about this: one says the barrier makes
+                    # calculate_subschedule_dwells raise Operation(builtins.max, ...), the other
+                    # says that exact error is a client-compile artifact and the barrier works on
+                    # hardware. Whichever happens here settles it -- and if the compile raises,
+                    # the failure IS the answer, so it is not caught.
+                    with a.channel_synchronizer():
+                        stimuli[0].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+                        a.barrier()
+                        stimuli[1].schedule_pulse(pulse)
+
+                elif self.case in ("stretch_duration_law", "stretch_zero"):
+                    # Q2 / Q5. marker | stretch(reg) | marker on ONE channel, so the marker
+                    # interval is ramp + reg + boundaries and sweeping reg gives the slope
+                    # (expect exactly 1 cycle per cycle) and the intercept. stretch_zero is the
+                    # same sequence at reg=0, where command_dma's `length - 1` wraps to an
+                    # all-ones field (~21 s) -- so this also checks the model REFUSES to deploy
+                    # it rather than the board hanging (see unsafe_reason).
+                    # markers on ch0, the stretch on ch1 -- the same split register_stretch
+                    # uses, and for the same reason: three pulses on ONE channel merge into one
+                    # above-threshold region as soon as the gaps close, and the interval then
+                    # spans nothing. (Measured that way first: 215 ns flat for reg = 1..115,
+                    # i.e. the register looked like it did nothing at all.) Blocking blocks
+                    # serialise, so ch0's marker-to-marker interval still contains the stretch.
                     with a.channel_synchronizer():
                         stimuli[0].schedule_pulse(pulse)
-                    with a.sequencer().test(sel == int(self.test_register_value)):
-                        with a.channel_synchronizer():
-                            stimuli[1].schedule_pulse(pulse)
-                    counter.pulse_cep()
-                with a.channel_synchronizer():
-                    stimuli[0].schedule_pulse(pulse)
-
-            elif self.case == "counter_loop_in_test":
-                # The mirror image: a whole counter loop inside a conditional arm. If the arm is
-                # skipped the loop must vanish entirely, not run once.
-                sel = a.sequencer().Register()
-                sel.load(cache[0])
-                counter = a.sequencer().DSP()
-                counter.load(0)
-                counter.configure(mode="P+1", dsp_cep="reset")
-                with a.channel_synchronizer():
-                    stimuli[0].schedule_pulse(pulse)
-                with a.sequencer().test(sel == int(self.test_register_value)):
-                    with a.sequencer().repeat_until(counter == int(self.loop_count)):
-                        with a.channel_synchronizer():
-                            stimuli[1].schedule_pulse(pulse)
-                        counter.pulse_cep()
-                with a.channel_synchronizer():
-                    stimuli[0].schedule_pulse(pulse)
-
-            elif self.case == "three_deep_nest_reconfig":
-                # three_deep_nest, but each counter is RE-CONFIGURED (not merely reloaded) every
-                # time its enclosing loop re-enters -- the pattern nested_cool_n uses and that
-                # works. three_deep_nest configures all three DSPs once up front and then only
-                # reloads them, and that version never returns from the board: repeated
-                # "Timeout occurred waiting for line", i.e. a loop that never terminates.
-                #
-                # The pair isolates ONE difference, so whichever runs tells us whether a counter's
-                # `configure` survives re-entry or has to be re-issued. Nothing in the qudit
-                # runtimes reaches three counter levels (cool_modes uses two counters plus a
-                # `test`), so this is about acadia's limits rather than about a shipped sequence.
-                l1, l2, l3 = (a.sequencer().DSP() for _ in range(3))
-                l1.load(0)
-                l1.configure(mode="P+1", dsp_cep="reset")
-                with a.sequencer().repeat_until(l1 == 2):
+                    with a.channel_synchronizer():
+                        stimuli[1].schedule_pulse("stretch_pulse", stretch_length=length_reg)
                     with a.channel_synchronizer():
                         stimuli[0].schedule_pulse(pulse)
-                    l2.load(0)
-                    l2.configure(mode="P+1", dsp_cep="reset")
-                    with a.sequencer().repeat_until(l2 == 2):
-                        with a.channel_synchronizer():
-                            stimuli[1].schedule_pulse(pulse)
-                        l3.load(0)
-                        l3.configure(mode="P+1", dsp_cep="reset")
-                        with a.sequencer().repeat_until(l3 == 2):
-                            with a.channel_synchronizer():
-                                stimuli[2].schedule_pulse(pulse)
-                            l3.pulse_cep()
-                        l2.pulse_cep()
-                    l1.pulse_cep()
+
+                elif self.case == "stretch_barrier_align":
+                    # The SAME question as stretch_dwell_align, asked of a BARRIER instead of a
+                    # hand-built wait. This is the one that decides whether the manual dwells can
+                    # be deleted: the barrier has to DERIVE a compensating dwell of ramp + reg on
+                    # the other channels, which means calculate_subschedule_dwells has to
+                    # establish equality between two indeterminate lengths -- something acadia
+                    # only does when both refer to the SAME Register. That it compiles says
+                    # nothing about whether the derived wait has the right LENGTH, so the marker
+                    # is placed exactly as in the manual case and the two are compared directly.
+                    with a.channel_synchronizer():            # ONE block, WITH a barrier
+                        stimuli[0].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+                        a.barrier()
+                        stimuli[1].schedule_pulse(pulse)      # stands in for the readout
+                    with a.channel_synchronizer():
+                        stimuli[2].schedule_pulse(pulse)
+
+                elif self.case == "stretch_dwell_align":
+                    # Q3. THE primitive design A rests on: one barrier-free block, a stretched
+                    # pulse on ch0 and a hand-built wait of the SAME register on ch1, then a
+                    # marker. Every channel in a barrier-free block starts on the block's single
+                    # trigger and plays its own commands in order, so ch1's marker should land
+                    # exactly ramp + reg after the block starts -- i.e. as the swap ends. If the
+                    # offset moves with reg, the readout drifts a different amount every round
+                    # and the confusion matrix picks up a per-round bias.
+                    with a.channel_synchronizer():            # ONE block, NO barrier
+                        stimuli[0].schedule_pulse("stretch_pulse", stretch_length=length_reg)
+                        stimuli[1].dwell(ramp)                # constant: the pulse's ramp
+                        stimuli[1].dwell(length_reg)          # indeterminate: the SAME register
+                        stimuli[1].schedule_pulse(pulse)      # stands in for the readout
+                    with a.channel_synchronizer():
+                        stimuli[2].schedule_pulse(pulse)      # a settled reference after both
+
+                else:   # direct_dwell_align
+                    # Q4. The same alignment for design B, where the pulse arrives as a STREAMED
+                    # DMA word instead of a stretch. A direct command carries no length the
+                    # sequencer can see, so the wait cannot be derived from it -- the length has
+                    # to travel in a parallel cache word, which is the whole reason design B
+                    # needs two pointers. A barrier is ILLEGAL in a block holding a direct
+                    # command (system.py raises "Can't place barrier after a DMA direct
+                    # command"), so the manual dwell is mandatory here, not a choice.
+                    # The word must be read by the SEQUENCER, not indexed on the host:
+                    # `rb_cmd_cache[0]` here is a host read at build time, when the cache is
+                    # still zero -- and a zero command word is a zero length, which command_dma
+                    # emits as `length - 1` = all ones. The first dry run of this case traced to
+                    # 7.87 ms for exactly that reason. Read it through a pointer, as the loop
+                    # does, so the value is whatever the host wrote before the run.
+                    command_reg = a.sequencer().Register()
+                    command_pointer = a.sequencer().DSP()
+                    command_pointer.load(
+                        a._firmware.sequencer_bus_decoder["cache"].address().value()
+                        + rb_cmd_cache.index)
+                    command_pointer.configure(mode="P+1", dsp_cep="reset")
+                    command_reg.load(a.sequencer().bus_read(
+                        command_pointer, latency=a._bus_latency("cache")))
+                    with a.channel_synchronizer():            # ONE block, NO barrier
+                        a.schedule_direct(stimuli[0].channel, command_reg)
+                        stimuli[1].dwell(length_reg)          # from the PARALLEL length cache
+                        stimuli[1].schedule_pulse(pulse)
+                    with a.channel_synchronizer():
+                        stimuli[2].schedule_pulse(pulse)
 
             elif self.case in ("random_seq", "pair_seq"):
                 # GENERATED SEQUENCES. Everything above is a shape someone thought to write down;
@@ -1397,7 +1643,7 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # *after* attach, and a memory created after attach is never mapped -- attach only
         # iterates the instances that exist when it runs.
         pulses_used = [self.stimulus_pulse_name]
-        if self.case.startswith("stretch"):
+        if self.case.startswith("stretch") or self.case == "loop_measure_feedback":
             pulses_used.append("stretch_pulse")
         pulses_used += {"shape": ["long_ramp_pulse"],
                         "detune_pair": ["detune_10MHz", "detune_25MHz"],
@@ -1406,7 +1652,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # rb_stream plays its gate set, initial pulse and readout marker on ch0 only, so
         # those extra pulses are allocated/loaded on stimulus0 alone (allocating them on the
         # idle channels would just waste DAC memory).
-        rb_pulses = ([] if self.case not in STREAM_CASES
+        # the streamed counting designs play the gate set on ch0 as well, and a streamed word
+        # points at a waveform memory -- so the memory must exist AND be loaded, or the DMA
+        # plays whatever was left in that address (rule load_every_pulse_you_schedule)
+        rb_pulses = ([] if self.case not in STREAM_CASES + COUNTING_STREAM_CASES
                      else list(dict.fromkeys(
                          list(self.rb_gates) + [self.rb_initial_pulse, self.rb_readout_pulse]
                          + ([self.rb_loop_gate] if self.rb_loop_gate else [])
@@ -1461,6 +1710,29 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             # see compiled_log.parse). That degenerate fixture, not the loop, is what made
             # stretch_in_loop miss by exactly 1 cycle per pass.
             cache[0] = self.acadia.seconds_to_cycles(self.register_stretch)
+        elif self.case in COUNTING_CASES:
+            # cache[0] is the register-driven flat length, in CYCLES. Floor at 1 unless the case
+            # is stretch_zero, whose whole point is that 0 is NOT a short pulse -- command_dma
+            # emits `length - 1`, so it wraps to ~21 s and reads as a dead board.
+            cache[0] = (0 if self.case == "stretch_zero"
+                        else max(int(self.count_cycles), 1))
+            rounds = max(int(self.count_rounds), 1)
+            for r in range(rounds):
+                # a DIFFERENT length per round, as the real ladder descent has: a per-round
+                # error is then visible as a drift rather than hidden in a constant offset
+                length_cache[r] = max(int(self.count_cycles) - 5 * r, 1)
+                record_cache[r] = -1                # "the loop never wrote here"
+            if self.case in COUNTING_STREAM_CASES:
+                rb_num_cache[0] = rounds
+                # one DMA command word per round. waveform_dma_command needs the memory to be
+                # ALLOCATED, so this runs after standard setup -- and the word carries the
+                # length, which is why design B needs the parallel length cache to tell the
+                # readout how long to wait.
+                for r in range(rounds):
+                    name = self.rb_gates[r % len(self.rb_gates)]
+                    rb_cmd_cache[r] = self.acadia.waveform_dma_command(
+                        stimuli[0].get_waveform_memory(name))
+                    length_cache[r] = (int(rb_cmd_cache[r]) & 0xFFFF) + 1
         elif (self.case.startswith("test_") or self.case in
               ("counter_loop_in_test", "repeat_until_op", "repeat_until_count_n")):
             # These compare a cached register against test_register_value, so the cache MUST

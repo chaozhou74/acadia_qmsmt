@@ -43,12 +43,16 @@ import paths_local                                                   # noqa: E40
 import timing_validation as tv                                       # noqa: E402
 
 
-def deploy(fields, iterations=5000, tag=None):
-    """Deploy test_chain with these field overrides. Returns compare()'s result."""
+def deploy(fields, iterations=5000, tag=None, case="test_chain"):
+    """Deploy one loopback case with these field overrides. Returns compare()'s result.
+
+    Shared with counting_round_timing.py, which drives a different case through the same
+    path -- probe, safety check, capture window, deploy, compare.
+    """
     board_ip = paths_local.require("board_ip")
     save_root = paths_local.require("loopback_data_root")
 
-    probe = tv.build_runtime("test_chain", iterations=10)
+    probe = tv.build_runtime(case, iterations=10)
     for name, value in fields.items():
         setattr(probe, name, value)
     unsafe = tv.unsafe_reason(probe)
@@ -56,14 +60,14 @@ def deploy(fields, iterations=5000, tag=None):
         return {"skipped": unsafe}
     window = tv.capture_window_for(probe)
 
-    runtime = tv.build_runtime("test_chain", iterations=iterations)
+    runtime = tv.build_runtime(case, iterations=iterations)
     for name, value in fields.items():
         setattr(runtime, name, value)
     if not runtime.capture_length_override:
         runtime.capture_length_override = window
     label = tag or "_".join(f"{k}{v}" for k, v in fields.items())
     runtime.deploy(board_ip,
-                   local_directory=f"{save_root}/test_chain__{label}/%y%m%d_%H%M%S")
+                   local_directory=f"{save_root}/{case}__{label}/%y%m%d_%H%M%S")
     runtime.wait_for_deploy_completion()
     result = tv.compare(runtime.local_directory, verbose=False)
     result["folder"] = str(runtime.local_directory)

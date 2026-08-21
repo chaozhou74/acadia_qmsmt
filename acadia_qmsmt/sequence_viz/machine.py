@@ -26,6 +26,7 @@ The intra-block subschedule/barrier layout, the blocking-boundary gap model
 loop unrolling via ``execution_plan`` are shared with the rest of the tracer. Hardware-
 validated on the 4-channel loopback (see ``validation/``).
 """
+import re
 from dataclasses import replace
 
 from .tracing import (Destination, Placement, decode_program, edge_gap,
@@ -36,6 +37,58 @@ from .tracing import (Destination, Placement, decode_program, edge_gap,
 #: earlier than ``fifo_empty`` (``0x2``). See :func:`drain_block_issue`.
 ALMOST_EMPTY_MASK = 0x8
 
+
+
+#: A `repeat_until` whose exit condition names a DSP -- the loop counter. When that counter is
+#: also the cache POINTER the body reads its per-pass value through, the two facts together turn
+#: an "indeterminate (register)" length into the actual number for every pass.
+_LOOP_COUNTER_RE = re.compile(r"\b(DSP\d+)\b")
+
+
+def _pointer_length(trace, placement, command, seen):
+    """Cycles a ``cache[pointer]`` register holds on THIS pass, or None.
+
+    The counting-round idiom (resonator_number_measurement): a DSP pointer is loaded with the
+    cache base plus a word index, configured ``P+1``, advanced once per pass by ``pulse_cep()``,
+    and the loop exits when it reaches a register holding base + index + rounds. The body reads
+    its per-round value with ``bus_read(pointer)``. So pass r reads word ``index + r`` -- every
+    term of which the program carries:
+
+      * the pointer's starting address is a compile-time immediate (register_immediates),
+      * the cache base is a firmware constant (cache_base),
+      * and r is how many times this command has already been laid down.
+
+    WHICH pointer feeds the register is not in the compiled record -- ``bus_read(pointer)`` emits
+    ``BUS_ADDR <- DSP_P`` and the minor field there is the bus port, not the counter. It is taken
+    from the LOOP the command sits in instead: the exit condition names the counter, and in this
+    idiom the counter IS the pointer. When the enclosing loop's counter is not a cache pointer the
+    link is unknown and this returns None, so the length stays honestly indeterminate rather than
+    being resolved from a guess.
+    """
+    cache, base = trace.point_cache, trace.cache_base
+    if not cache or base is None:
+        return None
+    if (trace.registers or {}).get(command.symbolic, {}).get("source") != "cache[pointer]":
+        return None
+    for context in reversed(getattr(placement, "conditional", ()) or ()):
+        if context.get("kind") != "repeat_until":
+            continue
+        match = _LOOP_COUNTER_RE.search(context.get("condition") or "")
+        if not match:
+            continue
+        start = (trace.register_immediates or {}).get(match.group(1))
+        if start is None:
+            continue
+        word = start - base
+        if word < 0:
+            continue                     # the counter is not a cache pointer at all
+        key = (command.channel, command.symbolic)
+        value = cache.get(word + seen.get(key, 0))
+        if value is None:
+            return None
+        seen[key] = seen.get(key, 0) + 1
+        return int(value)
+    return None
 
 
 def _register_gate(trace, command, gate_index):
@@ -55,6 +108,15 @@ def _register_gate(trace, command, gate_index):
     """
     symbolic = command.symbolic
     if not (symbolic and str(symbolic).startswith("REG")):
+        return None
+    # A CONTINUATION command's symbolic value is a LENGTH, not a command word. `use_stretch`
+    # splits a pulse into ARB / CONST_CONT / ARB_CONT and puts the register into the MIDDLE
+    # command's length field, so `symbolic` there names a hold length -- and decoding a length as
+    # a packed `(address << 16) | (length - 1)` invents both an address and a wrong duration.
+    # resonator_number_measurement's counting rounds are that shape: every ladder length was drawn
+    # one cycle too long, read one cache word too early, and attributed to a pulse the cache word
+    # never named. It looked plausible, which is what made it worth guarding rather than noticing.
+    if command.kind in ("CONST_CONT", "ARB_CONT"):
         return None
     source = (trace.registers or {}).get(symbolic, {}).get("source")
     if source != "cache[pointer]":
@@ -193,6 +255,9 @@ def machine_layout(trace):
     # how many register-sourced gates have already been laid on each channel, so consecutive
     # plays read consecutive cache words the way the walking pointer does
     gate_index = {}
+    # how many times each (channel, register) pointer read has been laid down, which IS the pass
+    # index the walking pointer is on -- same bookkeeping as gate_index, for lengths
+    pointer_reads = {}
     cursor, t_seq = {}, 0
     # Instruction span of the gap the sequencer is currently paying, i.e. how long BEFORE t_seq
     # the next block's descriptors start being pushed. Needed to tell a seamless continuation
@@ -319,6 +384,9 @@ def machine_layout(trace):
                 elif command.symbolic:
                     override = self.register_overrides.get(command.symbolic)
                     resolved = self.register_cycles.get(command.symbolic)
+                    if resolved is None and override is None:
+                        # a per-pass pointer read: pass r takes cache word index + r
+                        resolved = _pointer_length(self, placement, command, pointer_reads)
                     value = (override if override is not None else
                              resolved if resolved is not None else fallback)
                     length = int(value)

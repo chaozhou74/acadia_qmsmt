@@ -207,7 +207,15 @@ def main():
                   f"(nearest edge {near:.2f} ns away)")
         return 0 if result["ok"] else 1
 
-    cases = [args.case] if args.case else list(CASES)
+    # stretch_zero is a deliberate PATHOLOGY, not a drawing to check: a zero-length register
+    # command wraps to 4294967295 cycles, so the sequence is 21.5 SECONDS long and a 120 ns pulse
+    # sits 21 s from the origin, where the geometry comparison runs out of resolution (its own
+    # inset allowance comes out at 34 ms). The case exists so that unsafe_reason REFUSES it --
+    # which timing_validation checks -- and asking the renderer to agree about a picture nobody
+    # should ever see would only make the gate report a problem that is the point of the case.
+    PATHOLOGICAL = ("stretch_zero",)
+    cases = ([args.case] if args.case
+             else [c for c in CASES if c not in PATHOLOGICAL])
     failures, checked = [], 0
     for name in cases:
         try:

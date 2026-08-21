@@ -227,6 +227,11 @@ class SequenceTrace:
     gap_terms: dict = field(default_factory=dict)   # detect/propagate, from firmware
     registers: dict = field(default_factory=dict)         # "REG0" -> {source, cache_word}
     register_sources: dict = field(default_factory=dict)  # "REG0" -> cache word
+    #: "REG2"/"DSP0" -> the compile-time IMMEDIATE it was initialised with. A pointer
+    #: loop (`repeat_until(pointer == final)`) has both of its endpoints here, so its
+    #: pass count is arithmetic rather than a guess -- see repeat_until_count.
+    register_immediates: dict = field(default_factory=dict)
+    cache_base: int = None           # bus address of cache word 0
     register_cycles: dict = field(default_factory=dict)   # resolved for this point
     register_overrides: dict = field(default_factory=dict)  # user-supplied cycles
     register_names: dict = field(default_factory=dict)      # "REG0" -> "t_echo"
@@ -392,6 +397,12 @@ class SequenceTrace:
         if token in self.register_overrides:
             return int(self.register_overrides[token])
         value = self.register_cycles.get(token)
+        if value is not None:
+            return int(value)
+        # ...and finally a compile-time immediate. `final.load(cache_base + index + rounds)` is
+        # a constant the program carries, so a loop bounded by it is not data-dependent at all --
+        # it only looked that way because nothing read the constant back.
+        value = self.register_immediates.get(token)
         return int(value) if value is not None else None
 
     def repeat_until_count(self, context):
@@ -419,8 +430,21 @@ class SequenceTrace:
         right_dsp = bool(COUNTER_NAME_RE.fullmatch(right))
         if left_dsp == right_dsp:            # need exactly one DSP counter operand
             return None
-        count = self._operand_value(right if left_dsp else left)
-        if count is None or count < 0:
+        counter = left if left_dsp else right
+        target = self._operand_value(right if left_dsp else left)
+        if target is None:
+            return None
+        # A counter reaches its exit value after (exit - start) increments. The start is 0 for
+        # the `DSP.load(0)` idiom, which is why taking the target alone was right for every case
+        # that existed -- but a POINTER loop starts at a cache address and ends at that address
+        # plus the round count, so the target alone is a ~1.9-million-pass loop and the model gave
+        # up and drew one assumed pass instead. resonator_number_measurement's counting rounds are
+        # exactly that shape: `length_pointer.load(base + index)`, `final.load(base + index + N)`,
+        # `repeat_until(length_pointer == final)` with `pulse_cep()` once per pass. Both endpoints
+        # are compile-time immediates, so N is arithmetic.
+        start = self.register_immediates.get(counter, 0)
+        count = target - int(start)
+        if count < 0:
             return None
         if count == 0:
             # NOT zero passes -- this loop never exits. MEASURED on the loopback 2026-08-14:
@@ -448,7 +472,11 @@ class SequenceTrace:
         left_dsp = bool(COUNTER_NAME_RE.fullmatch(left))
         if left_dsp == bool(COUNTER_NAME_RE.fullmatch(right)):
             return False
-        return self._operand_value(right if left_dsp else left) == 0
+        target = self._operand_value(right if left_dsp else left)
+        counter = left if left_dsp else right
+        if target is None:
+            return False
+        return target - int(self.register_immediates.get(counter, 0)) == 0
 
     def execution_plan(self):
         """``[(block index, iteration), ...]`` in the order the sequencer runs them.
@@ -1312,6 +1340,16 @@ def _build_trace(runtime, raw_blocks, resolve):
     trace.register_sources = {name: info["cache_word"]
                               for name, info in trace.registers.items()
                               if info["cache_word"] is not None}
+    try:
+        trace.register_immediates = describe_immediates(acadia)
+    except Exception:
+        pass                    # a constant nobody could read is the old behaviour, not a failure
+    try:
+        # where the cache region starts on the bus, so an ABSOLUTE pointer immediate can be
+        # turned into a cache WORD index
+        trace.cache_base = acadia._firmware.sequencer_bus_decoder["cache"].address().value()
+    except Exception:
+        pass
 
     # A cache-pointer pulse stream (randomized benchmarking) is unrolled from the per-point
     # cache in relayout; store the decode map and the stream descriptor here.
@@ -1666,6 +1704,35 @@ def describe_registers(acadia):
                 "source": devices.get(address, f"bus 0x{address:X}"),
                 "cache_word": None}
     return registers
+
+
+def describe_immediates(acadia):
+    """``{"REG2": 1900548, "DSP0": 1900545}`` -- the compile-time constant each register or DSP
+    counter was INITIALISED with.
+
+    Separate from :func:`describe_registers`, which answers a different question: where a register
+    gets its value at RUN time (a cache word, a bus device, a pointer read). A constant load is
+    not a source in that sense -- it is a number the program carries -- and conflating the two
+    would make a pointer's base look like a data source.
+
+    Only the FIRST load of each name is kept. A counter is initialised once and then incremented
+    by ``pulse_cep()``; a later immediate write to the same register is a different value's life,
+    and taking it would report the end of a reused register as the start of a loop.
+    """
+    immediates = {}
+    for r in decode_program(acadia):
+        for dest, minor, imm, src in ((r.d1, r.d1_minor, r.imm1, r.s1),
+                                      (r.d2, r.d2_minor, r.imm2, r.s2)):
+            if src != "IMM" or dest not in ("REG", "DSP_AB"):
+                continue
+            # DSP_ABn is the DSP's INPUT; the counter is read back as DSPn, which is the name
+            # every condition string uses -- so record it under the name the condition will ask
+            # for, not the one the instruction writes.
+            name = f"DSP{minor}" if dest == "DSP_AB" else f"REG{minor}"
+            value = _resolve_imm(imm)
+            if value is not None and name not in immediates:
+                immediates[name] = value
+    return immediates
 
 
 def _dsp_pointer_config(r):
