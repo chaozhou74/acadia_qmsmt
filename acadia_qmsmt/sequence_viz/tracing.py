@@ -22,7 +22,7 @@ import numpy as np
 from acadia.system import DMASynchronizer
 from acadia.sequencer import STP, Destination
 
-from .dryrun import (StopDryRun, already_traced, branch_recorder,
+from .dryrun import (StopDryRun, _defining_class, already_traced, branch_recorder,
                      hardware_stubbed, preserved_runtime_state)
 
 KIND = {
@@ -184,6 +184,10 @@ class SequenceTrace:
     channel_ios: dict = field(default_factory=dict)
     envelopes: dict = field(default_factory=dict)         # from the pulse config
     loaded_envelopes: dict = field(default_factory=dict)  # from DAC memory
+    #: (io name, memory name) the run actually called load_pulse on -- so a memory holding zeros
+    #: because it was loaded with amplitude 0 is distinguishable from one never loaded at all.
+    #: See _spy_load_pulse and envelope().
+    loaded_pulses: set = field(default_factory=set)
     samples_per_cycle: dict = field(default_factory=dict)
     ns_per_cycle: float = 1.0
     runtime_class: str = ""
@@ -1018,10 +1022,18 @@ class SequenceTrace:
         pulse and ignores anything ``load_pulse`` overrode at runtime.
 
         Falls back to the config when the memory was never loaded (all zeros).
+
+        A memory that was deliberately loaded with amplitude ZERO -- an idle gate written as
+        ``{"scale": "0.0"}``, which still plays for its full duration -- also holds zeros, and is
+        NOT the same thing. :func:`_spy_load_pulse` records which pulses the run actually loaded,
+        so that case keeps its measured zeros: hovering it reads ``|A| = 0.000`` rather than
+        blanking out, and never falls back to the nominal amplitude the board did not play. Older
+        traces carry no record, so they keep the "zeros mean not loaded" reading.
         """
         if source == "memory":
             samples = self.loaded_envelopes.get((io_name, pulse))
-            if samples is not None and len(samples) and np.abs(samples).max() > 0:
+            if samples is not None and len(samples) and (
+                    (io_name, pulse) in self.loaded_pulses or np.abs(samples).max() > 0):
                 return samples
         return self.envelopes.get((io_name, pulse))
 
@@ -1207,6 +1219,8 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
         DMASynchronizer.create_schedules = staticmethod(spy_create)
         DMASynchronizer.merge_schedules = staticmethod(spy_merge)
         DMASynchronizer.__exit__ = spy_exit
+        loaded_pulses = set()
+        restore_loads = _spy_load_pulse(runtime, loaded_pulses)
         try:
             with hardware_stubbed(on_run, runtime=runtime,
                                   allow_instruments=allow_instruments), \
@@ -1219,6 +1233,8 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
             DMASynchronizer.create_schedules = staticmethod(orig_create)
             DMASynchronizer.merge_schedules = staticmethod(orig_merge)
             DMASynchronizer.__exit__ = orig_exit
+            for klass, original in restore_loads:
+                klass.load_pulse = original
             if restore_iterations is not _MISSING:
                 runtime.iterations = restore_iterations
 
@@ -1228,6 +1244,7 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                 "channel_synchronizer, or it stopped earlier than expected")
 
         trace = _build_trace(runtime, raw_blocks, resolve_indeterminate)
+        trace.loaded_pulses = loaded_pulses
         trace.register_overrides = dict(resolve_registers or {})
         trace.register_names = dict(register_names or {})
         trace.iterations_forced = restore_iterations is not _MISSING
@@ -1243,6 +1260,49 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
 
     trace.select_point(selected)
     return trace
+
+
+def _spy_load_pulse(runtime, loaded):
+    """Record every ``(io name, memory name)`` the dry run actually LOADS a waveform into.
+
+    Needed because a waveform memory that was never loaded and one deliberately loaded with
+    amplitude ZERO hold the same thing -- zeros -- and :meth:`SequenceTrace.envelope` has to tell
+    them apart. Reading zeros as "not loaded" hides a real zero-amplitude pulse (an idle gate
+    written as ``{"scale": "0.0"}``): its hover readout goes blank, or worse, falls back to the
+    config and reports the nominal amplitude the board never played.
+
+    The memory name is the first argument of ``load_pulse`` in every form the framework uses --
+    ``load_pulse("CR_x")``, ``load_pulse(cfg)`` with a ``name``, ``load_pulse(slot, pulse)`` --
+    which is the same key ``_snapshot`` files the memory under.
+
+    :return: ``[(class, original load_pulse), ...]`` for the caller to restore.
+    """
+    names = {id(io): name for name, io in getattr(runtime, "_ios", {}).items()}
+    restore, patched = [], set()
+    for io in getattr(runtime, "_ios", {}).values():
+        klass = _defining_class(type(io), "load_pulse")
+        if klass is None or klass in patched:
+            continue
+        patched.add(klass)
+        original = klass.load_pulse
+
+        def spy(self, memory=None, *args, _original=original, **kwargs):
+            try:
+                if isinstance(memory, str):
+                    name = memory
+                elif isinstance(memory, dict):
+                    name = memory.get("name")
+                else:
+                    name = getattr(memory, "name", None)
+                if name is not None:
+                    loaded.add((names.get(id(self)), name))
+            except Exception:
+                pass                # recording is an enhancement; never break the load
+            return _original(self, memory, *args, **kwargs)
+
+        klass.load_pulse = spy
+        restore.append((klass, original))
+    return restore
 
 
 def _cache_words(runtime):

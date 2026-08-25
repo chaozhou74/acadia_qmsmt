@@ -292,12 +292,55 @@ def main():
         print(f"   {name:28s} {count:3d} hovers -- "
               f"{'ok' if not found else f'{len(found)} PROBLEM(S)'}", flush=True)
 
+    problems += zero_amplitude_reads_as_zero()
+
     print(f"\n{hovers} tooltip readings over {folders} folders; {len(problems)} problems")
     if folders and not hovers:
         print("   NOTE: no pulse was hovered -- the zoom-invariance property checked nothing")
     for line in problems[:12]:
         print(f"   {line}")
     return 1 if problems else 0
+
+
+def zero_amplitude_reads_as_zero():
+    """A pulse LOADED with amplitude 0 must read as 0, not as "no data" or as its nominal shape.
+
+    An idle gate written as ``{"scale": "0.0"}`` still plays for its full duration, so the
+    readout owes the reader a number -- ``|A| = 0.000`` -- and must never substitute the config's
+    nominal amplitude, which is one the board did not play. The trap is that a memory nobody
+    loaded holds zeros too, and for THAT the config fallback is the useful answer; only the record
+    of which pulses were loaded separates them. Deterministic, so it does not depend on an
+    archived run happening to contain a zero-amplitude pulse.
+    """
+    import numpy as np
+    from acadia_qmsmt.sequence_viz.tracing import SequenceTrace
+
+    zeros = np.zeros(64, dtype=complex)
+    nominal = np.full(64, 0.2 + 0j)
+    key = ("rf1_stimulus", "CR_idle")
+    problems = []
+
+    loaded = SequenceTrace()
+    loaded.loaded_envelopes = {key: zeros}
+    loaded.envelopes = {key: nominal}
+    loaded.loaded_pulses = {key}
+    got = loaded.envelope(*key)
+    if got is None:
+        problems.append("a pulse loaded with amplitude 0 reads as no data (readout goes blank)")
+    elif np.abs(got).max() != 0:
+        problems.append(f"a pulse loaded with amplitude 0 reads as {np.abs(got).max():.3f} -- the "
+                        f"config's nominal amplitude, which the board never played")
+
+    never = SequenceTrace()
+    never.loaded_envelopes = {key: zeros}
+    never.envelopes = {key: nominal}
+    got = never.envelope(*key)
+    if got is None or np.abs(got).max() == 0:
+        problems.append("a memory that was NEVER loaded no longer falls back to the config shape")
+
+    print(f"   zero-amplitude readout      2 cases -- "
+          f"{'ok' if not problems else f'{len(problems)} PROBLEM(S)'}")
+    return problems
 
 
 if __name__ == "__main__":
