@@ -233,6 +233,10 @@ class SequenceTrace:
     register_immediates: dict = field(default_factory=dict)
     cache_base: int = None           # bus address of cache word 0
     register_cycles: dict = field(default_factory=dict)   # resolved for this point
+    #: "REG3" -> the compile-time immediate ADDED to its cache word. A register loaded as
+    #: `immediate + cache[word]` (an AB+C DSP -- see describe_cache_sums) is a cache-relative
+    #: ADDRESS, not the cache value itself, so the addend is carried alongside register_sources.
+    register_addends: dict = field(default_factory=dict)
     register_overrides: dict = field(default_factory=dict)  # user-supplied cycles
     register_names: dict = field(default_factory=dict)      # "REG0" -> "t_echo"
     resolve_indeterminate: int = 0
@@ -274,7 +278,7 @@ class SequenceTrace:
                       + 1j * array[:, 1].astype(np.float64)) / INT16_FULL_SCALE
                 for key, array in snapshot["memories"].items()}
             self.register_cycles = {
-                name: snapshot["cache"][word]
+                name: snapshot["cache"][word] + int(self.register_addends.get(name, 0))
                 for name, word in self.register_sources.items()
                 if word in snapshot["cache"]}
             self.point_cache = snapshot["cache"]   # full cache, for a cache-pointer stream
@@ -431,7 +435,10 @@ class SequenceTrace:
         if left_dsp == right_dsp:            # need exactly one DSP counter operand
             return None
         counter = left if left_dsp else right
-        target = self._operand_value(right if left_dsp else left)
+        target_token = right if left_dsp else left
+        if self._is_stream_count(target_token):
+            return None                      # the stream unroll owns this loop -- see _is_stream_count
+        target = self._operand_value(target_token)
         if target is None:
             return None
         # A counter reaches its exit value after (exit - start) increments. The start is 0 for
@@ -458,6 +465,86 @@ class SequenceTrace:
             # The board hangs, so the body ALWAYS RUNS AT LEAST ONCE and a target of 0 is a
             # non-terminating sequence, not an empty one. Reported through `nonterminating` rather
             # than drawn as a tidy zero-pass body, which is a picture the hardware cannot produce.
+            return None
+        return count
+
+    def _pointer_pair(self, condition):
+        """``(counter, operator, base, target)`` for a CACHE-POINTER comparison, else None.
+
+        The streamed-gate idiom (both XEB runtimes, dualrail_rb): a DSP walks a region of the
+        sequencer cache one word per pass and the loop ends when it reaches a register holding
+        ``region_base + count``, which :func:`describe_cache_sums` resolves from this point's
+        cache. Both operands are therefore ABSOLUTE cache addresses, and the pass count is their
+        difference -- not the target alone, which is a ~1.9-million-pass loop.
+
+        Deliberately narrow: the counter must be a DSP whose initial immediate is inside the
+        cache region (i.e. a real cache pointer), and the target must be a register resolved from
+        the cache or pinned by an override. A counter compared against a LITERAL -- the
+        `DSP0 == 1` cooling loops -- is not this idiom and is left to
+        :meth:`repeat_until_count` exactly as before.
+        """
+        match = COUNTER_RE.match((condition or "").strip())
+        if not match or match.group(2) not in ("==", "!="):
+            return None
+        operator = match.group(2)
+        for counter, target in ((match.group(1), match.group(3)),
+                                (match.group(3), match.group(1))):
+            if not COUNTER_NAME_RE.fullmatch(counter or ""):
+                continue
+            if counter not in self.register_immediates:
+                continue
+            if target not in self.register_cycles and target not in self.register_overrides:
+                continue
+            base = int(self.register_immediates[counter])
+            if self.cache_base is None or base < self.cache_base:
+                continue                      # not a pointer into the cache
+            value = self._operand_value(target)
+            if value is None:
+                continue
+            if self._is_stream_count(target):
+                return None
+            return counter, operator, base, int(value)
+        return None
+
+    def _is_stream_count(self, token):
+        """True when ``token`` is the register a cache-pointer STREAM's loop bound comes from.
+
+        :meth:`_expand_stream` already unrolls that loop out of the same count word -- one command
+        per played gate, all inside ONE pass -- so resolving its PASS count as well draws the whole
+        train once per pass: N**2 gates, which is what the RB folders showed the moment the bound
+        register became resolvable (1791 gates became 3207681). The stream idiom keeps its
+        deliberately unresolved count. XEB's gates are register-latched rather than streamed, so it
+        has no ``stream`` and is unaffected.
+        """
+        return bool(self.stream is not None
+                    and self.register_sources.get(token) is not None
+                    and self.register_sources.get(token) == self.stream.get("count_word"))
+
+    def _pointer_guard(self, context, advance):
+        """Decide ``test(pointer != final)`` -- the guard that makes a skipped streamed family
+        legal -- from where the pointer actually is. None when this is not that shape."""
+        if context.get("kind") != "test":
+            return None
+        pair = self._pointer_pair(context.get("condition"))
+        if pair is None:
+            return None
+        counter, operator, base, target = pair
+        equal = (base + advance.get(counter, 0)) == target
+        return (not equal) if operator == "!=" else equal
+
+    def _pointer_loop_count(self, context, advance):
+        """Passes a ``repeat_until(pointer == final)`` runs, from this point's cache. None when
+        the shape does not apply or the arithmetic is not credible."""
+        if context.get("kind") != "repeat_until":
+            return None
+        pair = self._pointer_pair(context.get("condition"))
+        if pair is None or pair[1] != "==":
+            return None
+        counter, _, base, target = pair
+        count = target - (base + advance.get(counter, 0))
+        # A count outside the cache is not a count -- it is a mis-read. Fail safe: leave the loop
+        # data-dependent rather than draw a train the cache cannot hold.
+        if count < 0 or (self.point_cache and count > len(self.point_cache)):
             return None
         return count
 
@@ -502,6 +589,7 @@ class SequenceTrace:
         self.indeterminate = set()
         self.entered_paths = {}
         self.nonterminating = set()
+        self.pointer_decisions = {}
         self._resolve_every_construct()
         return self._expand_contexts(list(range(len(self.blocks))), 0, 0)
 
@@ -515,6 +603,12 @@ class SequenceTrace:
         false claim of certainty this marker exists to prevent.
         """
         seen = set()
+        # How far each cache POINTER has already been walked by the guarded streamed loops
+        # resolved above it. A pointer loop's count is (target - where the pointer is NOW), and
+        # where it is now depends on the loops before it: the two XEB families share one pointer
+        # and one shot enters exactly one of them, which is a fact about this run's cache, not
+        # about the program. See _pointer_pair.
+        advance = {}
         for index, block in enumerate(self.blocks):
             for depth, context in enumerate(block.conditional or ()):
                 level = depth + 1
@@ -525,12 +619,35 @@ class SequenceTrace:
                 # `index` is the first block of this construct's body, which is how every other
                 # part of this module names it
                 if context.get("kind") == "test":
+                    guard = self._pointer_guard(context, advance)
+                    if guard is not None:
+                        self.pointer_decisions[self.construct_key(index, level)] = guard
+                        continue
                     if self.evaluate_condition(context.get("condition")) is None:
                         self.indeterminate.add(self.construct_key(index, level))
                         self.indeterminate.add(index)
                     continue
                 if context.get("kind") == "loop":
                     continue                 # a deterministic count, straight from the program
+                # A guarded pointer loop: the guard one level out decides whether it runs at all,
+                # so a count of 0 here is a legally SKIPPED family rather than a loop that never
+                # exits (`repeat_until` is a do-while -- see the zero-target note below).
+                guarded = self.pointer_decisions.get(self.construct_key(index, level - 1))
+                pointer_count = self._pointer_loop_count(context, advance)
+                if pointer_count is not None and guarded is not False:
+                    self.repeat_counts[self.construct_key(index, level)] = pointer_count
+                    self.repeat_counts.setdefault(index, pointer_count)
+                    if pointer_count == 0 and guarded is None:
+                        self.nonterminating.add(self.construct_key(index, level))
+                        self.nonterminating.add(index)
+                    else:
+                        counter = self._pointer_pair(context.get("condition"))[0]
+                        advance[counter] = advance.get(counter, 0) + pointer_count
+                    continue
+                if pointer_count is not None:          # guard skips it: zero passes, no advance
+                    self.repeat_counts[self.construct_key(index, level)] = 0
+                    self.repeat_counts.setdefault(index, 0)
+                    continue
                 count = self.repeat_until_count(context)
                 if count is None:
                     # a resolvable target of 0 is not "unknown", it is a loop that never exits
@@ -599,7 +716,9 @@ class SequenceTrace:
                 # and a hypothesis then looked exactly like a measured fact.
                 self.entered_paths.setdefault(
                     self.construct_key(first, depth + 1), set()).add(path)
-                decided = self.evaluate_condition(context.get("condition"))
+                decided = self.pointer_decisions.get(self.construct_key(first, depth + 1))
+                if decided is None:
+                    decided = self.evaluate_condition(context.get("condition"))
                 taken = self._path_override(first, depth + 1, path)
                 if taken is None:
                     taken = decided
@@ -1337,9 +1456,19 @@ def _build_trace(runtime, raw_blocks, resolve):
         trace.registers = describe_registers(acadia)
     except Exception:
         pass
+    try:
+        # `Register.load(immediate + cache[word])` leaves no BUS_DATA -> REGn for
+        # describe_registers to find; it is an arithmetic DSP. Merge those in so the register
+        # resolves per sweep point like any other cache-fed one.
+        trace.registers.update(describe_cache_sums(acadia))
+    except Exception:
+        pass
     trace.register_sources = {name: info["cache_word"]
                               for name, info in trace.registers.items()
                               if info["cache_word"] is not None}
+    trace.register_addends = {name: info["addend"]
+                              for name, info in trace.registers.items()
+                              if info.get("addend")}
     try:
         trace.register_immediates = describe_immediates(acadia)
     except Exception:
@@ -1733,6 +1862,105 @@ def describe_immediates(acadia):
             if value is not None and name not in immediates:
                 immediates[name] = value
     return immediates
+
+
+def describe_cache_sums(acadia):
+    """``{"REG3": {"source": "cache[360] + 0x1D0000", "cache_word": 360, "addend": 1900544}}``
+    -- registers loaded as an IMMEDIATE PLUS a cache word.
+
+    ``Register.load(cache_base + index + cache[word])`` is how a streamed gate loop states its
+    end pointer (both XEB runtimes: ``final_int.load(base + index + num_cycles_cache[0])``). There
+    is no ``BUS_DATA -> REGn`` in it for :func:`describe_registers` to find, because acadia does
+    the addition in a DSP and copies the result across::
+
+        001D0168 -> BUS_ADDR                                          <- the cache word
+        ...bus latency...
+        001D0000 -> DSP_AB5                                           <- the immediate addend
+        DSPConfiguration(mode='AB+C') -> DSP_CFG5  |  BUS_DATA -> DSP_C5
+        DSP_P5 -> REG3                                                <- the sum lands here
+
+    So the register is a cache-RELATIVE address: its value is ``addend + cache[word]``, which the
+    per-point snapshot pins down exactly. Without it the loop `repeat_until(pointer == REG3)` has
+    an unknown bound, and the viewer draws one assumed pass of a train that really runs `L` --
+    the gap README calls out as the one streaming idiom that does not resolve.
+
+    The ``DSP_Pk -> REGm`` copy is matched POSITIONALLY, within a few instructions of the AB+C
+    config: an instruction carries a minor for its DESTINATION only (see
+    :func:`_bus_addr_pointer`), so the source DSP index of that copy is not in the record. The
+    whole pattern is one ``Register.load(Operation)`` emission, so adjacency is what ties them --
+    and the caller sanity-checks the arithmetic it gets (a pointer loop whose count comes out
+    negative or larger than the cache is not resolved), so a mis-association fails safe.
+    """
+    prog = decode_program(acadia)
+    decoder = acadia._firmware.sequencer_bus_decoder
+    cache_base = decoder["cache"].address().value()
+    cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
+
+    sums = {}
+    for r in prog:
+        # this instruction must land BUS_DATA in DSP_Ck *and* configure that same DSP as AB+C
+        loaded = _bus_data_load(r, ("DSP_C",))
+        if loaded is None:
+            continue
+        unit = loaded[1]
+        if _dsp_config_mode(r, unit) != "AB+C":
+            continue
+        # the addend: the immediate most recently written to this DSP's AB input
+        addend = None
+        for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            found = _dsp_ab_immediate(prog[j], unit)
+            if found is not None:
+                addend = found
+                break
+        # the cache word: the nearest preceding LITERAL bus address, as describe_registers does
+        address, pointer = None, False
+        for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            if _bus_addr_pointer(prog[j]):
+                pointer = True
+                break
+            found = _bus_addr(prog[j])
+            if found is not None:
+                address = found
+                break
+        if pointer or addend is None or address is None:
+            continue
+        if not cache_base <= address < cache_base + cache_words:
+            continue
+        # the register the sum is copied into, just after the config
+        for j in range(r.i + 1, min(r.i + 6, len(prog))):
+            target = _dsp_p_to_register(prog[j])
+            if target is not None:
+                word = address - cache_base
+                sums[f"REG{target}"] = {"source": f"cache[{word}] + 0x{addend:X}",
+                                        "cache_word": word, "addend": addend}
+                break
+    return sums
+
+
+def _dsp_config_mode(r, unit):
+    """The mode string a ``DSP_CFG{unit}`` write in this instruction configures, else None."""
+    for dest, minor, imm in ((r.d1, r.d1_minor, r.imm1), (r.d2, r.d2_minor, r.imm2)):
+        if dest == "DSP_CFG" and minor == unit:
+            mode = getattr(imm, "mode", None)
+            return getattr(mode, "name", None) or (mode if isinstance(mode, str) else None)
+    return None
+
+
+def _dsp_ab_immediate(r, unit):
+    """The immediate this instruction writes to ``DSP_AB{unit}``, else None."""
+    for dest, minor, src, imm in ((r.d1, r.d1_minor, r.s1, r.imm1),
+                                  (r.d2, r.d2_minor, r.s2, r.imm2)):
+        if dest == "DSP_AB" and minor == unit and src == "IMM":
+            return _resolve_imm(imm)
+    return None
+
+
+def _dsp_p_to_register(r):
+    """The register index this instruction copies a DSP output into (``DSP_P -> REGm``), else None."""
+    for dest, minor, src in ((r.d1, r.d1_minor, r.s1), (r.d2, r.d2_minor, r.s2)):
+        if dest == "REG" and src == "DSP_P":
+            return minor
+    return None
 
 
 def _dsp_pointer_config(r):

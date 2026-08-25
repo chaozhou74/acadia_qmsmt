@@ -117,6 +117,14 @@ def pinning_never_invents_gates(folder, experiment):
         holders.append(entry)
     for entry in holders[:2]:
         for count in (2, 5):
+            # Pinning the count the run ALREADY has is not a test of anything: nothing is added, so
+            # "no extra commands were drawn" is the correct outcome rather than a problem. This
+            # matters now that XEB's pass count resolves from the cache (it was assumed 1 before,
+            # so every pin was an increase). Skipped, and said so, rather than counted as a pin.
+            if entry["count"] == count:
+                print(f"   {experiment}: not pinning {entry['key']}={count} -- that is already "
+                      f"this point's resolved count, so there is nothing extra to draw")
+                continue
             pins += 1
             trace.loop_counts.clear()
             trace.loop_counts[entry["key"]] = count

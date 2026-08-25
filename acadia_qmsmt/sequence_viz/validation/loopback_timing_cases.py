@@ -189,6 +189,17 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                                       # pulse list, so this asks the question that decides
                                       # whether a skip is O(1) or O(body): does the cost of
                                       # NOT running an arm grow with what the arm contains?
+    # HOST-MEMORY PROBE (no effect on the sequence). A CacheArray is numpy over an mmap of
+    # /dev/mem, so `cache[a:b] = words` is a memcpy into DEVICE memory, where an access that is
+    # not naturally aligned faults. With slice_probe_words > 0 the runtime performs exactly one
+    # such slice write, of that many int32 words, starting at a byte offset congruent to
+    # slice_probe_align (mod 16), BEFORE the first acadia.run(). If the process survives, the run
+    # produces its usual traces; if the access faults, SIGBUS kills it with no traceback and no
+    # data comes back at all. That binary outcome is the measurement, and what it measured is in
+    # validation/cache_write_alignment.py: survives iff the byte length and the byte offset are
+    # both multiples of 8, or the write is a single word.
+    slice_probe_words: int = 0        # int32 words to write in ONE numpy slice assignment
+    slice_probe_align: int = 0        # byte alignment (mod 16) of the write's first byte
     exclude_stretch: bool = False     # generated cases: leave `stretch` out of the alphabet
     fuzz_steps: int = 6               # random_seq: how many primitive steps to compose
     batch_resync_pulses: int = 8      # batch_resync: how many pulses the block=False batches play
@@ -270,6 +281,12 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             rounds = max(int(self.count_rounds), 1)
             length_cache = self.acadia.CacheArray(shape=(rounds,), dtype=np.dtype("<i4"))
             record_cache = self.acadia.CacheArray(shape=(rounds,), dtype=np.dtype("<i4"))
+
+        probe_cache = None
+        if self.slice_probe_words:
+            # 4 spare words so the write can be slid to any 4-byte alignment inside the region
+            probe_cache = self.acadia.CacheArray(shape=int(self.slice_probe_words) + 4,
+                                                 dtype=np.dtype("<i4"))
 
         rb_cmd_cache = rb_num_cache = None
         if self.case in STREAM_CASES or self.case in COUNTING_STREAM_CASES:
@@ -1751,6 +1768,21 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 gate = self.rb_loop_gate or self.rb_gates[gate_idx]
                 rb_cmd_cache[k] = self.acadia.waveform_dma_command(
                     stimuli[0].get_waveform_memory(gate))
+
+        if probe_cache is not None:
+            # ONE numpy slice assignment into /dev/mem-backed memory, at a controlled byte offset
+            # and length. Logged either side, so the run's own log says whether the process came
+            # back from it -- and if it did not, no data comes back at all.
+            words = int(self.slice_probe_words)
+            start = 0
+            while ((probe_cache.index + start) * 4) % 16 != int(self.slice_probe_align) % 16:
+                start += 1
+            byte_offset = (probe_cache.index + start) * 4
+            logger.info(f"slice probe: writing {words} int32 words ({words * 4} bytes) at cache "
+                        f"word {probe_cache.index + start} (byte {byte_offset}, "
+                        f"{byte_offset % 16} mod 16)")
+            probe_cache[start:start + words] = np.arange(words, dtype=np.int32)
+            logger.info(f"slice probe: SURVIVED the {words * 4}-byte write")
 
         t_data = None
         configure_streams = True

@@ -225,6 +225,32 @@ records which was used, and `summary()` reports it per register:
 
 `register_names={"REG0": "t_echo"}` sets a display alias.
 
+### The streamed-gate loop's bound
+
+A streamed gate loop states its end as `Register.load(cache_base + region + cache[count_word])` —
+an address *relative* to the cache, not a value in it — and acadia emits that as arithmetic in a
+DSP rather than a bus read, so the pattern above does not match it:
+
+```
+001D0168 -> BUS_ADDR                                          <- the count word
+...bus latency...
+001D0000 -> DSP_AB5                                           <- the immediate addend
+DSPConfiguration(mode='AB+C') -> DSP_CFG5  |  BUS_DATA -> DSP_C5
+DSP_P5 -> REG3                                                <- the sum lands here
+```
+
+`describe_cache_sums` reads those, so `REG3` resolves per point as `addend + cache[word]` and
+reports as `cache[360] + 0x1D0000`. That makes `repeat_until(pointer == REG3)` arithmetic: the
+count is `target - where the pointer is`, and *where the pointer is* accumulates over the guarded
+loops before it — which is what lets the two XEB families share one pointer and one shot enter
+exactly one of them (`test(pointer != final)` is decided the same way, so the family this run did
+not play is drawn as skipped rather than assumed taken). Before this, both families drew one
+assumed pass and every XEB run looked like a 2-cycle circuit whatever its depth.
+
+A cache-pointer **stream** (randomized benchmarking) is deliberately excluded: `_expand_stream`
+already unrolls that loop from the same count word, one command per gate inside a single pass, so
+resolving its pass count as well would draw the whole train once per pass — N² gates.
+
 ## Inter-block dead time
 
 A **blocking** `channel_synchronizer` does not hand off seamlessly. At block exit
@@ -250,9 +276,11 @@ The triple sweep runs **0 failures at 0.23 ns worst**, and re-scoring every arch
 the model gives the same **0.23 ns**, with no residual above 1 ns that is not a classified
 systematic. Documented *measurement* systematics (the
 mixed-ramp stretch edge, slow-ramp edge jitter) and the two KI_004 variants are excluded and
-listed in `validation/README.md`, which also records the eight model bugs this net has caught and
-the one idiom (`REGn -> BUS_DATA` streaming, used by the multi-rail XEB runtimes) it does not yet
-resolve.
+listed in `validation/README.md`, which also records the model bugs this net has caught. The
+`REGn -> BUS_DATA` streaming idiom (the multi-rail XEB runtimes) resolves as of 2026-08-24: the
+loop bound is a register loaded as `immediate + cache[word]` through an `AB+C` DSP, which
+`describe_cache_sums` now reads, so those trains draw their real per-point length instead of one
+assumed pass — see *The streamed-gate loop's bound* below.
 
 A second harness, `validation/render_validation.py`, closes the other half of the chain: it
 renders a trace to a real figure, reads the patches back off the axes and checks every rectangle
