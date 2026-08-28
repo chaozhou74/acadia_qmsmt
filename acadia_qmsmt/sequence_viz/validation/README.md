@@ -18,6 +18,25 @@ Paths below are relative to the `sequence_viz/` package root.
 | `python validation/timing_validation.py --revalidate` | archived measured runs | changes to the *timing model* (gap counting, empirical constants) that a trace alone wouldn't reveal, re-derived against measured intervals |
 | `python validation/timing_validation.py --all` | the loopback board | full re-measure — only needed if the gateware itself changed |
 | `python validation/render_validation.py` | packages only | a DRAWING that disagrees with the trace — the second half of the chain (see below) |
+
+
+## The board
+
+The loopback board is a ZCU216 with an **XM650 16T16R N79-band card** (10.66.3.229): every DAC
+loops back to an ADC through a 4400–5000 MHz filter. `validation_board_config.yaml` here stays
+generic — stimulus0..3 / capture0..3 / capture_dummy — and is retuned for this board (4.7 GHz
+carrier, even Nyquist zone, boxcar windows) by the generator in
+`msmt_workbench/rfsoc/msmt/loopback_measurements/`, so the two cannot drift apart.
+
+Experiment-specific work — the 16 fridge channels, the board tests, the pulse analysis — lives
+in **`msmt_workbench/rfsoc/msmt/loopback_measurements/`**, and its reference is
+**`XM650_BOARD.md`** there. Four board facts that affect anything run here:
+
+* only **four** ADCs can be captured at once (cmacc modules), not six as the ADC routing suggests;
+* the card wires **DAC pairs to ADC pairs in reverse order** — ADC0 hears DAC14;
+* a capture window must span its **whole memory**, or the trace is silently stale DDR;
+* ~30 ns of apparent inter-channel skew is the **capture trigger**, not the cable — spend a
+  sacrificial capture on it and the real spread is 2.5 ns.
 | `python validation/timing_validation.py --pairs` | the loopback board | every ordered PAIR of scheduling primitives, exhaustively |
 | `python validation/timing_validation.py --fuzz-steps N --scan random_seq:fuzz_seed=0,1,...` | the loopback board | randomly composed sequences, for interactions no hand-written case covers |
 | `python validation/nesting_boxes.py` | archived data | one dashed box per ENTRY, and a clickable handle on every construct and execution — including ones pinned to zero passes, which used to delete their own control |

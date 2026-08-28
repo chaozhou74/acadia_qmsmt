@@ -1,362 +1,1004 @@
-# Test config for the 4-channel loopback runtime (LoopbackMultichannelRuntime).
-# ch0=DAC0/ADC0, ch1=DAC2/ADC2, ch2=DAC4/ADC4, ch3=DAC6/ADC6 -- each pair expected to be
-# physically cabled together. DAC/ADC 0 is the high-freq channel (7 GHz, mix_reconstruction on);
-# DAC/ADC 2/4/6 are the low-freq channels (1 GHz, mix_reconstruction off).
-# Placed here as an example; recommended to keep this on the data drive for a real station,
-# same as test_config_walnut.yaml.
-
-stimulus0:
-  channel: DAC0
-  channel_config:
-    vop: 28000 # Gain of the DAC, ~ 2500-40000, adjust to your setup
-    mix_reconstruction: true
-    nco_frequency: 7.0e+9
-  pulses:
-    test_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 20e-9
-      flat: 100e-9
-      use_stretch: false
-    # rb_stream gate set: three SHORT pulses that differ only in amplitude, so a
-    # back-to-back train encodes its gate sequence as a staircase of plateau heights
-    # (power ~ scale^2, i.e. 1 : 4 : 9) that stays readable even when the pulses merge.
-    # Distinct amplitudes also mean distinct waveform memories -> distinct DMA words in
-    # the cache, so the eventual per-gate decode has ground truth to check against.
-    rb_gate_lo:
-      data: hann
-      scale: 0.15
-      ramp: 10e-9
-      flat: 20e-9
-      use_stretch: false
-    rb_gate_mid:
-      data: hann
-      scale: 0.30
-      ramp: 10e-9
-      flat: 20e-9
-      use_stretch: false
-    rb_gate_hi:
-      data: hann
-      scale: 0.45
-      ramp: 10e-9
-      flat: 20e-9
-      use_stretch: false
-    # rb_stream loop-gate LENGTH sweep: same shape, varied duration, to map the per-pulse
-    # period vs pulse length across the ~110 ns fifo-refill floor (period = max(len, floor)).
-    # Selected one at a time via rb_loop_gate; the loop then plays only this gate.
-    rb_len_015: {data: hann, scale: 0.3, ramp: 2.5e-9, flat: 10e-9,  use_stretch: false}
-    rb_len_030: {data: hann, scale: 0.3, ramp: 5e-9,   flat: 20e-9,  use_stretch: false}
-    rb_len_060: {data: hann, scale: 0.3, ramp: 10e-9,  flat: 40e-9,  use_stretch: false}
-    rb_len_090: {data: hann, scale: 0.3, ramp: 10e-9,  flat: 70e-9,  use_stretch: false}
-    rb_len_120: {data: hann, scale: 0.3, ramp: 20e-9,  flat: 80e-9,  use_stretch: false}
-    rb_len_150: {data: hann, scale: 0.3, ramp: 20e-9,  flat: 110e-9, use_stretch: false}
-    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
-    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
-    stretch_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 400e-9
-      use_stretch: true
-    # test_pulse edge to this one has no ramp mismatch. stretch_pulse keeps its 100 ns ramp for
-    # the envelope/shape cases; the generated sequences use this one for timing.
-    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
-    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
-    long_ramp_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      use_stretch: false
-    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
-    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
-    detune_10MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 10.0e+6
-      use_stretch: false
-    detune_25MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 25.0e+6
-      use_stretch: false
-    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
-    # (scale_detune_pulse applies exp(1j*phase)).
-    phase_half_pi:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      phase: 1.5707963267948966
-      use_stretch: false
-
-stimulus1:
-  channel: DAC2
-  channel_config:
-    vop: 18000
-    mix_reconstruction: false
-    nco_frequency: 1.0e+9
-  pulses:
-    test_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 20e-9
-      flat: 100e-9
-      use_stretch: false
-    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
-    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
-    stretch_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 400e-9
-      use_stretch: true
-    # test_pulse edge to this one has no ramp mismatch. stretch_pulse keeps its 100 ns ramp for
-    # the envelope/shape cases; the generated sequences use this one for timing.
-    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
-    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
-    long_ramp_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      use_stretch: false
-    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
-    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
-    detune_10MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 10.0e+6
-      use_stretch: false
-    detune_25MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 25.0e+6
-      use_stretch: false
-    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
-    # (scale_detune_pulse applies exp(1j*phase)).
-    phase_half_pi:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      phase: 1.5707963267948966
-      use_stretch: false
-
-stimulus2:
-  channel: DAC4
-  channel_config:
-    vop: 18000
-    mix_reconstruction: false
-    nco_frequency: 1.0e+9
-  pulses:
-    test_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 20e-9
-      flat: 100e-9
-      use_stretch: false
-    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
-    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
-    stretch_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 400e-9
-      use_stretch: true
-    # test_pulse edge to this one has no ramp mismatch. stretch_pulse keeps its 100 ns ramp for
-    # the envelope/shape cases; the generated sequences use this one for timing.
-    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
-    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
-    long_ramp_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      use_stretch: false
-    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
-    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
-    detune_10MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 10.0e+6
-      use_stretch: false
-    detune_25MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 25.0e+6
-      use_stretch: false
-    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
-    # (scale_detune_pulse applies exp(1j*phase)).
-    phase_half_pi:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      phase: 1.5707963267948966
-      use_stretch: false
-
-stimulus3:
-  channel: DAC6
-  channel_config:
-    vop: 18000
-    mix_reconstruction: false
-    nco_frequency: 1.0e+9
-  pulses:
-    test_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 20e-9
-      flat: 100e-9
-      use_stretch: false
-    # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
-    # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
-    stretch_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 400e-9
-      use_stretch: true
-    # test_pulse edge to this one has no ramp mismatch. stretch_pulse keeps its 100 ns ramp for
-    # the envelope/shape cases; the generated sequences use this one for timing.
-    # Long ramps so pulse-shape fits have enough samples at the 5 ns capture spacing
-    # (a 20 ns ramp is only 4 samples). Used by the stage-2 shape comparison.
-    long_ramp_pulse:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      use_stretch: false
-    # Stage 2: known SSB detunes, kept well under the 100 MHz Nyquist of the 5 ns capture
-    # spacing. 10 MHz gives 20 samples/period, 25 MHz gives 8 -- both fit a phase slope.
-    detune_10MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 10.0e+6
-      use_stretch: false
-    detune_25MHz:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      detune: 25.0e+6
-      use_stretch: false
-    # Same shape as long_ramp_pulse with a pi/2 phase offset. NOTE: phase is in RADIANS
-    # (scale_detune_pulse applies exp(1j*phase)).
-    phase_half_pi:
-      data: hann
-      scale: 0.3
-      ramp: 100e-9
-      flat: 200e-9
-      phase: 1.5707963267948966
-      use_stretch: false
-
+# Retuned for the XM650 loopback board by loopback_measurements/make_xm650_config.py
+# (carrier 4700 MHz, even Nyquist zone, boxcar windows). The CHANNELS here are the
+# timing harness's own generic ones -- experiment-specific channels live in
+# msmt/loopback_measurements/loopback_board_config.yaml.
 capture0:
   channel: ADC0
   channel_config:
-    nco_frequency: 7.0e+9
+    nco_frequency: 4700000000.0
   memories:
-    loopback_trace:
-      length: 1.2e-6 # seconds; padded beyond pre_pulse_dwell + pulse length -- see tail_trim_samples in the runtime
-      decimation: 4 # fixed by the CMACC "input" passthrough tap (see runtime docstring); required for 32-bit dtype
+    dummy_trace:
+      decimation: 4
+      length: 2.0e-06
       region: plddr
-
+    loopback_trace:
+      decimation: 4
+      length: 2.0e-06
+      region: plddr
+    loopback_trace_deep:
+      decimation: 4
+      length: 6.0e-05
+      region: plddr
+    loopback_trace_long:
+      decimation: 4
+      length: 2.0e-05
+      region: plddr
+  windows:
+    boxcar:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
+    matched:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
 capture1:
   channel: ADC2
   channel_config:
-    nco_frequency: 1.0e+9
+    nco_frequency: 4700000000.0
   memories:
-    loopback_trace:
-      length: 1.2e-6
+    dummy_trace:
       decimation: 4
+      length: 2.0e-06
       region: plddr
-
+    loopback_trace:
+      decimation: 4
+      length: 2.0e-06
+      region: plddr
+    loopback_trace_deep:
+      decimation: 4
+      length: 6.0e-05
+      region: plddr
+    loopback_trace_long:
+      decimation: 4
+      length: 2.0e-05
+      region: plddr
+  windows:
+    boxcar:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
+    matched:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
 capture2:
   channel: ADC4
   channel_config:
-    nco_frequency: 1.0e+9
+    nco_frequency: 4700000000.0
   memories:
-    loopback_trace:
-      length: 1.2e-6
+    dummy_trace:
       decimation: 4
+      length: 2.0e-06
       region: plddr
-
+    loopback_trace:
+      decimation: 4
+      length: 2.0e-06
+      region: plddr
+    loopback_trace_deep:
+      decimation: 4
+      length: 6.0e-05
+      region: plddr
+    loopback_trace_long:
+      decimation: 4
+      length: 2.0e-05
+      region: plddr
+  windows:
+    boxcar:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
+    matched:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
 capture3:
   channel: ADC6
   channel_config:
-    nco_frequency: 1.0e+9
+    nco_frequency: 4700000000.0
   memories:
-    loopback_trace:
-      length: 1.2e-6
+    dummy_trace:
       decimation: 4
+      length: 2.0e-06
       region: plddr
-    # Second accumulating memory, for the SECOND resonator in measure_multi. Simultaneous
-    # multi-resonator readout (readout_confusion, the joint dual-rail readouts) puts two
-    # measure() calls in ONE channel_synchronizer, and each resonator needs its own capture IO
-    # and its own accumulating memory. This ADC is free in the readout cases: those trace only
-    # ch0/ch1 (trace_channels), so ADC6's cmacc is unused.
-    readout_accumulated:
-      length: 4.0e-7
+    loopback_trace:
       decimation: 4
+      length: 2.0e-06
+      region: plddr
+    loopback_trace_deep:
+      decimation: 4
+      length: 6.0e-05
+      region: plddr
+    loopback_trace_long:
+      decimation: 4
+      length: 2.0e-05
+      region: plddr
+    readout_accumulated:
+      decimation: 4
+      length: 4.0e-07
       region: plddr
   windows:
     boxcar:
-      data: "np.ones(20)"
-
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
+    matched:
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
 capture_dummy:
   channel: ADC1
   channel_config:
-    nco_frequency: 7.0e+9
+    nco_frequency: 4700000000.0
   memories:
     dummy_trace:
-      length: 1.2e-6 # seconds; padded beyond pre_pulse_dwell + pulse length -- see tail_trim_samples in the runtime
-      decimation: 4 # fixed by the CMACC "input" passthrough tap (see runtime docstring); required for 32-bit dtype
+      decimation: 4
+      length: 2.0e-06
       region: plddr
-    # Accumulating memory for the measure_* cases, which exercise
-    # MeasurableResonator.measure() -- the readout path 94 of the qudit runtimes use and that
-    # no loopback case reached (every other case captures a raw trace via stream_cmacc).
-    # measure() lands here on ADC1, so it never contends with the four trace captures; those
-    # cases set use_dummy_channel=False to free this ADC. What is physically MEASURED is the
-    # readout PULSE the resonator schedules on its stimulus DAC, which is cabled to a trace ADC.
+    loopback_trace:
+      decimation: 4
+      length: 2.0e-06
+      region: plddr
+    loopback_trace_deep:
+      decimation: 4
+      length: 6.0e-05
+      region: plddr
+    loopback_trace_long:
+      decimation: 4
+      length: 2.0e-05
+      region: plddr
     readout_accumulated:
-      length: 4.0e-7
-      decimation: 4   # as on the trace memories: the CMACC "input" tap requires a 32-bit dtype,
-                      # and decimation 1 gives int16 ("CMACC streams require destinations with
-                      # 32-bit quadratures")
+      decimation: 4
+      length: 4.0e-07
       region: plddr
   windows:
-    # measure(window_name=None) takes the FIRST window here. Left without `data`, so
-    # capture_cmacc takes its kernel-is-None branch and reads the accumulation length from
-    # `memories.<name>.length` -- valid only for a memory given by NAME. A DUPLICATED capture
-    # memory is an object, not a name, and raises KeyError there (the documented
-    # readout_window_needs_data_when_capture_memory_is_duplicated / failure_019), which is why
-    # `matched` below carries real kernel data for the two-round case.
     boxcar:
-      # Real data, not null. An empty window dict raises KeyError: 'data', and a null one gets
-      # as far as MeasurableResonator.load_windows() before failing with "Unable to load
-      # WaveformMemory from object of type NoneType" -- load_windows has nothing to write. Every
-      # window a runtime actually measures through carries a calibrated kernel, so carrying one
-      # here matches real use as well as being the only thing that loads.
-      data: "np.ones(20)"
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
     matched:
-      # Written INLINE (yaml_editor evaluates an "np." string) rather than as a .npy path: a
-      # relative path resolves against the CWD, not this file, and an absolute one bakes in one
-      # machine -- which is exactly how Ziqian_measurements/config.yaml ended up pointing every
-      # readout kernel at /home/c6/..., breaking 6 of the repo's own checks on any other station.
-      # 80 samples = the 4.0e-7 s window at 5 ns/sample, decimation 1. A flat boxcar is the
-      # natural "no weighting" demodulation vector; it is a fixture, not measured data.
-      data: "np.ones(20)"   # 4.0e-7 s at 5 ns/sample with decimation 4
+      data: np.ones(20)
+      offset:
+      - 0
+      - 0
+stimulus0:
+  channel: DAC0
+  channel_config:
+    mix_reconstruction: true
+    nco_frequency: 4700000000.0
+    vop: 28000
+  pulses:
+    detune_10MHz:
+      data: hann
+      detune: 10000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      detune: 25000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    id_dac00:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.1
+      use_stretch: false
+    id_dac01:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.13
+      use_stretch: false
+    id_dac02:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.16
+      use_stretch: false
+    id_dac03:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.19
+      use_stretch: false
+    id_dac04:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.22
+      use_stretch: false
+    id_dac05:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.25
+      use_stretch: false
+    id_dac06:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.28
+      use_stretch: false
+    id_dac07:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.31
+      use_stretch: false
+    id_dac08:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.34
+      use_stretch: false
+    id_dac09:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.37
+      use_stretch: false
+    id_dac10:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.4
+      use_stretch: false
+    id_dac11:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.43
+      use_stretch: false
+    id_dac12:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.46
+      use_stretch: false
+    id_dac13:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.49
+      use_stretch: false
+    id_dac14:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.52
+      use_stretch: false
+    id_dac15:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.55
+      use_stretch: false
+    long_ramp_pulse:
+      data: hann
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    phase_half_pi:
+      data: hann
+      flat: 200e-9
+      phase: 90
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    rb_gate_hi:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_gate_lo:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.15
+      use_stretch: false
+    rb_gate_mid:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.3
+      use_stretch: false
+    rb_len_015:
+      data: hann
+      flat: '7.5e-9'
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_030:
+      data: hann
+      flat: 20e-9
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_060:
+      data: hann
+      flat: 40e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_090:
+      data: hann
+      flat: 60e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_120:
+      data: hann
+      flat: 80e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_150:
+      data: hann
+      flat: 100e-9
+      ramp: 30e-9
+      scale: 0.45
+      use_stretch: false
+    stretch_pulse:
+      data: hann
+      flat: 400e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: true
+    test_pulse:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_bs:
+      data: hann
+      flat: 280e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_swap:
+      data: hann
+      flat: 580e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+stimulus1:
+  channel: DAC2
+  channel_config:
+    mix_reconstruction: true
+    nco_frequency: 4700000000.0
+    vop: 18000
+  pulses:
+    detune_10MHz:
+      data: hann
+      detune: 10000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      detune: 25000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    id_dac00:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.1
+      use_stretch: false
+    id_dac01:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.13
+      use_stretch: false
+    id_dac02:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.16
+      use_stretch: false
+    id_dac03:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.19
+      use_stretch: false
+    id_dac04:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.22
+      use_stretch: false
+    id_dac05:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.25
+      use_stretch: false
+    id_dac06:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.28
+      use_stretch: false
+    id_dac07:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.31
+      use_stretch: false
+    id_dac08:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.34
+      use_stretch: false
+    id_dac09:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.37
+      use_stretch: false
+    id_dac10:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.4
+      use_stretch: false
+    id_dac11:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.43
+      use_stretch: false
+    id_dac12:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.46
+      use_stretch: false
+    id_dac13:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.49
+      use_stretch: false
+    id_dac14:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.52
+      use_stretch: false
+    id_dac15:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.55
+      use_stretch: false
+    long_ramp_pulse:
+      data: hann
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    phase_half_pi:
+      data: hann
+      flat: 200e-9
+      phase: 90
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    rb_gate_hi:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_gate_lo:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.15
+      use_stretch: false
+    rb_gate_mid:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.3
+      use_stretch: false
+    rb_len_015:
+      data: hann
+      flat: '7.5e-9'
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_030:
+      data: hann
+      flat: 20e-9
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_060:
+      data: hann
+      flat: 40e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_090:
+      data: hann
+      flat: 60e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_120:
+      data: hann
+      flat: 80e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_150:
+      data: hann
+      flat: 100e-9
+      ramp: 30e-9
+      scale: 0.45
+      use_stretch: false
+    stretch_pulse:
+      data: hann
+      flat: 400e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: true
+    test_pulse:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_bs:
+      data: hann
+      flat: 280e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_swap:
+      data: hann
+      flat: 580e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+stimulus2:
+  channel: DAC4
+  channel_config:
+    mix_reconstruction: true
+    nco_frequency: 4700000000.0
+    vop: 18000
+  pulses:
+    detune_10MHz:
+      data: hann
+      detune: 10000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      detune: 25000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    id_dac00:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.1
+      use_stretch: false
+    id_dac01:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.13
+      use_stretch: false
+    id_dac02:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.16
+      use_stretch: false
+    id_dac03:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.19
+      use_stretch: false
+    id_dac04:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.22
+      use_stretch: false
+    id_dac05:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.25
+      use_stretch: false
+    id_dac06:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.28
+      use_stretch: false
+    id_dac07:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.31
+      use_stretch: false
+    id_dac08:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.34
+      use_stretch: false
+    id_dac09:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.37
+      use_stretch: false
+    id_dac10:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.4
+      use_stretch: false
+    id_dac11:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.43
+      use_stretch: false
+    id_dac12:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.46
+      use_stretch: false
+    id_dac13:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.49
+      use_stretch: false
+    id_dac14:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.52
+      use_stretch: false
+    id_dac15:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.55
+      use_stretch: false
+    long_ramp_pulse:
+      data: hann
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    phase_half_pi:
+      data: hann
+      flat: 200e-9
+      phase: 90
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    rb_gate_hi:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_gate_lo:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.15
+      use_stretch: false
+    rb_gate_mid:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.3
+      use_stretch: false
+    rb_len_015:
+      data: hann
+      flat: '7.5e-9'
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_030:
+      data: hann
+      flat: 20e-9
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_060:
+      data: hann
+      flat: 40e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_090:
+      data: hann
+      flat: 60e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_120:
+      data: hann
+      flat: 80e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_150:
+      data: hann
+      flat: 100e-9
+      ramp: 30e-9
+      scale: 0.45
+      use_stretch: false
+    stretch_pulse:
+      data: hann
+      flat: 400e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: true
+    test_pulse:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_bs:
+      data: hann
+      flat: 280e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_swap:
+      data: hann
+      flat: 580e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+stimulus3:
+  channel: DAC6
+  channel_config:
+    mix_reconstruction: true
+    nco_frequency: 4700000000.0
+    vop: 18000
+  pulses:
+    detune_10MHz:
+      data: hann
+      detune: 10000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    detune_25MHz:
+      data: hann
+      detune: 25000000.0
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    id_dac00:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.1
+      use_stretch: false
+    id_dac01:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.13
+      use_stretch: false
+    id_dac02:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.16
+      use_stretch: false
+    id_dac03:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.19
+      use_stretch: false
+    id_dac04:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.22
+      use_stretch: false
+    id_dac05:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.25
+      use_stretch: false
+    id_dac06:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.28
+      use_stretch: false
+    id_dac07:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.31
+      use_stretch: false
+    id_dac08:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.34
+      use_stretch: false
+    id_dac09:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.37
+      use_stretch: false
+    id_dac10:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.4
+      use_stretch: false
+    id_dac11:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.43
+      use_stretch: false
+    id_dac12:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.46
+      use_stretch: false
+    id_dac13:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.49
+      use_stretch: false
+    id_dac14:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.52
+      use_stretch: false
+    id_dac15:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.55
+      use_stretch: false
+    long_ramp_pulse:
+      data: hann
+      flat: 200e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    phase_half_pi:
+      data: hann
+      flat: 200e-9
+      phase: 90
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: false
+    rb_gate_hi:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_gate_lo:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.15
+      use_stretch: false
+    rb_gate_mid:
+      data: hann
+      flat: 20e-9
+      ramp: 10e-9
+      scale: 0.3
+      use_stretch: false
+    rb_len_015:
+      data: hann
+      flat: '7.5e-9'
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_030:
+      data: hann
+      flat: 20e-9
+      ramp: 5e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_060:
+      data: hann
+      flat: 40e-9
+      ramp: 10e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_090:
+      data: hann
+      flat: 60e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_120:
+      data: hann
+      flat: 80e-9
+      ramp: 20e-9
+      scale: 0.45
+      use_stretch: false
+    rb_len_150:
+      data: hann
+      flat: 100e-9
+      ramp: 30e-9
+      scale: 0.45
+      use_stretch: false
+    stretch_pulse:
+      data: hann
+      flat: 400e-9
+      ramp: 100e-9
+      scale: 0.3
+      use_stretch: true
+    test_pulse:
+      data: hann
+      flat: 100e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_bs:
+      data: hann
+      flat: 280e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false
+    xeb_swap:
+      data: hann
+      flat: 580e-9
+      ramp: 20e-9
+      scale: 0.3
+      use_stretch: false

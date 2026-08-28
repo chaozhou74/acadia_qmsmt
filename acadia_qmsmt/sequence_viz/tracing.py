@@ -201,6 +201,9 @@ class SequenceTrace:
     control_flow: dict = field(default_factory=dict)
     loop_counts: dict = field(default_factory=dict)  # block index -> iterations to draw
     repeat_counts: dict = field(default_factory=dict)  # block index -> resolved repeat_until count
+    stream_words: int = 0        # cache words the pulse stream walks (one per loop pass)
+    stream_repeats: int = 1      # copies of each word issued per pass (dualrail_rb's bs_repeats)
+    stream_gates: int = 0        # words * repeats -- the gates _expand_stream actually drew
     #: Constructs whose compiled target makes them NON-TERMINATING on hardware: a ``P+1`` counter
     #: loop whose exit target is 0. The body runs at least once and the counter never comes back to
     #: 0, so the board hangs. Kept separate from a user's pinned 0, which is a drawing hypothesis.
@@ -311,27 +314,60 @@ class SequenceTrace:
     def _is_stream_command(self, command):
         """True for the direct DMA command of a cache-pointer stream on its channel.
 
-        The whole DMA word is fetched at runtime, so it comes through as symbolic
-        ``BUS_DATA``; :attr:`stream` marks which channel that stream drives.
+        The whole DMA word is fetched at runtime, so it comes through as symbolic: either
+        ``BUS_DATA`` (the cache read issued in the same instruction) or ``REG<n>`` (the read
+        latched into a register first, which dualrail_rb does when it issues the same word
+        several times per pass -- a raw bus_read result is only valid for a few cycles).
+        :attr:`stream` marks which channel that stream drives, and is only set for a
+        single-channel stream, so the multi-rail XEB idiom cannot reach here.
         """
-        return bool(self.stream and command.symbolic == "BUS_DATA"
-                    and command.channel == self.stream["channel"])
+        symbolic = str(command.symbolic or "")
+        return bool(self.stream and command.channel == self.stream["channel"]
+                    and (symbolic == "BUS_DATA" or symbolic.startswith("REG")))
 
-    def _expand_stream(self, command, placement, start):
+    def _expand_stream(self, command, placement, start, per_pass_extra=0, extras=(),
+                       repeats=1):
         """Unroll a cache-pointer pulse stream into one command per played gate.
 
         The loop plays ``count`` gates, ``count`` read from the cache word the runtime
         computed the pointer bound from; gate ``k`` is ``cache[start_offset + k]``, a DMA
         word decoding to ``addr = word >> 16`` / ``length = (word & 0xFFFF) + 1`` (the same
         ``waveform_dma_command`` packing the static path uses), and ``addr`` names the pulse
-        via :attr:`addr_names`. Gates are laid at the per-pulse *period* ``max(length,
-        floor)`` -- the fifo-refill floor means short pulses cannot play back-to-back.
+        via :attr:`addr_names`.
+
+        Gates are laid at the per-pulse *period* ``max(length + per_pass_extra, floor)`` -- the
+        fifo-refill floor means short pulses cannot play back-to-back, and anything else the loop
+        pass queues on the same channel lengthens the period by its own duration.
+
+        ``repeats`` is how many times the pass issues the SAME word before advancing the
+        pointer. dualrail_rb does this when the half-swap is shorter than the loop can sustain:
+        five copies of a pi/2 beamsplitter are the same logical gate (5*pi/2 = 2*pi + pi/2, and a
+        2*pi rotation in SU(2) is -I) and they queue five pulses' worth of play time in one pass,
+        so the channel stops running dry. They play CONTIGUOUSLY -- measured on the loopback
+        board, a 50 ns half-swap went from 40% duty with 60 ns gaps at one per pass to 87% duty,
+        continuous, at five. Modelling each copy as its own pass would put the floor between them
+        and show gaps that are not there.
+
+        ``per_pass_extra`` / ``extras`` are the other descriptors a pass queues. A pass typically pushes the
+        gate and then an idle dwell (dualrail_rb's ``inter_bs_dwell``), and the dwell is pushed
+        EVERY pass, so it sits between every pair of gates. Without this the model spaced the
+        gates by the pulse alone and drew the dwell once after the whole train -- so a 20 ns
+        inter_bs_dwell was invisible in the view and the predicted gate period was 20 ns short of
+        what the board plays (measured: a 130 ns gate has a 130.0 ns period at dwell 0 and
+        135.0 ns at dwell 5, on every rf line).
 
         :return: the cursor after the train (its start plus ``count`` period slots).
         """
         meta = self.stream
         cache = self.point_cache or {}
         count = int(cache.get(meta["count_word"], 0))
+        # What this train really is, kept for the drawing: the loop's PASS count is deliberately
+        # left unresolved (see _is_stream_count -- resolving it would draw the whole train once per
+        # pass), so without this the tab can only say "the board decides at runtime" about a number
+        # this run's cache pins down exactly. One cache word per pass, `repeats` copies per word.
+        self.stream_words = count
+        self.stream_repeats = max(int(repeats), 1)
+        self.stream_gates = count * max(int(repeats), 1)
         floor = int(meta["floor"])
         post_span = int(meta.get("post_span", floor))
         cnum = meta["channel_num"]
@@ -341,16 +377,27 @@ class SequenceTrace:
             address = word >> 16
             length = (word & 0xFFFF) + 1
             io_name, pulse = self.addr_names.get((cnum, address), (None, None))
-            placement.commands.append(replace(
-                command, start=cursor, length=length, symbolic=None,
-                resolution="cache", pulse=pulse, io_name=io_name, address=address))
+            # `repeats` copies, back to back: one pass queues them together so nothing
+            # separates them.
+            for r in range(max(int(repeats), 1)):
+                placement.commands.append(replace(
+                    command, start=cursor + r * length, length=length, symbolic=None,
+                    resolution="cache", pulse=pulse, io_name=io_name, address=address))
+            played = length * max(int(repeats), 1)
             # Gates are spaced by the per-gate period (max of the pulse length and the push-
             # cadence floor). The LAST gate has no next gate to refill for, so its trailing is
             # the counted post-loop span instead -- the loop exit + drain + next block's push/
             # trigger -- which is where the following block actually begins. (Ending at the bare
             # last-pulse stop would merge the next block into the gate; ending a full floor past
             # it, as before, put the next block ~one refill gap too late.)
-            trailing = max(length, floor) if k < count - 1 else max(length, post_span)
+            # the rest of what this pass queued on the same channel, in order after the gate
+            sub = cursor + played
+            for extra in extras:
+                placement.commands.append(replace(extra, start=sub, symbolic=None,
+                                                  resolution="cache"))
+                sub += int(extra.length or 0)
+            period = played + per_pass_extra
+            trailing = max(period, floor) if k < count - 1 else max(period, post_span)
             cursor += trailing
         return cursor
 
@@ -2133,16 +2180,40 @@ def describe_cache_stream(acadia):
     """
     prog = decode_program(acadia)
 
-    # the played command: BUS_DATA issued straight to a channel's DMA, named in the comment
-    direct = None
+    # The played command: a runtime-fetched DMA word driven into a channel's data port, named in
+    # the comment. Two forms, and both are streams:
+    #
+    #   s == BUS_DATA   the cache read is issued in the same instruction (one push per pass)
+    #   s == REG        the read was latched into a register first, and the register is pushed
+    #
+    # dualrail_rb latches when `bs_repeats` issues the same word several times per pass, because a
+    # raw bus_read result is only valid for a few cycles after the read: measured on the loopback
+    # board, five unlatched pushes delivered the right word only twice (a 90-degree gate group
+    # read 91, 90, 4, 4, 15 degrees) and at 200 ns dropped two descriptors of every five.
+    #
+    # The latched form is accepted ONLY when every register-sourced push in the program is on ONE
+    # channel. The multi-rail XEB runtimes latch too -- three rails, three pointers, three
+    # registers -- and they are laid out by the register-gate path in machine.py instead. Firing
+    # here for them would model a single rail as the whole train.
+    direct, reg_directs = None, []
     for r in prog:
-        if (r.comment and r.comment.startswith("Command DMA for")
-                and ((r.d1 == "BUS_DATA" and r.s1 == "BUS_DATA")
-                     or (r.d2 == "BUS_DATA" and r.s2 == "BUS_DATA"))):
-            match = re.match(r"Command DMA for (\w+)", r.comment)
-            if match:
-                direct = (r.i, match.group(1))
-                break
+        if not (r.comment and r.comment.startswith("Command DMA for")):
+            continue
+        match = re.match(r"Command DMA for (\w+)", r.comment)
+        if not match:
+            continue
+        for dest, src in ((r.d1, r.s1), (r.d2, r.s2)):
+            if dest != "BUS_DATA":
+                continue
+            if src == "BUS_DATA":
+                if direct is None:
+                    direct = (r.i, match.group(1))
+            elif src == "REG":
+                reg_directs.append((r.i, match.group(1)))
+        if direct is not None:
+            break
+    if direct is None and reg_directs and len({c for _i, c in reg_directs}) == 1:
+        direct = reg_directs[0]
     if direct is None:
         return None
     direct_idx, channel = direct

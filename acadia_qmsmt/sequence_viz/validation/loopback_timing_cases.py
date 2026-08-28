@@ -75,7 +75,7 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          "stretch_measure_dwell", "stretch_measure_barrier",
          "loop_measure_feedback", "loop_stream_feedback",
          # the almost_empty drain -- the ONLY drain variant the real runtimes use
-         "batch_drain_almost", "batch_in_loop_almost",
+         "batch_drain_almost", "batch_in_loop_almost", "stagger_stream",
          # generated sequences: random compositions, and the exhaustive pair enumeration
          "random_seq", "pair_seq",
          # KI_002 cases: these could not compile before the 2026-07-27 acadia pull
@@ -163,6 +163,29 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                                       # gate). Set this for TIMING validation of the final block.
     rb_loop_gate: str = None          # if set, the loop plays only this gate (a single shape),
                                       # for the pulse-length sweep that maps the ~110 ns floor
+    # stagger_stream: two channels serialised WITHIN a cycle by lead/tail dwells and
+    # streamed in chunks. `stagger_poll_all` picks whether the drain poll before each chunk
+    # waits on every channel or only the first-draining one -- the question being whether
+    # waiting for the slowest starves the fastest and destroys the stagger.
+    stagger_poll_all: bool = True
+    stagger_channels: int = 2         # how many channels take turns (2 or 3)
+    stagger_cycles_per_chunk: int = 6
+    stagger_pulse_names: tuple = None # one pulse per taking-turns channel, which sets the
+                                      # CYCLE LENGTH (the sum of them). None keeps the default
+                                      # below, whose fixed 300 ns third pulse pins the cycle
+                                      # near 470 ns; override it to reach short cycles, where
+                                      # the queued play time no longer covers the push.
+    rb_stream_channel: int = 0        # which stimulus the rb_stream case drives. ch0 is the
+                                      # 7 GHz mix_reconstruction line; ch1/2/3 are the 1 GHz
+                                      # mix_reconstruction=False lines, which is the fridge's
+                                      # sideband-channel configuration.
+    rb_loop_dwell: float = 0.0        # seconds; a dwell descriptor appended to each loop pass,
+                                      # exactly dualrail_rb's `inter_bs_dwell`. 0 disables it.
+    rb_loop_descriptors: int = 1      # descriptors pushed per loop PASS. 1 is dualrail_rb; 2 is
+                                      # the shape that pushes a pulse PAIR per pass
+                                      # (single_g1e0_phase_calibration), which is what decides
+                                      # whether the per-pass floor is cleared by the pair or by
+                                      # one pulse.
     loop_count: int = 2               # loop_n / nested_cool_n: outer deterministic loop passes
     inner_loop_count: int = 2         # nested_cool_n: inner passes per outer pass
     n_blocks: int = 3                 # blocks_n: how many blocking blocks in a row
@@ -249,6 +272,22 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 cap.get_config("memories", mem)["length"] = float(self.capture_length_override)
 
         capture_length = captures[0].get_config("memories", self.capture_memory_name, "length")
+
+        # stagger_stream needs the two pulse lengths in whole cycles, computed out here
+        # because the sequence body cannot call get_config on a per-case basis cleanly.
+        self._case_clock = self.acadia.sequencer_clock_frequency()
+        def _cyc(io, name):
+            return int(np.ceil((io.get_config("pulses", name, "ramp")
+                                + io.get_config("pulses", name, "flat")) * self._case_clock))
+        self._case_len_a = _cyc(stimuli[0], self.stimulus_pulse_name)
+        self._case_len_b = _cyc(stimuli[1], self.rb_loop_gate or "rb_gate_hi")
+        self._case_stagger_names = (list(self.stagger_pulse_names)
+                                    if self.stagger_pulse_names else
+                                    [self.stimulus_pulse_name,
+                                     self.rb_loop_gate or "rb_gate_hi",
+                                     "long_ramp_pulse"])
+        self._case_stagger_lens = [_cyc(stimuli[i], self._case_stagger_names[i])
+                                   for i in range(3)]
 
         # batch_resync: the dwell that waits for the last queued pulse, sized flat + ramp,
         # exactly as the SWAP runtime computes bs_pulse_length.
@@ -868,7 +907,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 # at its own start while a 5-descriptor batch releases three descriptors in. The
                 # count was hard-coded at 3, which made `--scan batch_drain_almost:...` vacuous --
                 # every point deployed the identical sequence and reported a reassuring 0.10 ns.
-                n_batch = max(int(self.batch_resync_pulses), 2)
+                # Floor 1, not 2: dualrail_rb streams ONE descriptor per pass without
+                # inter_bs_dwell and TWO with it, so the 1-vs-2 comparison is the whole
+                # question about that dwell. Flooring at 2 made it unaskable.
+                n_batch = max(int(self.batch_resync_pulses), 1)
                 if self.case == "batch_in_loop_almost":
                     counter = a.sequencer().DSP()
                     counter.load(0)
@@ -895,6 +937,52 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                             pass
                     with a.channel_synchronizer():
                         stimuli[0].schedule_pulse(pulse)
+
+            elif self.case == "stagger_stream":
+                # TWO channels, serialised inside every cycle: ch0 plays, then ch1, and each
+                # channel dwells out the rest of the cycle so both cycles are the same length
+                # and the offset holds. Streamed as chunks of `stagger_cycles_per_chunk`
+                # cycles in one block=False batch each, with a drain poll in between.
+                # N channels take turns inside every cycle, exactly the pattern the XEB
+                # multi-rail runtimes use: each channel is held off for `lead`, plays, then
+                # held off for `after`, with lead + own + after the same for all of them.
+                clk = self._case_clock
+                n_ch = max(2, min(int(self.stagger_channels), 3))
+                ios = [stimuli[i] for i in range(n_ch)]
+                names = self._case_stagger_names[:n_ch]
+                lens = self._case_stagger_lens[:n_ch]
+                gap = 1
+                cyc = sum(L + gap for L in lens)
+                lead = [sum(lens[j] + gap for j in range(i)) for i in range(n_ch)]
+                after = [cyc - lead[i] - lens[i] for i in range(n_ch)]
+                n_cycles = max(int(self.loop_count), 1)
+                per_chunk = max(int(self.stagger_cycles_per_chunk), 1)
+
+                for start in range(0, n_cycles, per_chunk):
+                    if self.stagger_poll_all:
+                        for io in ios:
+                            with a.sequencer().repeat_until(
+                                    a.channel_is_fifo_almost_empty(io.channel)):
+                                pass
+                    else:
+                        with a.sequencer().repeat_until(
+                                a.channel_is_fifo_almost_empty(ios[0].channel)):
+                            pass
+                    with a.channel_synchronizer(block=False):
+                        for i, io in enumerate(ios):
+                            if start == 0 and lead[i]:
+                                io.dwell(lead[i] / clk)         # wait for the earlier turns
+                            for _ in range(start, min(start + per_chunk, n_cycles)):
+                                io.schedule_pulse(names[i])
+                                io.dwell((cyc - lens[i]) / clk)
+
+                for io in ios:
+                    with a.sequencer().repeat_until(
+                            a.channel_is_fifo_almost_empty(io.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    for io in ios:
+                        io.dwell(1.0 / clk)
 
             elif self.case == "stretch_in_loop":
                 # A register-stretched pulse inside a loop: an indeterminate length and a loop
@@ -1331,7 +1419,7 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 # are fifo-almost-empty gated (period floors at ~110 ns), while the 8 final
                 # gates are pushed up front in one block (back-to-back at pulse length): the
                 # contrast confirms the floor is the loop's alone.
-                stim = stimuli[0]
+                stim = stimuli[int(self.rb_stream_channel)]
                 with a.channel_synchronizer():                       # (0) initial pulse
                     stim.schedule_pulse(self.rb_initial_pulse)
 
@@ -1349,7 +1437,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         command = a.sequencer().bus_read(
                             pointer, latency=a._bus_latency("cache"))
                         with a.channel_synchronizer(block=False):
-                            a.schedule_direct(stim.channel, command)
+                            for _ in range(max(int(self.rb_loop_descriptors), 1)):
+                                a.schedule_direct(stim.channel, command)
+                            if self.rb_loop_dwell:
+                                a.dwell(stim.channel, self.rb_loop_dwell)
                         pointer.pulse_cep()
                 with a.sequencer().repeat_until(
                         a.channel_is_fifo_almost_empty(stim.channel)):
@@ -1679,7 +1770,11 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                          + ([self.rb_final_gate] if self.rb_final_gate else []))))
 
         def names_for(index):
-            return pulses_used + (rb_pulses if index == 0 else [])
+            extra = ([self._case_stagger_names[index]]
+                     if self.case == "stagger_stream" and index < len(self._case_stagger_names)
+                     else [])
+            return list(dict.fromkeys(pulses_used + extra
+                                      + (rb_pulses if index == 0 else [])))
 
         for i, stim in enumerate(stimuli):
             for name in names_for(i):

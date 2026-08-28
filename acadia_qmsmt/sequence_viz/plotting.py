@@ -553,6 +553,26 @@ def fit_layout(fig, ax):
         fig.subplots_adjust(right=right)
 
 
+def _stream_gates_of(trace, block_index):
+    """Gates the cache-pointer stream drew inside the construct whose body is ``block_index``.
+
+    The stream loop's PASS count is deliberately unresolved -- `_expand_stream` unrolls the whole
+    train inside one pass, and resolving the count as well would draw it once per pass (measured:
+    1791 gates became 3207681). So the tab has no number to show and falls back to "the board
+    decides this at runtime", which is false: the count is read from this run's own cache. This
+    gives the caption the real figure to print instead.
+    """
+    stream = getattr(trace, "stream", None)
+    if not stream or not getattr(trace, "stream_gates", 0):
+        return None
+    blocks = getattr(trace, "blocks", None) or ()
+    if not (0 <= block_index < len(blocks)):
+        return None
+    if not any(trace._is_stream_command(c) for c in blocks[block_index].commands):
+        return None
+    return int(trace.stream_gates)
+
+
 def branch_regions(trace):
     """``[(start, stop, context, info), ...]`` -- one span per CONSTRUCT, at every nesting level.
 
@@ -646,7 +666,7 @@ def branch_regions(trace):
             "depth": len(run["full"]),
             "assumed": first in trace.assumed_paths,
             "unsupported": first in getattr(trace, "unsupported_paths", ()),
-            "stream_count": None,
+            "stream_count": _stream_gates_of(trace, first),
             # which execution this is, for a per-execution override key
             "path": run.get("path", ()),
             "repeat_count": getattr(trace, "repeat_counts", {}).get(first),
@@ -812,8 +832,17 @@ def branch_caption(trace, context, info):
         # per-point cache -- so say how many gates, not that the count is unknown.
         stream = info.get("stream_count")
         if stream is not None:
-            return (f"repeat_until({condition}) — {stream} gates from cache "
-                    f"(this sweep point)")
+            # One pass per cache word, and `bs_repeats` copies of that word per pass -- the copies
+            # abut, so they are one logical gate played several times, not several gates. Saying
+            # only the gate total would hide exactly the structure that matters here: dualrail_rb
+            # issues five copies of a short half-swap so the loop can keep up, and whether those
+            # five carry the same word is the thing worth checking on hardware.
+            words = int(getattr(trace, "stream_words", 0) or 0)
+            copies = int(getattr(trace, "stream_repeats", 1) or 1)
+            how = (f"{words} cache words x {copies} copies = {stream} pulses"
+                   if copies > 1 else f"{stream} gates")
+            return (f"repeat_until({condition}) — {how} from cache (this sweep point); "
+                    f"the loop runs {words} passes, all drawn unrolled inside one")
         if info.get("nonterminating") and info.get("source") != "pinned":
             return (f"repeat_until({condition}) — NEVER EXITS: the counter starts at 0 and is "
                     f"incremented before this test is next evaluated, so it cannot reach 0. "

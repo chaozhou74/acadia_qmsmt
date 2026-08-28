@@ -340,12 +340,40 @@ def machine_layout(trace):
         t_sub = 0
         for i_sub, group in enumerate(block.subschedules):
             per_channel, sub_len = {}, 0
+            # Commands already placed by a stream expansion: the repeat copies of the same word,
+            # and the per-pass extras that were laid between the gates. Checked BEFORE the stream
+            # branch, because a repeat copy IS a stream command and would otherwise expand the
+            # whole train again -- five copies of a three-gate train gave 75 pulses, not 15.
+            placed_by_stream = set()
             for command in group:
+                if id(command) in placed_by_stream:
+                    continue
                 if self._is_stream_command(command):
                     stream_here = True
                     start_rel = per_channel.get(command.channel, t_sub)
                     base = play_start[command.channel]
-                    end = self._expand_stream(command, placement, base + start_rel)
+                    # Everything else this subschedule puts on the stream's channel belongs to
+                    # EVERY pass of the loop, not once after it: the loop body is its own
+                    # subschedule holding the gate and whatever follows it (an inter-gate dwell).
+                    # Laying those after the train, as before, drew one dwell at the end and left
+                    # the gate period short by its duration.
+                    extras = [c for c in group
+                              if c.channel == command.channel
+                              and c is not command
+                              and not self._is_stream_command(c)]
+                    extra_len = sum(int(c.length or 0) for c in extras)
+                    # The same word issued more than once in a pass: dualrail_rb repeats a short
+                    # half-swap so the loop can keep up. Every such command is a stream command
+                    # on this channel, so counting them gives the repeat factor -- and they must
+                    # be expanded ONCE with that factor, not once each, or the model puts the
+                    # refill floor between copies that actually abut.
+                    same = [c for c in group
+                            if c.channel == command.channel and self._is_stream_command(c)]
+                    end = self._expand_stream(command, placement, base + start_rel,
+                                              per_pass_extra=extra_len, extras=extras,
+                                              repeats=len(same))
+                    placed_by_stream.update(id(c) for c in extras)
+                    placed_by_stream.update(id(c) for c in same[1:])
                     end_rel = end - base
                     per_channel[command.channel] = end_rel
                     prev_len[command.channel] = 0
