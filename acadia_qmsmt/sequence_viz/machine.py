@@ -131,15 +131,53 @@ def _register_gate(trace, command, gate_index):
 
     starts = trace.register_stream_starts
     if command.channel not in starts:
-        # first gate on this channel: find the cache offset whose word names a pulse here
+        # First gate on this channel: find the cache offset whose word names a pulse here.
+        #
+        # "names a pulse here" is NOT enough on its own. The rails hold DUPLICATES of the same
+        # shape, so one address can name a valid pulse on several channels at once -- measured:
+        # in the 3-rail XEB, address 196 is xeb_0_sqrtW on DAC10 and xeb_1_sqrtY on DAC3. Taking
+        # the first offset that merely resolved handed DAC3 rail 1's region, and rail 2's gates
+        # were then drawn with rail 1's LENGTH (33 cycles instead of 40). Where the register value
+        # could not be decoded at all the raw command word was used as a duration, which drew a
+        # 42.6 ms dwell for a 200 ns gate.
+        #
+        # Two rules make the choice unambiguous, both from the data rather than from a guess:
+        #   1. an offset already claimed by another channel is not a candidate -- each rail owns
+        #      a disjoint cache region;
+        #   2. an offset whose address resolves on EXACTLY ONE channel beats one that resolves
+        #      on several, so an ambiguous word is only ever used as a last resort.
+        # Each rail's gates are written CONTIGUOUSLY from its own cache base, so the non-zero
+        # words form one cluster per rail (measured: offsets 0,1 | 16,17 | 32,33 at depth 2, and
+        # 0,1 | 64,65 | 128,129 in a deeper run). Assign whole CLUSTERS, not single words: a
+        # cluster belongs to the one channel every word in it resolves on. Intersecting across
+        # the cluster kills the ambiguity that a single word cannot settle, and taking the
+        # cluster's FIRST offset keeps the gate order right -- picking merely the first word that
+        # resolved uniquely would start rail 1 at its SECOND gate and mislabel every one after.
+        clusters = []
         for offset in sorted(cache):
-            word = int(cache.get(offset, 0))
-            if not word:
+            if not int(cache.get(offset, 0)):
                 continue
-            if names.get((channel_num, word >> 16)) is not None:
-                starts[command.channel] = offset
-                break
-        else:
+            if clusters and offset == clusters[-1][-1] + 1:
+                clusters[-1].append(offset)
+            else:
+                clusters.append([offset])
+        for cluster in clusters:
+            channels = None
+            for offset in cluster:
+                address = int(cache[offset]) >> 16
+                here = {ch for (ch, addr) in names if addr == address}
+                channels = here if channels is None else (channels & here)
+            if channels and len(channels) == 1:
+                only = next(iter(channels))
+                for chan_name, chan_start in list(starts.items()):
+                    if chan_start == cluster[0]:
+                        only = None                     # already claimed; leave it alone
+                        break
+                if only is not None and only == channel_num:
+                    starts[command.channel] = cluster[0]
+                    break
+        chosen = starts.get(command.channel)
+        if chosen is None:
             return None
 
     offset = starts[command.channel] + gate_index.get(command.channel, 0)
