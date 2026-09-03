@@ -74,6 +74,9 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          # the shape resonator_number_measurement actually deploys
          "stretch_measure_dwell", "stretch_measure_barrier",
          "loop_measure_feedback", "loop_stream_feedback",
+         # INTERLEAVED ladder descent (CustomRuntime.cool_modes with several paired modes):
+         # ONE pointer, advanced once per CHANNEL inside each pass, walking a round-major cache
+         "interleaved_stretch",
          # the almost_empty drain -- the ONLY drain variant the real runtimes use
          "batch_drain_almost", "batch_in_loop_almost", "stagger_stream",
          # generated sequences: random compositions, and the exhaustive pair enumeration
@@ -206,6 +209,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     # many loop passes to run.
     count_cycles: int = 40            # flat length in sequencer cycles, from cache[0]
     count_rounds: int = 3             # loop passes for the loop_* cases
+    # interleaved_stretch: how many channels descend TOGETHER, i.e. how many times one pass
+    # advances the pointer. One channel is the ordinary one-advance-per-pass shape every other
+    # counting case has; 2 and 3 are what multi-mode ladder cooling compiles to.
+    interleave_channels: int = 3
     count_ramp_grid: bool = True      # snap the manual readout dwell onto the cycle grid
 
     chain_body: int = 1               # pulses scheduled per arm. A real prep arm is a whole
@@ -247,6 +254,21 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     dummy_memory_name: str = "dummy_trace"
     figsize: tuple = None
     yaml_path: str = None
+
+    @property
+    def _interleave_steps(self):
+        """Channels the interleaved_stretch case descends together, i.e. K.
+
+        One of the four stimuli is kept for the before/after markers, so K is capped at three.
+        A silently clamped K would be worse than an error: the cache would be laid out for a
+        different K than the loop walks, and the case would then be testing its own fixture.
+        """
+        steps = int(self.interleave_channels)
+        if not 1 <= steps <= 3:
+            raise ValueError(
+                f"interleave_channels must be 1..3 (four stimuli, one reserved for the "
+                f"markers); got {steps}")
+        return steps
 
     def main(self):
         if self.case not in CASES:
@@ -320,6 +342,16 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             rounds = max(int(self.count_rounds), 1)
             length_cache = self.acadia.CacheArray(shape=(rounds,), dtype=np.dtype("<i4"))
             record_cache = self.acadia.CacheArray(shape=(rounds,), dtype=np.dtype("<i4"))
+
+        # interleaved_stretch: ONE cache holding every (round, channel) length, laid out
+        # ROUND-MAJOR -- word r*K + k is channel k's length in round r -- so a single pointer
+        # sweeping it plays round r on every channel before it reaches any channel's round r+1.
+        # That is exactly the layout CustomRuntime._make_mode_ladder builds for cool_modes.
+        ladder_cache = None
+        if self.case == "interleaved_stretch":
+            ladder_cache = self.acadia.CacheArray(
+                shape=(max(int(self.count_rounds), 1) * self._interleave_steps,),
+                dtype=np.dtype("<i4"))
 
         probe_cache = None
         if self.slice_probe_words:
@@ -507,6 +539,59 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         with a.channel_synchronizer():
                             stimuli[1].schedule_pulse(pulse)    # only when the register says so
                     counter.pulse_cep()
+
+            elif self.case == "interleaved_stretch":
+                # INTERLEAVED LADDER DESCENT -- the shape CustomRuntime.cool_modes compiles when
+                # several modes are PAIRED and num_mode_cool_rounds is (ladder_top, extra): the
+                # pairing loop sits INSIDE the round loop so the modes descend together, and one
+                # pass therefore advances the single cache pointer once per MODE.
+                #
+                # Everything else in this suite advances its pointer once per pass, which makes
+                # "cache words the pointer covers" and "passes the loop runs" the same number and
+                # hides the distinction completely. Here they differ by K, and BOTH halves of the
+                # model were wrong on it: sequence_viz drew 9 passes for a 3-pass loop (the whole
+                # cooling stage three times over) and gave every channel words `start, start+1,
+                # start+2` instead of its own stride-K slice -- so three cavities whose level-1
+                # swaps are 176 / 1073 / 344 ns were all drawn with the SAME length per round.
+                # Neither shows up as an error; the picture is simply a schedule the cache does
+                # not contain. Cooling is not measurable on a loopback board, so this reproduces
+                # the pointer arithmetic alone: no readout, no feedback, just K channels whose
+                # per-round widths the board reports directly.
+                #
+                # Channel k plays round r stretched to ladder_cache[r*K + k], so the recording
+                # must show, on channel k, `count_rounds` pulses of DECREASING width around
+                # (k+1)*count_cycles -- and channel k's widths must not be channel j's.
+                steps = self._interleave_steps
+                rounds = max(int(self.count_rounds), 1)
+                base = a._firmware.sequencer_bus_decoder["cache"].address().value()
+                length_reg = a.sequencer().Register()
+                final = a.sequencer().Register()
+                pointer = a.sequencer().DSP()
+                pointer.load(base + ladder_cache.index)
+                pointer.configure(mode="P+1", dsp_cep="reset")
+                # The loop comes out on the pointer reaching the END of the cache, not on a round
+                # count -- one fewer thing that can disagree with the layout, and the same way
+                # cool_modes writes it.
+                final.load(base + ladder_cache.index + rounds * steps)
+
+                # A marker on the one channel that does NOT descend, so the loop's extent is
+                # measurable independently of the widths inside it.
+                marker = stimuli[len(stimuli) - 1]
+                with a.channel_synchronizer():
+                    marker.schedule_pulse(pulse)                  # t0, before the loop
+                with a.sequencer().repeat_until(pointer == final):
+                    for k in range(steps):
+                        # Latch the read: bus_read returns the live BUS_DATA port, so a second
+                        # read would overwrite the first (rule
+                        # bus_read_is_a_live_port_not_a_latched_value).
+                        length_reg.load(a.sequencer().bus_read(
+                            pointer, latency=a._bus_latency("cache")))
+                        with a.channel_synchronizer():
+                            stimuli[k].schedule_pulse("stretch_pulse",
+                                                      stretch_length=length_reg)
+                        pointer.pulse_cep()       # next (round, channel) in the same cache
+                with a.channel_synchronizer():
+                    marker.schedule_pulse(pulse)                  # t1, after the loop
 
             elif self.case in READOUT_CASES:
                 # THE READOUT PATH. MeasurableResonator.measure() is used by 94 of the qudit
@@ -1751,7 +1836,8 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # *after* attach, and a memory created after attach is never mapped -- attach only
         # iterates the instances that exist when it runs.
         pulses_used = [self.stimulus_pulse_name]
-        if self.case.startswith("stretch") or self.case == "loop_measure_feedback":
+        if (self.case.startswith("stretch") or self.case == "loop_measure_feedback"
+                or self.case == "interleaved_stretch"):
             pulses_used.append("stretch_pulse")
         pulses_used += {"shape": ["long_ramp_pulse"],
                         "detune_pair": ["detune_10MHz", "detune_25MHz"],
@@ -1845,6 +1931,22 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                     rb_cmd_cache[r] = self.acadia.waveform_dma_command(
                         stimuli[0].get_waveform_memory(name))
                     length_cache[r] = (int(rb_cmd_cache[r]) & 0xFFFF) + 1
+        elif self.case == "interleaved_stretch":
+            # Every (round, channel) length DIFFERENT, and different along BOTH axes: channel k
+            # is based at (k+1) * count_cycles and each round takes 5 cycles off it. That is what
+            # makes the case able to fail. A shared-per-round schedule and a per-channel one are
+            # indistinguishable when every channel plays the same lengths, which is how
+            # sequence_viz drew three cavities whose real level-1 swaps differ by 6x with
+            # IDENTICAL lengths and nobody could tell from the picture that anything was wrong.
+            #
+            # Written element by element: a CacheArray is numpy over an mmap of /dev/mem, and a
+            # slice assignment is a memcpy that can issue a wide store, which faults (SIGBUS,
+            # no traceback, no data). See validation/cache_write_alignment.py.
+            steps = self._interleave_steps
+            for r in range(max(int(self.count_rounds), 1)):
+                for k in range(steps):
+                    ladder_cache[r * steps + k] = max(
+                        int(self.count_cycles) * (k + 1) - 5 * r, 1)
         elif (self.case.startswith("test_") or self.case in
               ("counter_loop_in_test", "repeat_until_op", "repeat_until_count_n")):
             # These compare a cached register against test_register_value, so the cache MUST

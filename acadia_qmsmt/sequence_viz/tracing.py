@@ -238,6 +238,9 @@ class SequenceTrace:
     #: loop (`repeat_until(pointer == final)`) has both of its endpoints here, so its
     #: pass count is arithmetic rather than a guess -- see repeat_until_count.
     register_immediates: dict = field(default_factory=dict)
+    #: "DSP1" -> the program addresses that PULSE that counter (describe_cep_sites). How many of
+    #: them sit inside a loop's back-edge is how many cache words one pass of that loop walks.
+    cep_sites: dict = field(default_factory=dict)
     cache_base: int = None           # bus address of cache word 0
     register_cycles: dict = field(default_factory=dict)   # resolved for this point
     #: "REG3" -> the compile-time immediate ADDED to its cache word. A register loaded as
@@ -460,14 +463,14 @@ class SequenceTrace:
         value = self.register_immediates.get(token)
         return int(value) if value is not None else None
 
-    def repeat_until_count(self, context):
+    def repeat_until_count(self, context, index=None):
         """Iterations a counter-driven ``repeat_until`` runs, or None if not resolvable.
 
         The idiom (DR_RB.py, the RepeatTomo runtimes): a DSP counter loaded 0 and
         incremented +1 per pass, ``repeat_until(DSP_counter == target)`` where ``target`` is
         a register fed from the per-point cache (or pinned via an override) or a literal. The
-        counter reaches ``target`` after exactly ``target`` passes, so the drawn count is the
-        target's value.
+        counter reaches ``target`` after exactly ``target`` INCREMENTS -- passes only when the
+        body increments once, which :meth:`pointer_cep_per_pass` establishes from the program.
 
         Only that form resolves: exactly one operand must be the ``DSPn`` counter, and the
         other must resolve to a value. Everything else -- a fifo-empty drain, a countdown or
@@ -504,6 +507,19 @@ class SequenceTrace:
         count = target - int(start)
         if count < 0:
             return None
+        # INCREMENTS, not passes. They are the same number only when the body advances the
+        # counter once, which is every case that existed until interleaved ladder-descent
+        # cooling: its pairing loop sits inside the round loop so the modes descend together,
+        # and one pass pulses the pointer once per PAIRED MODE. Three cavities walk 9 words in 3
+        # rounds, and drawing 9 passes played the whole cooling stage three times over -- while
+        # each pass read word `start + pass`, so all three cavities got one another's swap
+        # lengths. The advances are in the program (describe_cep_sites), so this is measured.
+        per_pass = self.pointer_cep_per_pass(index, counter) if index is not None else 1
+        if count and count % per_pass:
+            # Not a whole number of passes: nobody wrote that sequence, so say the count is
+            # data-dependent rather than round it into a picture.
+            return None
+        count //= per_pass
         if count == 0:
             # NOT zero passes -- this loop never exits. MEASURED on the loopback 2026-08-14:
             # repeat_until_op with loop_count=0 never returns from the board ("Timeout occurred
@@ -518,6 +534,56 @@ class SequenceTrace:
             # than drawn as a tidy zero-pass body, which is a picture the hardware cannot produce.
             return None
         return count
+
+    def block_address(self, index):
+        """The program address of block ``index``'s DMA trigger, or None.
+
+        Blocks are numbered by ``channel_synchronizer`` entry; the program's trigger addresses
+        are in :attr:`control_flow` in the same order, but only TRIGGERING blocks have one (a
+        ``channel_synchronizer(trigger=False)`` arm only queues, so nothing anchors it to an
+        address). Used to find which loop back-edge a construct sits inside.
+        """
+        triggers = (self.control_flow or {}).get("triggers") or []
+        if not (0 <= index < len(self.blocks)) or not self.blocks[index].trigger:
+            return None
+        nth = sum(1 for block in self.blocks[:index] if block.trigger)
+        return triggers[nth] if nth < len(triggers) else None
+
+    def pointer_cep_per_pass(self, index, counter):
+        """Cache words ONE pass of the loop starting at block ``index`` walks ``counter`` over.
+
+        A ``repeat_until(pointer == final)`` gives a word RANGE, and the pass count is that range
+        divided by how far one pass moves the pointer. Nearly every runtime advances it once
+        (`pulse_cep()` at the end of the body) and the two are the same number, which is why this
+        was implicit for a long time. Interleaved ladder-descent cooling is not that shape: the
+        pairing loop sits INSIDE the round loop so the modes descend together, and one pass
+        advances the pointer once per PAIRED MODE. Three cavities therefore walk 9 words in 3
+        passes, and reading the range as the count drew nine cooling rounds instead of three --
+        each of them, in the same bug, taking word `start + pass` on every channel, so all three
+        cavities were drawn with the SAME swap length per round when their level-1 swaps are
+        176 / 1073 / 344 ns apart.
+
+        Measured from the program, not assumed: ``pulse_cep()`` is the only thing that moves the
+        pointer, and :func:`describe_cep_sites` records where each one is. This counts the ones
+        inside the innermost back-edge that encloses the construct's first block.
+
+        :return: advances per pass, or 1 when the program does not settle it (which is the old
+            behaviour, and right for every one-advance loop).
+        """
+        sites = (self.cep_sites or {}).get(counter)
+        address = self.block_address(index)
+        if not sites or address is None:
+            return 1
+        spans = [(target, branch)
+                 for branch, target in ((self.control_flow or {}).get("back_branches") or ())
+                 if target <= address <= branch]
+        if not spans:
+            return 1
+        # The INNERMOST enclosing loop is the one with the latest target: an active-reset loop
+        # inside a cooling round inside a mode loop all enclose the same address, and only the
+        # innermost one's body is "a pass" here.
+        target, branch = max(spans)
+        return sum(1 for site in sites if target <= site <= branch) or 1
 
     def _pointer_pair(self, condition):
         """``(counter, operator, base, target)`` for a CACHE-POINTER comparison, else None.
@@ -583,21 +649,34 @@ class SequenceTrace:
         equal = (base + advance.get(counter, 0)) == target
         return (not equal) if operator == "!=" else equal
 
-    def _pointer_loop_count(self, context, advance):
-        """Passes a ``repeat_until(pointer == final)`` runs, from this point's cache. None when
-        the shape does not apply or the arithmetic is not credible."""
+    def _pointer_loop_count(self, context, advance, index=None):
+        """``(passes, words per pass)`` for a ``repeat_until(pointer == final)``, else None.
+
+        The condition pins down the WORD RANGE the pointer covers; the program says how far one
+        pass moves it (:meth:`pointer_cep_per_pass`). Passes are the range divided by that, so a
+        body that walks one word per pass is unchanged and an interleaved one -- ladder-descent
+        cooling of several modes, which plays round r on every mode before round r+1 -- is no
+        longer drawn once per WORD.
+
+        None when the shape does not apply, the arithmetic is not credible, or the range is not a
+        whole number of passes: a partial pass is a sequence nobody wrote, so the loop is left
+        honestly data-dependent instead of being rounded into a picture.
+        """
         if context.get("kind") != "repeat_until":
             return None
         pair = self._pointer_pair(context.get("condition"))
         if pair is None or pair[1] != "==":
             return None
         counter, _, base, target = pair
-        count = target - (base + advance.get(counter, 0))
+        words = target - (base + advance.get(counter, 0))
         # A count outside the cache is not a count -- it is a mis-read. Fail safe: leave the loop
         # data-dependent rather than draw a train the cache cannot hold.
-        if count < 0 or (self.point_cache and count > len(self.point_cache)):
+        if words < 0 or (self.point_cache and words > len(self.point_cache)):
             return None
-        return count
+        per_pass = self.pointer_cep_per_pass(index, counter) if index is not None else 1
+        if words % per_pass:
+            return None
+        return words // per_pass, per_pass
 
     def _zero_target(self, context):
         """Is this a counter loop whose exit target resolves to 0 -- i.e. one that never exits?"""
@@ -684,7 +763,8 @@ class SequenceTrace:
                 # so a count of 0 here is a legally SKIPPED family rather than a loop that never
                 # exits (`repeat_until` is a do-while -- see the zero-target note below).
                 guarded = self.pointer_decisions.get(self.construct_key(index, level - 1))
-                pointer_count = self._pointer_loop_count(context, advance)
+                resolved_pointer = self._pointer_loop_count(context, advance, index)
+                pointer_count = None if resolved_pointer is None else resolved_pointer[0]
                 if pointer_count is not None and guarded is not False:
                     self.repeat_counts[self.construct_key(index, level)] = pointer_count
                     self.repeat_counts.setdefault(index, pointer_count)
@@ -693,13 +773,16 @@ class SequenceTrace:
                         self.nonterminating.add(index)
                     else:
                         counter = self._pointer_pair(context.get("condition"))[0]
-                        advance[counter] = advance.get(counter, 0) + pointer_count
+                        # WORDS, not passes: the next loop sharing this pointer starts where this
+                        # one left the pointer, and a pass may have walked several words.
+                        advance[counter] = (advance.get(counter, 0)
+                                            + pointer_count * resolved_pointer[1])
                     continue
                 if pointer_count is not None:          # guard skips it: zero passes, no advance
                     self.repeat_counts[self.construct_key(index, level)] = 0
                     self.repeat_counts.setdefault(index, 0)
                     continue
-                count = self.repeat_until_count(context)
+                count = self.repeat_until_count(context, index)
                 if count is None:
                     # a resolvable target of 0 is not "unknown", it is a loop that never exits
                     if self._zero_target(context):
@@ -1388,6 +1471,13 @@ class Instr:
     "DSP_C", "DSP_CFG", "BUS_DATA", "MASK", "NONE"), with the paired source major in ``s1``/``s2``
     and immediate in ``imm1``/``imm2`` (slot 1 pairs dest1/src1/imm1). ``d1_minor`` is the port
     index -- or, for a PC destination, the branch/hold code.
+
+    ``cep`` is the DSP index whose counter-enable this instruction PULSES, i.e. which counter it
+    advances by one -- ``pulse_cep()`` compiles to an instruction with no destination at all and
+    the DSP named only in the STP's ``dsp_cep`` field, so it is invisible in ``d1``/``d2``. It is
+    the only record of how many times a loop body advances its pointer, which is what turns a
+    cache-pointer loop's word range into a PASS count (see
+    :meth:`SequenceTrace.pointer_cep_per_pass`).
     """
     i: int
     d1: Optional[str]
@@ -1402,6 +1492,7 @@ class Instr:
     condition_invert: bool
     op: Optional[str]
     comment: Optional[str]
+    cep: Optional[int] = None
 
 
 def decode_program(acadia):
@@ -1423,8 +1514,44 @@ def decode_program(acadia):
                 imm1=ins.imm1, imm2=ins.imm2,
                 conditional=bool(ins.conditional),
                 condition_invert=bool(ins.condition_invert),
-                op=ins.op, comment=ins.comment))
+                op=ins.op, comment=ins.comment,
+                cep=_cep_dsp(ins)))
     return prog
+
+
+def _cep_dsp(ins):
+    """The DSP index whose CEP this instruction pulses, else None.
+
+    ``DSP.pulse_cep()`` emits ``store(src=IMM, dest=None, dsp_cep=<the DSP>)``, and the sequencer
+    turns that into a ``Source(DSP_P, resource id)`` in the instruction's ``dsp_cep`` slot. It is
+    the ONLY place the advance appears: the instruction has no destination, so every predicate
+    that reads ``d1``/``d2`` is blind to it.
+    """
+    cep = getattr(ins, "dsp_cep", None)
+    major = getattr(getattr(cep, "major", None), "name", None)
+    if major != "DSP_P":
+        return None
+    try:
+        return int(cep.minor)
+    except (TypeError, ValueError):
+        return None
+
+
+def describe_cep_sites(acadia):
+    """``{"DSP1": [program address, ...]}`` -- every place a DSP's counter is advanced.
+
+    A cache POINTER loop's condition gives a word RANGE (``final - start``), not a pass count:
+    the two agree only when the body advances the pointer once per pass. A body that walks
+    several cache words per pass -- interleaved ladder-descent cooling reads one flat length per
+    (round, mode), so three paired modes advance the pointer three times per round -- has a range
+    three times its pass count, and taking the range for the count drew the cooling loop three
+    times over. The advances are right here in the program.
+    """
+    sites = {}
+    for r in decode_program(acadia):
+        if r.cep is not None:
+            sites.setdefault(f"DSP{r.cep}", []).append(r.i)
+    return sites
 
 
 def _resolve_imm(imm):
@@ -1580,6 +1707,12 @@ def _build_trace(runtime, raw_blocks, resolve):
         trace.register_immediates = describe_immediates(acadia)
     except Exception:
         pass                    # a constant nobody could read is the old behaviour, not a failure
+    try:
+        # Where each counter is ADVANCED, which is how many cache words a pointer loop's body
+        # walks per pass -- see SequenceTrace.pointer_cep_per_pass.
+        trace.cep_sites = describe_cep_sites(acadia)
+    except Exception:
+        pass                    # one advance per pass is the old assumption, and the fallback
     try:
         # where the cache region starts on the bus, so an ABSOLUTE pointer immediate can be
         # turned into a cache WORD index

@@ -52,13 +52,20 @@ def deploy(fields, iterations=5000, tag=None, case="test_chain"):
     board_ip = paths_local.require("board_ip")
     save_root = paths_local.require("loopback_data_root")
 
+    # TWO probes, not one. A runtime can only be traced ONCE (its Acadia keeps the compiled
+    # program, and trace_runtime refuses a second pass), so asking unsafe_reason and
+    # capture_window_for the same object meant the window call raised and silently fell back to
+    # the 4 us constant -- MEASURED 2026-09-03: a 7.66 us case recorded only its first 3.87 us,
+    # with no warning anywhere. Every case deployed through here paid that.
     probe = tv.build_runtime(case, iterations=10)
+    window_probe = tv.build_runtime(case, iterations=10)
     for name, value in fields.items():
         setattr(probe, name, value)
+        setattr(window_probe, name, value)
     unsafe = tv.unsafe_reason(probe)
     if unsafe:
         return {"skipped": unsafe}
-    window = tv.capture_window_for(probe)
+    window = tv.capture_window_for(window_probe)
 
     runtime = tv.build_runtime(case, iterations=iterations)
     for name, value in fields.items():

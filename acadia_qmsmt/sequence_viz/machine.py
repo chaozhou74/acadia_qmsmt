@@ -46,17 +46,27 @@ _LOOP_COUNTER_RE = re.compile(r"\b(DSP\d+)\b")
 
 
 def _pointer_length(trace, placement, command, seen):
-    """Cycles a ``cache[pointer]`` register holds on THIS pass, or None.
+    """Cycles a ``cache[pointer]`` register holds on THIS read, or None.
 
     The counting-round idiom (resonator_number_measurement): a DSP pointer is loaded with the
-    cache base plus a word index, configured ``P+1``, advanced once per pass by ``pulse_cep()``,
-    and the loop exits when it reaches a register holding base + index + rounds. The body reads
-    its per-round value with ``bus_read(pointer)``. So pass r reads word ``index + r`` -- every
-    term of which the program carries:
+    cache base plus a word index, configured ``P+1``, advanced by ``pulse_cep()``, and the loop
+    exits when it reaches a register holding base + index + words. The body reads its value with
+    ``bus_read(pointer)``. So the n-th read takes word ``index + n`` -- every term of which the
+    program carries:
 
       * the pointer's starting address is a compile-time immediate (register_immediates),
       * the cache base is a firmware constant (cache_base),
-      * and r is how many times this command has already been laid down.
+      * and n is how many reads through THAT POINTER have already been laid down.
+
+    ``n`` counts per POINTER, not per (channel, register), and that distinction is the whole
+    point. One pass may read the pointer once per PAIRED MODE -- interleaved ladder-descent
+    cooling plays round r on every cavity before round r+1, so the lengths live round-major in
+    one cache and a single pointer walks them -- and counting per channel gave every cavity
+    ``word + 0, word + 1, ...`` instead of its own stride-K slice. Three cavities were then drawn
+    with the SAME swap length in each round (25, 151, 48 cycles on all three) when their level-1
+    swaps are 176 / 1073 / 344 ns apart, i.e. the picture claimed a cooling schedule the cache
+    does not contain. One shared counter reproduces the pointer exactly: reads are laid in
+    execution order, so read n is word index + n whichever channel it lands on.
 
     WHICH pointer feeds the register is not in the compiled record -- ``bus_read(pointer)`` emits
     ``BUS_ADDR <- DSP_P`` and the minor field there is the bus port, not the counter. It is taken
@@ -76,17 +86,17 @@ def _pointer_length(trace, placement, command, seen):
         match = _LOOP_COUNTER_RE.search(context.get("condition") or "")
         if not match:
             continue
-        start = (trace.register_immediates or {}).get(match.group(1))
+        counter = match.group(1)
+        start = (trace.register_immediates or {}).get(counter)
         if start is None:
             continue
         word = start - base
         if word < 0:
             continue                     # the counter is not a cache pointer at all
-        key = (command.channel, command.symbolic)
-        value = cache.get(word + seen.get(key, 0))
+        value = cache.get(word + seen.get(counter, 0))
         if value is None:
             return None
-        seen[key] = seen.get(key, 0) + 1
+        seen[counter] = seen.get(counter, 0) + 1
         return int(value)
     return None
 
@@ -293,8 +303,9 @@ def machine_layout(trace):
     # how many register-sourced gates have already been laid on each channel, so consecutive
     # plays read consecutive cache words the way the walking pointer does
     gate_index = {}
-    # how many times each (channel, register) pointer read has been laid down, which IS the pass
-    # index the walking pointer is on -- same bookkeeping as gate_index, for lengths
+    # how many reads through each cache POINTER have been laid down, which IS how far that
+    # pointer has walked -- same bookkeeping as gate_index, for lengths. Per POINTER, not per
+    # channel: one pass may read it once per paired mode (see _pointer_length).
     pointer_reads = {}
     cursor, t_seq = {}, 0
     # Instruction span of the gap the sequencer is currently paying, i.e. how long BEFORE t_seq
@@ -451,7 +462,7 @@ def machine_layout(trace):
                     override = self.register_overrides.get(command.symbolic)
                     resolved = self.register_cycles.get(command.symbolic)
                     if resolved is None and override is None:
-                        # a per-pass pointer read: pass r takes cache word index + r
+                        # a walking pointer read: the n-th read takes cache word index + n
                         resolved = _pointer_length(self, placement, command, pointer_reads)
                     value = (override if override is not None else
                              resolved if resolved is not None else fallback)

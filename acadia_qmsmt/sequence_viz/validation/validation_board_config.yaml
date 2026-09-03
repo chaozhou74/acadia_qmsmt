@@ -171,7 +171,7 @@ capture_dummy:
       - 0
       - 0
 stimulus0:
-  channel: DAC0
+  channel: DAC14
   channel_config:
     mix_reconstruction: true
     nco_frequency: 4700000000.0
@@ -379,7 +379,7 @@ stimulus0:
       scale: 0.3
       use_stretch: false
 stimulus1:
-  channel: DAC2
+  channel: DAC12
   channel_config:
     mix_reconstruction: true
     nco_frequency: 4700000000.0
@@ -587,7 +587,7 @@ stimulus1:
       scale: 0.3
       use_stretch: false
 stimulus2:
-  channel: DAC4
+  channel: DAC10
   channel_config:
     mix_reconstruction: true
     nco_frequency: 4700000000.0
@@ -795,7 +795,7 @@ stimulus2:
       scale: 0.3
       use_stretch: false
 stimulus3:
-  channel: DAC6
+  channel: DAC8
   channel_config:
     mix_reconstruction: true
     nco_frequency: 4700000000.0

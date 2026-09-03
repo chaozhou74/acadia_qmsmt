@@ -41,7 +41,41 @@ SAVE_ROOT = _LOCAL.get("loopback_data_root")
 YAML_PATH = _LOCAL.get("yaml_path") or str(Path(__file__).parent / "validation_board_config.yaml")
 REPORT = Path(__file__).parent / "timing_validation_results.json"
 
-CHANNEL_OF = {"ch0": "DAC0", "ch1": "DAC2", "ch2": "DAC4", "ch3": "DAC6"}
+def _channel_of():
+    """``{"ch0": "DAC14", ...}`` -- which DAC each traced channel is, read from the CONFIG.
+
+    Hard-coded here once, as DAC0/2/4/6. That was wrong the moment the board's own config moved
+    the stimuli (which the XM650 card's reverse DAC->ADC wiring forced: capture_k has to be the
+    ADC that hears stimulus_k, see make_xm650_config.HARNESS_ALIASES), and the failure is silent
+    -- every prediction is looked up under a DAC name the trace does not contain, so `predicted`
+    comes back empty and the comparison reports "0 predicted" rather than an error. Reading it
+    from the config is the only version that cannot disagree with the runtime.
+    """
+    try:
+        import yaml
+        cfg = yaml.safe_load(Path(YAML_PATH).read_text())
+        return {f"ch{i}": str(cfg[f"stimulus{i}"]["channel"]) for i in range(4)}
+    except Exception:
+        return {"ch0": "DAC14", "ch1": "DAC12", "ch2": "DAC10", "ch3": "DAC8"}
+
+
+CHANNEL_OF = _channel_of()
+
+
+def channel_of(trace=None):
+    """``{"ch0": "<DAC>", ...}`` for THIS trace, falling back to the current config.
+
+    An archived run carries its own config, and the harness's stimuli have moved (see
+    ``_channel_of``). Reading the map off the trace is what keeps ``--revalidate`` able to score
+    a folder recorded before the move: taking the module constant would look every prediction up
+    under a DAC name that run never used, and report "0 predicted" instead of an error.
+    """
+    found = {}
+    for channel, ios in (getattr(trace, "channel_ios", None) or {}).items():
+        for i in range(4):
+            if f"stimulus{i}" in ios:
+                found[f"ch{i}"] = str(channel)
+    return found if len(found) == 4 else CHANNEL_OF
 
 #: A channel is treated as IDLE (no pulses at all) unless its peak stands this many baseline sigmas
 #: above the baseline. Measured on this station: a driven loopback channel peaks at 4.1e3-5.5e4
@@ -300,18 +334,44 @@ def measure_spans(folder):
     return out
 
 
+#: DMA commands that CONTINUE the pulse in front of them rather than starting one of their own.
+#: A `use_stretch` pulse compiles to ARB (first half) + CONST_CONT (the register-driven hold) +
+#: ARB_CONT (second half), and only the first carries the pulse NAME -- so a predicted region
+#: built from named commands alone is the first half only. That understated every stretched
+#: pulse: `interleaved_stretch` predicted 50 ns regions where the board measured 300, 500 and
+#: 695 ns, i.e. the model was right about the length (it resolved 40/80/120 cycles from the
+#: cache) and the REPORT threw it away. Width is the whole claim for a register-driven length,
+#: so the region has to be the whole pulse.
+CONTINUATION_KINDS = ("CONST_CONT", "ARB_CONT")
+
+
+def _pulse_regions(trace, channel):
+    """[[start, stop], ...] in CYCLES: the trace's pulses on ``channel``, contiguous ones merged.
+
+    Merged because that is what the measurement sees: two pulses butted together cross the
+    detection threshold once and come back as one wide region.
+    """
+    commands = sorted((c for c in trace.commands
+                       if c.channel == channel
+                       and (c.pulse or c.kind in CONTINUATION_KINDS)),
+                      key=lambda c: c.start)
+    merged = []
+    for command in commands:
+        # A continuation with nothing in front of it is not a pulse -- do not open a region on it.
+        if not merged and not command.pulse:
+            continue
+        if merged and command.start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], command.stop)
+        else:
+            merged.append([command.start, command.stop])
+    return merged
+
+
 def regions_of(trace):
     """{label: ([region start ns], [region width ns])} for the trace's CURRENT layout."""
     starts, spans = {}, {}
-    for label, channel in CHANNEL_OF.items():
-        pulses = sorted((c for c in trace.commands
-                         if c.pulse and c.channel == channel), key=lambda c: c.start)
-        merged = []
-        for command in pulses:
-            if merged and command.start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], command.stop)
-            else:
-                merged.append([command.start, command.stop])
+    for label, channel in channel_of(trace).items():
+        merged = _pulse_regions(trace, channel)
         starts[label] = [r[0] * trace.ns_per_cycle for r in merged]
         spans[label] = [(r[1] - r[0]) * trace.ns_per_cycle for r in merged]
     return starts, spans
@@ -357,16 +417,8 @@ def predict(folder):
 
     trace = sv.trace_folder(folder)
     starts, spans = {}, {}
-    for label, channel in CHANNEL_OF.items():
-        pulses = sorted((c for c in trace.commands
-                         if c.pulse and c.channel == channel),
-                        key=lambda c: c.start)
-        merged = []
-        for command in pulses:
-            if merged and command.start <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], command.stop)
-            else:
-                merged.append([command.start, command.stop])
+    for label, channel in channel_of(trace).items():
+        merged = _pulse_regions(trace, channel)
         starts[label] = [region[0] * trace.ns_per_cycle for region in merged]
         spans[label] = [((region[1] - region[0]) * trace.ns_per_cycle) for region in merged]
 
@@ -754,11 +806,19 @@ def capture_window_for(runtime):
     shorter than the sequence silently truncates the recording: the yaml's 1.2e-6 recorded only
     1070 ns of 2400-2610 ns cases, which is why the post-batch discriminator pulses those cases
     exist to measure were missing entirely.
+
+    ``capture_points=True`` for the same reason ``unsafe_reason`` needs it: a register-driven
+    length comes out of the per-point cache, and without the cache every one of them falls back
+    to ``resolve_indeterminate`` (0). The sequence then LOOKS short and the window is sized for
+    that -- MEASURED 2026-09-03 on ``interleaved_stretch``, 4285 ns predicted against 7660 ns
+    real, so the window came out 5.5 us and the last stretched pulse was cut from 650 ns to 340.
+    A truncated recording reads as a runtime that stopped playing. These cases have one sweep
+    point, so capturing it costs nothing.
     """
     from acadia_qmsmt import sequence_viz as sv
 
     try:
-        trace = sv.trace_runtime(runtime, capture_points=False, envelopes=False)
+        trace = sv.trace_runtime(runtime, capture_points=True, envelopes=False)
     except Exception:
         return CAPTURE_WINDOW_S                      # fall back to the constant
     return max(CAPTURE_WINDOW_S, (trace.length_ns + 1200.0) * 1e-9)

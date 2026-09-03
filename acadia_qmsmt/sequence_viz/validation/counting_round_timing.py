@@ -14,6 +14,8 @@ its own half rather than "the round is broken":
   Q4  the same for a STREAMED command, whose length the sequencer cannot see.
   Q5  the zero-length wrap -- checked offline, because it is a 21 s hang, not a short pulse.
   Q6  the whole round body -- swap, readout, quadrant, cache write, conditional pi -- in a loop.
+  Q7  ONE pointer advanced K times per pass -- interleaved ladder-descent cooling of K modes,
+      where the pointer's word range and the loop's pass count stop being the same number.
 
 Run one phase at a time; each deploys a handful of runs:
 
@@ -172,15 +174,106 @@ def phase_q6(args):
         print(f"    {result['folder']}")
 
 
+def interleaved_model(steps, rounds, cycles):
+    """Trace ``interleaved_stretch`` offline and return (drawn widths per channel, the cache).
+
+    Widths, not starts: what a stretched pulse's LENGTH resolved to is the whole question, and
+    on the board it is the pulse's own width -- a quantity the recording gives directly, with the
+    cable latency cancelling out of it entirely.
+    """
+    from acadia_qmsmt import sequence_viz as sv
+
+    runtime = tv.build_runtime("interleaved_stretch", iterations=1)
+    runtime.interleave_channels = steps
+    runtime.count_rounds = rounds
+    runtime.count_cycles = cycles
+    trace = sv.trace_runtime(runtime, capture_points=True, envelopes=False)
+    drawn = {}
+    for command in trace.commands:
+        if command.kind != "CONST_CONT" or not command.symbolic:
+            continue
+        drawn.setdefault(command.channel, []).append((command.length, command.resolution))
+    want = [max(cycles * (k + 1) - 5 * r, 1) for r in range(rounds) for k in range(steps)]
+    return trace, drawn, want
+
+
+def phase_q7(args):
+    """Q7 -- ONE pointer advanced several times per pass (interleaved ladder-descent cooling).
+
+    Offline first, because this is a claim about the MODEL and the cache settles it exactly: the
+    pointer's word range is rounds x steps while the loop runs `rounds` passes, and channel k's
+    round r is word r*steps + k. Then on the board, where the widths are physical.
+    """
+    print("\nQ7 -- interleaved ladder descent: one pointer, several advances per pass.")
+    for steps in (1, 2, 3):
+        rounds, cycles = args.rounds, args.cycles[-2]
+        trace, drawn, want = interleaved_model(steps, rounds, cycles)
+        n_stretch = sum(len(v) for v in drawn.values())
+        print(f"\n  steps={steps} rounds={rounds}: cache (round-major) {want}")
+        count_ok = n_stretch == rounds * steps
+        print(f"    stretched commands drawn {n_stretch}, expected {rounds * steps}   "
+              + ("OK" if count_ok else
+                 "<-- FAIL: the pass count was taken as the pointer's WORD range"))
+        ok = count_ok
+        channels = tv.channel_of(trace)
+        for k in range(steps):
+            channel = channels[f"ch{k}"]
+            got = [n for n, _ in drawn.get(channel, ())]
+            mine = want[k::steps]
+            flag = "OK" if got == mine else "<-- FAIL"
+            if got != mine:
+                ok = False
+            print(f"    ch{k} ({channel}): drawn {got}  cache {mine}   {flag}")
+            unresolved = [r for _, r in drawn.get(channel, ()) if r != "cache"]
+            if unresolved:
+                ok = False
+                print(f"    ch{k}: {len(unresolved)} length(s) not resolved from the cache "
+                      f"({set(unresolved)}) <-- FAIL")
+        # The failure this exists for is not "wrong number" but "same number on every channel",
+        # which reads as a plausible schedule. Say so explicitly.
+        if steps > 1:
+            per_channel = [[n for n, _ in drawn.get(channels[f"ch{k}"], ())]
+                           for k in range(steps)]
+            if len({tuple(v) for v in per_channel}) == 1:
+                ok = False
+                print("    every channel drew the SAME lengths <-- FAIL: a shared per-round "
+                      "schedule is exactly the bug, and it looks correct")
+        print(f"    offline verdict: {'OK' if ok else 'FAIL'}")
+
+    if args.offline:
+        print("\n  --offline: skipping the board run.")
+        return
+    result = ps.deploy({"interleave_channels": 3, "count_rounds": args.rounds,
+                        "count_cycles": args.cycles[-2]},
+                       tag=f"q7_{args.rounds}rounds", case="interleaved_stretch")
+    if "skipped" in result:
+        print(f"\n  board: REFUSED -- {result['skipped']}")
+        return
+    print(f"\n  board: {result['blocks']} blocks, {result['executed_blocks']} executed, "
+          f"gaps {result['gaps_ns']}")
+    for row in result.get("rows", ()):
+        if not row["n_measured"]:
+            continue
+        print(f"    {row['channel']}: {row['n_measured']} pulses measured vs "
+              f"{row['n_predicted']} predicted")
+        print(f"      widths  measured {row.get('measured_widths_ns')}")
+        print(f"              model    {row.get('predicted_widths_ns')}")
+    print(f"    worst error {result['worst_error_ns']} ns")
+    print(f"    {result['folder']}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--phase", default="all",
-                        choices=("q1", "q2", "q3", "q4", "q5", "q6", "all"))
+                        choices=("q1", "q2", "q3", "q4", "q5", "q6", "q7", "all"))
     parser.add_argument("--cycles", type=int, nargs="+", default=CYCLES)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--offline", action="store_true",
+                        help="q7 only: run the model half and skip the board deploy")
     args = parser.parse_args()
     for name, fn in (("q1", phase_q1), ("q2", phase_q2), ("q3", phase_q3),
-                     ("q4", phase_q4), ("q5", phase_q5), ("q6", phase_q6)):
+                     ("q4", phase_q4), ("q5", phase_q5), ("q6", phase_q6),
+                     ("q7", phase_q7)):
         if args.phase in (name, "all"):
             fn(args)
     return 0
