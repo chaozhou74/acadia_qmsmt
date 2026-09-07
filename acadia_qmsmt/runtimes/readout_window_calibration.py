@@ -43,6 +43,13 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
     capture_memory_name: str = "readout_trace"
     capture_window_name: str = None
 
+    # optimizable readout knobs; None -> use the yaml value. See
+    # `MeasurableResonator.apply_knobs`: applied in memory, nothing is written to the yaml.
+    readout_scale: float = None
+    readout_flat_length: float = None
+    readout_capture_extra: float = None
+    readout_frequency: float = None
+
     iterations: int
     run_delay:int = 200e3 #ns
 
@@ -57,6 +64,11 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
 
+        # Knobs, before any memory is allocated or the sequence is compiled.
+        readout_resonator.apply_knobs(
+            self.readout_pulse_name, self.capture_memory_name,
+            scale=self.readout_scale, flat_length=self.readout_flat_length,
+            capture_extra=self.readout_capture_extra, frequency=self.readout_frequency)
 
         # Create the record groups for saving captured data
         self.data.add_group("traces_g", uniform=True)
@@ -326,6 +338,14 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
 
     @annotate_method(button_name="update window")
     def update_window(self, window_name: str = "matched", biased_g_offset: int = -1000):
+        """Persist the matched kernel, and the trace memory length when it was a knob.
+
+        The length belongs here rather than in the fidelity runtime's write-back: this
+        runtime is the one that captures into the trace memory, so it is the one that
+        knows what length it used. Otherwise an optimizer that shortened the pulse leaves
+        a stale trace length behind and the NEXT window calibration measures a different
+        capture than the one that was optimized.
+        """
         # can't use self.yaml_path here! because the reloaded runtime will not find the right path
         yaml_path = self.io("readout_capture")._config["__yaml_path__"]
         kernel_dir = os.path.join(os.path.dirname(yaml_path), "readout_kernels")
@@ -345,6 +365,21 @@ class ReadoutWindowCalibrationRuntime(QMsmtRuntime):
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}.offset", offset)
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.data", full_filepath)
         self.update_io_yaml_field("readout_capture", f"windows.{window_name}_biased_g.offset", (offset[0]+biased_g_offset, offset[1]))
+
+        if self.readout_flat_length is not None:
+            # Re-apply the knobs before reading the length. This method runs on a RELOADED
+            # runtime whose main() never executed, so the in-memory config still holds the
+            # yaml values -- reading it directly would write the length straight back
+            # unchanged, which is exactly how readout_trace ended up stale by one flat
+            # update while readout_accumulated tracked the new one.
+            MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture")).apply_knobs(
+                self.readout_pulse_name, self.capture_memory_name,
+                scale=self.readout_scale, flat_length=self.readout_flat_length,
+                capture_extra=self.readout_capture_extra, frequency=self.readout_frequency)
+            length = self.io("readout_capture").get_config(
+                "memories", self.capture_memory_name)["length"]
+            self.update_io_yaml_field(
+                "readout_capture", f"memories.{self.capture_memory_name}.length", length)
 
     def interpolate_kernel(self, kernel: np.ndarray, decimation_used: int):
         """

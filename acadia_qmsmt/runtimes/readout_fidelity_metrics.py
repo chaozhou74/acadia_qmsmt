@@ -5,6 +5,44 @@ from acadia_qmsmt import QMsmtRuntime, MeasurableResonator, Qubit, IOConfig
 from acadia.runtime import annotate_method
 
 
+
+def log_infid_cost(fidelity, fidelity_err=None, length=None,
+                   len_pen_weight=5e5, infid_thresh=1e-2):
+    """log2(1 - fidelity) plus a penalty on total readout time. Returns (cost, cost_err).
+
+    Raw fidelity is a poor objective near the ceiling. At F = 0.985 an improvement to 0.990
+    removes a THIRD of the remaining error but moves a linear cost by only 0.005, so an
+    optimizer fitted on fidelity works on a nearly flat landscape and its length scales end
+    up set by measurement noise. In log2(infidelity) every halving of the error is the same
+    size step.
+
+    `infid_thresh` flattens the cost once the infidelity falls below it, so past that point
+    only the length penalty moves: "good enough, now make it short." Keep it well BELOW the
+    fidelity actually being chased -- `optimizer.RO_log_infid_cost` defaults to 1e-2, which
+    clamps at F = 0.99 and would flatten the objective exactly at a 99 % target.
+
+    The length penalty exists because fidelity can always be bought with integration time,
+    while the full sequence reads several modes through one transmon. The default 5e5 per
+    second trades ~0.2 in log2 -- a 15 % increase in infidelity -- for 400 ns saved.
+
+    The error is transformed too: d/dF log2(1-F) = -1/((1-F) ln2), so handing a raw
+    sigma_F to a known-noise GP would understate the noise ~100x at F = 0.985. In the
+    clamped branch the cost no longer depends on F, so the same expression is evaluated at
+    the threshold rather than reporting zero noise.
+
+    Mirrors `optimizer.RO_log_infid_cost`.
+    """
+    infid = 1.0 - float(fidelity)
+    effective = infid_thresh if infid <= infid_thresh else infid
+    if effective <= 0:
+        return float("inf"), float("inf")
+
+    len_pen = float(len_pen_weight) * float(length) if length else 0.0
+    cost = float(np.log2(effective) + len_pen)
+    if fidelity_err is None:
+        return cost, None
+    return cost, float(abs(fidelity_err) / (effective * np.log(2.0)))
+
 class ReadoutFidelityRuntime(QMsmtRuntime):
     """
     A :class:`Runtime` subclass for readout fidelity metrics
@@ -25,6 +63,13 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
     post_prep_delay: float = 20e-9
     prep_capture_window_name: str = "matched_biased_g"
 
+    # optimizable readout knobs; None -> use the yaml value. See
+    # `MeasurableResonator.apply_knobs`: applied in memory, nothing is written to the yaml.
+    readout_scale: float = None
+    readout_flat_length: float = None
+    readout_capture_extra: float = None
+    readout_frequency: float = None
+
     figsize: tuple[int] = None
     yaml_path: str = None
 
@@ -38,6 +83,12 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
         readout_resonator = MeasurableResonator(readout_stimulus_io, readout_capture_io)
         qubit = Qubit(qubit_stimulus_io)
+
+        # Knobs, before any memory is allocated or the sequence is compiled.
+        readout_resonator.apply_knobs(
+            self.readout_pulse_name, self.capture_memory_name,
+            scale=self.readout_scale, flat_length=self.readout_flat_length,
+            capture_extra=self.readout_capture_extra, frequency=self.readout_frequency)
 
         self.data.add_group(f"prep_g", uniform=True)
         self.data.add_group(f"prep_e", uniform=True)
@@ -127,8 +178,29 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
 
 
 
+    @property
+    def readout_total_length(self):
+        """Total readout time: ramp + flat + any extra capture.
+
+        `readout_flat_length` is the FLAT alone, so the ramp has to be read from the pulse
+        and added; the flat itself falls back to the pulse config when it is not being
+        swept, so the length penalty stays meaningful in runs that hold it fixed.
+        """
+        flat = self.readout_flat_length
+        try:
+            io = self.io("readout_stimulus")
+            ramp = io.get_config("pulses", self.readout_pulse_name, "ramp") or 0.0
+            if flat is None:
+                flat = io.get_config("pulses", self.readout_pulse_name, "flat")
+        except Exception:
+            if flat is None:
+                return None
+            ramp = 0.0
+        return float(ramp) + float(flat) + float(self.readout_capture_extra or 0.0)
+
     @annotate_method(is_data_processor=True)
-    def process_current_data(self,my_thresh=0.):
+    def process_current_data(self, my_thresh=0., len_pen_weight=5e5,
+                             infid_thresh=1e-3):
         # First make sure that we actually have new data to process
         from acadia_qmsmt.analysis import reshape_iq_data_by_axes
 
@@ -167,6 +239,18 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         self.num_counts = num_counts
 
         self.Fidelity = 1./2.*(prep_g_get_g_counts/num_counts + prep_e_get_e_counts/num_counts)
+
+        # 1-sigma on Fidelity: independent binomials on the two preparations, so the
+        # mean of the two rates has half the quadrature sum of their standard errors.
+        var_g = self.P_g_given_g * (1 - self.P_g_given_g) / num_counts
+        var_e = self.P_e_given_e * (1 - self.P_e_given_e) / num_counts
+        self.Fidelity_err = float(np.sqrt(var_g + var_e) / 2.)
+
+        # Objective for an optimizer. Point `cost_attr` at LogInfidCost (with cost_sign = +1,
+        # since it is already a cost) rather than at Fidelity.
+        self.LogInfidCost, self.LogInfidCost_err = log_infid_cost(
+            self.Fidelity, self.Fidelity_err, self.readout_total_length,
+            len_pen_weight=len_pen_weight, infid_thresh=infid_thresh)
 
         self.median_g = np.median(self.real_g)
         self.median_e = np.median(self.real_e)
@@ -368,3 +452,30 @@ class ReadoutFidelityRuntime(QMsmtRuntime):
         if not np.isnan(self.overlap_thresh):
             self.update_io_yaml_field("readout_capture", f"windows.{self.capture_window_name}.offset", 
                                     [self.overlap_thresh, window_offset[1]])
+
+
+
+    @annotate_method(button_name="update readout knobs")
+    def update_readout_knobs(self):
+        """
+        Write this run's knob values into the yaml. The knobs are otherwise in-memory
+        only, so this is what an optimizer calls to keep its best point -- without it a
+        later verification run reads the OLD yaml settings and disagrees with the
+        optimizer's own number.
+
+        """
+        resonator = MeasurableResonator(self.io("readout_stimulus"), self.io("readout_capture"))
+        resonator.apply_knobs(
+            self.readout_pulse_name, self.capture_memory_name,
+            scale=self.readout_scale, flat_length=self.readout_flat_length,
+            capture_extra=self.readout_capture_extra, frequency=self.readout_frequency)
+
+        pulse = self.io("readout_stimulus").get_config("pulses", self.readout_pulse_name)
+        length = self.io("readout_capture").get_config("memories", self.capture_memory_name)["length"]
+        self.update_io_yaml_field("readout_stimulus", f"pulses.{self.readout_pulse_name}.scale", pulse["scale"])
+        self.update_io_yaml_field("readout_stimulus", f"pulses.{self.readout_pulse_name}.flat", pulse["flat"])
+        for io_name in ("readout_stimulus", "readout_capture"):
+            nco = self.io(io_name).get_config("channel_config")["nco_frequency"]
+            self.update_io_yaml_field(io_name, "channel_config.nco_frequency", nco)
+        self.update_io_yaml_field("readout_capture",
+                                  f"memories.{self.capture_memory_name}.length", length)

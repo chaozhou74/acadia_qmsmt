@@ -54,7 +54,7 @@ def prepare_plot_axes(fig_or_axs: Union[None, Figure, Axes, np.ndarray[Axes]],
 
 
 def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, use_customizer=True,
-                          transparent=True) -> None:
+                          transparent=True, save_dir:str=None) -> None:
     """
     Do a final plot on all registered plot methods and save the figures.
 
@@ -65,11 +65,13 @@ def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, u
     :param use_customizer: If True, try running the customizer method tagged by `CUSTOMIZATION_METHOD_TAG=True`
         before plotting the data
     :param transparent: If True, save png with transparent background
+    :param save_dir: Directory in which to save the figures. Default to `runtime.local_directory`
     :return:
     """
     import matplotlib
     # Save the current backend
     current_backend = matplotlib.get_backend()
+    save_dir = runtime.local_directory if save_dir is None else save_dir
 
     try:
         # Use headless backend for safe figure saving
@@ -91,11 +93,11 @@ def save_registered_plots(runtime: Runtime, save_pickle=True, do_process=True, u
                 save_name = sanitize_filename(plot_name)
                 figure, _ = getattr(runtime, method_name)()
                 figure.tight_layout()
-                image_filename = os.path.join(runtime.local_directory, f"{save_name}.png")
+                image_filename = os.path.join(save_dir, f"{save_name}.png")
                 figure.savefig(image_filename, dpi=500, transparent=transparent)
 
                 if save_pickle:
-                    with open(os.path.join(runtime.local_directory, f"{save_name}.pkl"), "wb") as f:
+                    with open(os.path.join(save_dir, f"{save_name}.pkl"), "wb") as f:
                         pickle.dump(figure, f)
 
             except Exception as e:

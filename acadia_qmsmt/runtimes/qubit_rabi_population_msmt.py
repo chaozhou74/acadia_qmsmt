@@ -130,6 +130,7 @@ class QubitRpmRuntime(QMsmtRuntime):
         
         self.fitted_A_0 = abs(self.fit_0.ufloat_results["A"])
         self.fitted_A_1 = abs(self.fit_1.ufloat_results["A"])
+        self.qubit_thermal_pop = self.fitted_A_0 / (self.fitted_A_0 + self.fitted_A_1)
 
         return completed_iterations
     
@@ -147,7 +148,7 @@ class QubitRpmRuntime(QMsmtRuntime):
         axs[1].set_ylim(-0.02, 1.02)
 
         axs[0].legend()
-        axs[0].set_title(f"Thermal pop: {(self.fitted_A_0/(self.fitted_A_0+self.fitted_A_1)*100):.5g} %")
+        axs[0].set_title(f"Thermal pop: {(self.qubit_thermal_pop*100):.5g} %")
         return fig, axs
 
 

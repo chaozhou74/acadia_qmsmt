@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import functools
+import inspect
 
 import numpy as np
 from numpy.typing import NDArray
@@ -110,6 +111,125 @@ class InputOutputWaveforms:
         Calculate a DRAG pulse with a Hann base pulse for a given list of times
         """
         return 0.5 * (1 - np.cos(2 * np.pi * t)) + (rel_drag * np.pi * np.sin(2 * np.pi * t) * 1j)
+
+    @staticmethod
+    def impulse_hold_empty(t: NDArray, kappa: float, impulse_length: float = 0.0,
+                           empty_length: float = 0.0, state_freqs=None,
+                           drive_freq: float = None, impulse_segments: int = 1,
+                           empty_segments: int = 1, nco_frequency: float = None,
+                           detune: float = None) -> NDArray:
+        """
+        Readout envelope in three parts: `impulse` fills the cavity faster than 2/kappa,
+        `hold` sets the photon number while measuring, `empty` drives the field back to
+        zero. Normalised to peak 1, so the pulse's own `scale` is the peak DAC amplitude.
+
+        Segment amplitudes are derived from the cavity, not chosen. With
+        lambda_s = kappa/2 + i*2*pi*(f_drive - f_s) per prepared state, a constant drive
+        eps held for tau takes the field from alpha_0 to
+
+            alpha(tau) = alpha_0 exp(-lambda tau) - i eps (1 - exp(-lambda tau)) / lambda
+
+        which is linear in eps, so each segment's amplitude is a least-squares solve over
+        the states (exact when segments == states). The amplitudes are complex: the impulse
+        and empty segments need a PHASE, because the field rotates as it fills and empties.
+
+        The shape is independent of the total pulse length: `flattop_generator` maps this
+        function's argument 0..0.5 onto a leading window of max(impulse_length,
+        empty_length) whatever the total, so the hold can be stretched at runtime
+        (`use_stretch`) without moving the impulse or empty. Both windows are that same
+        width, so the shorter part is padded with hold -- physically just more hold.
+
+        :param kappa: cavity linewidth in rad/s
+        :param impulse_length, empty_length: durations in seconds (absolute, because the
+            amplitudes depend on kappa*tau)
+        :param state_freqs: dressed cavity frequencies in Hz, one per prepared state, e.g.
+            (f_g, f_e) from prep-qubit spectroscopy. None -> on resonance. Frequencies
+            rather than chi, because the chi convention (states split by chi or by 2*chi)
+            is ambiguous while the frequencies are not.
+        :param drive_freq: drive frequency in Hz. Leave as None to take it from the channel
+            as nco_frequency + detune, the tone actually emitted, so it follows a retuned
+            NCO; a stale hard-coded value silently mis-phases the segments.
+        :param nco_frequency, detune: injected by `compute_pulse` because this function
+            declares them, and unreachable otherwise. Do not set them in the yaml.
+        :param impulse_segments, empty_segments: sub-segments per part. Two exactly null
+            both prepared states where one can only least-square them.
+        """
+        t = np.atleast_1d(np.asarray(t, dtype=np.float64))
+        out = np.ones(t.shape, dtype=np.complex128)      # hold = 1 before normalisation
+        if kappa is None:
+            return out
+
+        freqs = list(state_freqs) if state_freqs is not None else None
+        if drive_freq is not None:
+            f_d = drive_freq
+        elif nco_frequency is not None:
+            f_d = nco_frequency + (detune or 0.0)
+        elif freqs:
+            # No channel context and no explicit value: refuse rather than guess. The old
+            # mean(state_freqs) fallback is wrong whenever the drive is deliberately not
+            # centred between the states, which is the usual case.
+            raise ValueError(
+                "impulse_hold_empty needs the drive frequency: pass drive_freq, or let "
+                "compute_pulse supply nco_frequency/detune from the channel.")
+        else:
+            f_d = 0.0
+        lam = (np.array([kappa / 2.0 + 1j * 2 * np.pi * (f_d - fs) for fs in freqs])
+               if freqs else np.array([kappa / 2.0 + 0j]))
+        alpha_hold = -1j / lam                          # field a unit hold drive sustains
+
+        def c_of(tau):
+            return -1j * (1.0 - np.exp(-lam * tau)) / lam
+
+        def solve(durs, alpha_start, alpha_end):
+            durs = np.atleast_1d(np.asarray(durs, float))
+            tail = [np.exp(-lam * durs[k + 1:].sum()) for k in range(len(durs))]
+            M = np.stack([c_of(tk) * tl for tk, tl in zip(durs, tail)], axis=1)
+            eps, *_ = np.linalg.lstsq(
+                M, alpha_end - alpha_start * np.exp(-lam * durs.sum()), rcond=None)
+            return eps
+
+        window = max(impulse_length, empty_length)
+        if window <= 0:
+            return out
+
+        imp_durs = (np.full(impulse_segments, impulse_length / impulse_segments)
+                    if impulse_length > 0 else None)
+        emp_durs = (np.full(empty_segments, empty_length / empty_segments)
+                    if empty_length > 0 else None)
+        # Solved before placement: the amplitudes depend only on the parameters, and
+        # `flattop_generator` calls this function three times (leading slice, the single
+        # point 0.5 for the hold, trailing slice), so nothing may depend on which t values
+        # were passed.
+        eps_imp = (solve(imp_durs, np.zeros_like(alpha_hold), alpha_hold)
+                   if imp_durs is not None else np.array([]))
+        eps_emp = (solve(emp_durs, alpha_hold, np.zeros_like(alpha_hold))
+                   if emp_durs is not None else np.array([]))
+
+        # Normalise to peak 1 using a constant derived from the solved amplitudes.
+        # The (1 + 1e-12) keeps the normalised peak STRICTLY below 1.
+        peak = max([1.0] + [abs(e) for e in np.concatenate([eps_imp, eps_emp])]) * (1 + 1e-12)
+        out /= peak
+        eps_imp = eps_imp / peak
+        eps_emp = eps_emp / peak
+
+        # the impulse occupies the START of the leading window (it must begin from zero
+        # field) and the empty the END of the trailing window; hold-valued padding sits
+        # against the hold in both cases
+        if imp_durs is not None:
+            since_start = window - (0.5 - t) * 2.0 * window
+            edges = np.cumsum(imp_durs)
+            for k, e in enumerate(edges):
+                sel = (t < 0.5) & (since_start > (edges[k - 1] if k else 0.0)) \
+                    & (since_start <= e)
+                out[sel] = eps_imp[k]
+        if emp_durs is not None:
+            into_empty = (t - 0.5) * 2.0 * window - (window - empty_length)
+            edges = np.cumsum(emp_durs)
+            for k, e in enumerate(edges):
+                sel = (t > 0.5) & (into_empty > (edges[k - 1] if k else 0.0)) \
+                    & (into_empty <= e)
+                out[sel] = eps_emp[k]
+        return out
 
     @staticmethod
     def hamming(t: NDArray) -> NDArray:
@@ -576,9 +696,11 @@ class InputOutput:
         phase = pulse_config.get("phase", None)
         detune = pulse_config.get("detune", None)
         use_stretch = pulse_config.get("use_stretch", False)
-        if use_stretch and detune is not None:
-            raise ValueError("Detune and use_stretch cannot be used together. "
-                            "Please use either one or the other.")
+        if use_stretch and detune is not None and np.any(detune):
+            raise ValueError("A nonzero detune cannot be used with use_stretch: the stretched "
+                            "region repeats a single memory sample, so the detuning carrier "
+                            "cannot advance its phase through it. A detune of 0 (or None) is "
+                            "allowed, since it applies no rotation.")
         
         if pulse_config["name"] is not None:
             # Look in the cache for the pulse
@@ -589,7 +711,15 @@ class InputOutput:
 
             if complex_samples is None:
                 # This means the pulse hasn't already been computed and cached
-                if scale is not None or detune is not None:
+                # A shape function that DECLARES `detune` derives its samples from the
+                # drive frequency (nco_frequency + detune) rather than just being rotated
+                # by it, so it must not go through the waveform_0 split below, which
+                # deliberately zeroes the detuning.
+                shape_detune = (isinstance(pulse_config["data"], str)
+                                and detune is not None and np.any(detune)
+                                and "detune" in inspect.signature(
+                                    getattr(InputOutputWaveforms, pulse_config["data"])).parameters)
+                if (scale is not None or detune is not None) and not shape_detune:
                     # compute waveform_0 (one with no scale or detuning)
                     # so that pulse computation is not repeated
                     # when changing just scale and detuning
@@ -607,7 +737,18 @@ class InputOutput:
                     num_samples = self._acadia.seconds_to_cycles(memory_length) * self._samples_per_cycle
                     complex_samples = np.zeros(num_samples, dtype = np.complex128)
                     func_kwargs = {k: v for k, v in pulse_config.items() if k not in KWARG_EXCLUDE_LIST}
-                    InputOutputWaveforms.flattop_generator(complex_samples, getattr(InputOutputWaveforms, pulse_config["data"]), ramp_frac, flat_frac, **func_kwargs)
+                    # Opt-in channel context: a shape function that DECLARES these
+                    # parameters gets them, others are untouched. `nco_frequency` is not in
+                    # the pulse config at all and `detune` is in KWARG_EXCLUDE_LIST, so a
+                    # shape whose maths depends on the actual drive frequency (emitted tone
+                    # = NCO + detune) has no other way to reach it -- and reading them here
+                    # means they track knob overrides instead of going stale in the yaml.
+                    shape_func = getattr(InputOutputWaveforms, pulse_config["data"])
+                    context = {"nco_frequency": self.get_config("channel_config").get("nco_frequency"),
+                               "detune": pulse_config.get("detune")}
+                    declared = inspect.signature(shape_func).parameters
+                    func_kwargs.update({k: v for k, v in context.items() if k in declared})
+                    InputOutputWaveforms.flattop_generator(complex_samples, shape_func, ramp_frac, flat_frac, **func_kwargs)
                 else: # we just use the data directly
                     complex_samples = pulse_config["data"]
                 
@@ -1246,8 +1387,60 @@ class MeasurableResonator:
         self._windows = {}
         self._classifiers = {}
         self.capture_delay = capture._config.get("capture_delay", 0)
- 
-    def measure(self, 
+
+    def apply_knobs(self, pulse_name: str, capture_memory_name: str, scale: float = None,
+                    flat_length: float = None, capture_extra: float = None,
+                    frequency: float = None):
+        """
+        Override readout parameters in the in-memory config dicts; `None` keeps the
+        configured value. Nothing is written to the yaml file, so a sweep or optimizer
+        driving these leaves the config on disk untouched.
+
+        Call this before allocating the capture memory and compiling the sequence: the
+        pulse and capture lengths determine the memories that get allocated.
+
+        :param pulse_name: stimulus pulse to modify
+        :param capture_memory_name: capture memory whose length tracks the pulse
+        :param scale: pulse amplitude
+        :param flat_length: length of the pulse's FLAT part, written straight to
+            `flat`. The total drive is then ramp + flat_length.
+        :param capture_extra: capture length beyond the pulse. When None the margin is
+            INFERRED from the config as (memory length - pulse length).
+        :param frequency: NCO frequency, set on both the stimulus and the capture
+        """
+        pulse = self._stimulus.get_config("pulses", pulse_name)
+        memory = self._capture.get_config("memories", capture_memory_name)
+        pulse_length = pulse.get("ramp", 0) + pulse.get("flat", 0)
+
+        if scale is not None:
+            pulse["scale"] = scale
+        if frequency is not None:
+            self._stimulus.get_config("channel_config")["nco_frequency"] = frequency
+            self._capture.get_config("channel_config")["nco_frequency"] = frequency
+        if flat_length is not None:
+            if flat_length < 0:
+                raise ValueError(f"flat_length {flat_length:.3g} s is negative for "
+                                 f"'{pulse_name}'")
+            pulse["flat"] = flat_length
+        if flat_length is not None or capture_extra is not None:
+            if capture_extra is None:
+                # Inferring the margin only works while `length` and the pulse it was sized
+                # for are mutually consistent in the config. Any write that updates one
+                # without the other poisons this for every later run, so a negative result
+                # -- a capture shorter than the pulse it must contain -- is not something to
+                # propagate silently.
+                capture_extra = memory["length"] - pulse_length
+                if capture_extra < 0:
+                    raise ValueError(
+                        f"capture memory '{capture_memory_name}' is {memory['length']:.3g} s "
+                        f"but pulse '{pulse_name}' is {pulse_length:.3g} s, giving a negative "
+                        f"margin of {capture_extra:.3g} s. The config's memory length and "
+                        f"pulse length disagree, which means one was written without the "
+                        f"other. Pass `capture_extra` explicitly instead of relying on the "
+                        f"margin being inferred.")
+            memory["length"] = pulse.get("ramp", 0) + pulse["flat"] + capture_extra
+
+    def measure(self,
                 stimulus_waveform_memory: Union[str, WaveformMemory] = None, 
                 capture_waveform_memory: Union[str, WaveformMemory] = None,
                 window_name: str = None,
