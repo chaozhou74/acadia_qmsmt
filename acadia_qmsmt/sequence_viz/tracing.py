@@ -22,7 +22,7 @@ import numpy as np
 from acadia.system import DMASynchronizer
 from acadia.sequencer import STP, Destination
 
-from .dryrun import (StopDryRun, already_traced, branch_recorder,
+from .dryrun import (StopDryRun, _defining_class, already_traced, branch_recorder,
                      hardware_stubbed, preserved_runtime_state)
 
 KIND = {
@@ -36,24 +36,61 @@ KIND = {
 # The compiled program is read through structured STP fields (see `decode_program` and the
 # `_is_*` predicates below), not by matching `instruction.pprint()` text.
 
-# Measured, not derived. The three terms below (detect + issue + propagate) come out one
-# cycle short of hardware at every blocking block boundary. Established on the 4-channel
-# DAC->ADC loopback (validation/timing_validation.py, 2026-07-27): the error is
-# +1.000 cycle for one boundary and +2.00 for two, and does not change with the number of
-# DMA pushes (1 / 2 / 4 channels all give +1), while intra-block layout -- back-to-back
-# pulses, dwell(), and block=False FIFO batching -- is exact to 0.01 cycle. So the shortfall
-# is a fixed per-boundary constant, not a counting error. Which term owns it is not
-# separable by timing alone: candidates are Acadia._bus_latency("dma_running") being one
-# low, the trigger->DMA-load propagation being one low, or a DAC start latency that is not
-# modelled at all. Kept as its own named term rather than silently folded into one of them.
-MEASURED_BOUNDARY_OFFSET = 1
+# DERIVED from acadia_dma.vhd: one clocked stage that Acadia._bus_latency does not count.
+#
+# A blocking boundary and a FIFO drain both make the sequencer WAIT for a status bit to change,
+# and both bits are produced by a synchronous process inside the DMA:
+#
+#   running_int_proc:  running_int <= '1' on `trigger`, '0' on `descriptor_done and fifo_empty`
+#   bus_miso_proc:     master_bus_miso(0..4) <= running_int / fifo_empty / fifo_almost_empty / ...
+#
+# Both are `process(clk) ... if rising_edge(clk)`, so the observable bit changes one clock AFTER
+# the condition that causes it. `Acadia._bus_latency(port)` models only the READ path -- one cycle
+# to load the sequencer's bus register, one for the decoder's pipelined MISO, one for the decoder's
+# per-device pipeline stage (3 for `dma_running` on CONFIG_200) -- and deliberately says nothing
+# about how the peripheral produced the value. It adds exactly this cycle for the datamover
+# controllers, with the comment "its MISO is driven in a synchronous process"; acadia_dma drives
+# its MISO the same way and gets no such term.
+#
+# So a wait costs `detect` (the read path) PLUS one cycle for the state register, at every boundary,
+# whatever the number of channels or descriptors -- each channel's flag passes through its own
+# identical single stage, in parallel. That is precisely the measured signature on the 4-channel
+# loopback (validation/timing_validation.py, 2026-07-27): +1.000 cycle for one boundary, +2.00 for
+# two, unchanged across 1 / 2 / 4 channels, while intra-block layout is exact to 0.01 cycle.
+#
+# The dataport's own `"pipeline": 1` is NOT a second stage: the generator emits registers for
+# `range(1, pipeline)`, so 1 means "no delay" (acadia/pyacadia/acadia/hdl.py, BusDataport.
+# generate_hdl). That is what leaves exactly one uncounted stage rather than two.
+#
+# The same fact explains why a poll whose condition is ALREADY TRUE costs one cycle less: there is
+# no transition to observe, so the state register is not on the path. One firmware stage, charged
+# when a change must be waited for and not charged when it must not.
+DMA_STATUS_REGISTER = 1
 
-# Also measured. A boundary crossed by a TAKEN branch (a loop back-edge) costs three more
-# cycles than the straight-line instruction count, on top of MEASURED_BOUNDARY_OFFSET --
-# consistent with a pipeline flush on the redirected fetch. Established on the loopback with
-# two different loop bodies (timing_validation.py cases loop_2 / loop_3 / loop_2_double,
-# 2026-07-27): a 4-push body measured 20 cycles against 11 counted instructions, an 8-push
-# body 21 against 12. The counting tracks the body exactly; only this constant is extra.
+# A boundary crossed by a TAKEN branch (a loop back-edge, or a `test` skipping forward) costs
+# three more cycles than the straight-line instruction count, on top of DMA_STATUS_REGISTER.
+#
+# DERIVED FROM THE FIRMWARE, then confirmed by measurement -- not fitted. acadia_sequencer.vhd's
+# instruction_proc shows exactly where the three cycles go when a branch writes the PC:
+#
+#     pc_wr <= '1';                       -- 1: the cycle that writes the PC
+#     instruction_p <= (others => '0');   -- 2: the fetch pipeline's first stage is flushed
+#     instruction   <= (others => '0');   -- 3: and its second stage
+#     ...
+#     elsif(pc_wr = '1') then
+#         -- "If the PC was just updated in the previous cycle, we need one more
+#         --  cycle of nothing before we can load the output of the memory"
+#
+# So the cost is the depth of the instruction fetch pipeline (instruction_p -> instruction) plus
+# the PC-write cycle itself: 3. That the loopback independently measures 3 is a CHECK on the
+# reading of the VHDL, not the origin of the number -- which matters, because a constant fitted
+# to the cases someone happened to test generalises only to those cases, while a pipeline depth
+# read off the hardware description generalises to every branch the sequencer can take.
+#
+# The measurements that confirm it (timing_validation.py loop_2 / loop_3 / loop_2_double,
+# 2026-07-27): a 4-push body measured 20 cycles against 11 counted instructions, an 8-push body
+# 21 against 12 -- the counting tracks each body exactly and only this constant is extra. If the
+# firmware's fetch pipeline ever gains or loses a stage, this must follow it.
 MEASURED_BRANCH_PENALTY = 3
 
 # `test` condition strings come from dryrun's branch_recorder (a rendering of the Python
@@ -76,6 +113,10 @@ class Command:
     length: int
     is_padding: bool = False
     symbolic: Optional[str] = None
+    #: compile-time value of a symbolic length that is NOT a runtime unknown (barrier padding
+    #: built as an acadia Operation). Recorded so a UI can decline to offer it as settable; the
+    #: command is deliberately not laid out at this length -- see _build_trace.
+    static_length: Optional[int] = None
     resolution: str = "fallback"      # "cache" | "override" | "fallback"
     pulse: Optional[str] = None
     io_name: Optional[str] = None
@@ -116,6 +157,9 @@ class Placement:
     """
     index: int                  # index into SequenceTrace.blocks
     iteration: int              # 0-based pass through the enclosing loop
+    #: enclosing pass indices, outermost first -- identifies THIS execution of the block, which
+    #: is what a per-execution override is keyed by
+    path: tuple = ()
     start: int = 0
     length: int = 0
     trigger: bool = True
@@ -140,6 +184,10 @@ class SequenceTrace:
     channel_ios: dict = field(default_factory=dict)
     envelopes: dict = field(default_factory=dict)         # from the pulse config
     loaded_envelopes: dict = field(default_factory=dict)  # from DAC memory
+    #: (io name, memory name) the run actually called load_pulse on -- so a memory holding zeros
+    #: because it was loaded with amplitude 0 is distinguishable from one never loaded at all.
+    #: See _spy_load_pulse and envelope().
+    loaded_pulses: set = field(default_factory=set)
     samples_per_cycle: dict = field(default_factory=dict)
     ns_per_cycle: float = 1.0
     runtime_class: str = ""
@@ -153,13 +201,52 @@ class SequenceTrace:
     control_flow: dict = field(default_factory=dict)
     loop_counts: dict = field(default_factory=dict)  # block index -> iterations to draw
     repeat_counts: dict = field(default_factory=dict)  # block index -> resolved repeat_until count
+    stream_words: int = 0        # cache words the pulse stream walks (one per loop pass)
+    stream_repeats: int = 1      # copies of each word issued per pass (dualrail_rb's bs_repeats)
+    stream_gates: int = 0        # words * repeats -- the gates _expand_stream actually drew
+    #: Constructs whose compiled target makes them NON-TERMINATING on hardware: a ``P+1`` counter
+    #: loop whose exit target is 0. The body runs at least once and the counter never comes back to
+    #: 0, so the board hangs. Kept separate from a user's pinned 0, which is a drawing hypothesis.
+    nonterminating: set = field(default_factory=set)
+    #: ``{construct key: {enclosing pass path, ...}}`` -- every execution the layout REACHED,
+    #: recorded whether or not it drew anything. Enumerating executions from the drawn placements
+    #: instead loses exactly the ones set to zero passes: the execution disappears from the panel
+    #: and its tab disappears from the diagram, so the setting hides its own control.
+    entered_paths: dict = field(default_factory=dict)
+    #: Constructs whose value the BOARD decides at runtime -- the count or arm cannot be
+    #: established from this run's data. Independent of any override, so the drawing can keep
+    #: saying "this is data-dependent" while you try values out. Holds both the canonical
+    #: ``(block, depth)`` key and the bare block, for older readers.
+    indeterminate: set = field(default_factory=set)
     path_choices: dict = field(default_factory=dict)  # block index -> take test body?
     assumed_paths: set = field(default_factory=set)   # tests we could not decide
+    #: ``{channel: cache word}`` for direct DMA commands read from a FIXED cache address --
+    #: a replayed single word rather than a walking pointer. See direct_command_words().
+    direct_words: dict = field(default_factory=dict)
+    #: ``{channel: cache offset}`` where that channel's register-sourced gate words begin,
+    #: established from the data during layout (see machine._register_gate)
+    register_stream_starts: dict = field(default_factory=dict)
+    #: register-driven lengths that resolved to ZERO. acadia emits `length - 1`, so 0 wraps to an
+    #: all-ones length field -- 328 us (16-bit) or ~21 s (32-bit) rather than nothing. Recorded so
+    #: a sweep point that does this is visible instead of silently drawn as an empty command.
+    length_underflows: list = field(default_factory=list)
     unsupported_paths: set = field(default_factory=set)  # KI_004: speculation=False
     gap_terms: dict = field(default_factory=dict)   # detect/propagate, from firmware
     registers: dict = field(default_factory=dict)         # "REG0" -> {source, cache_word}
     register_sources: dict = field(default_factory=dict)  # "REG0" -> cache word
+    #: "REG2"/"DSP0" -> the compile-time IMMEDIATE it was initialised with. A pointer
+    #: loop (`repeat_until(pointer == final)`) has both of its endpoints here, so its
+    #: pass count is arithmetic rather than a guess -- see repeat_until_count.
+    register_immediates: dict = field(default_factory=dict)
+    #: "DSP1" -> the program addresses that PULSE that counter (describe_cep_sites). How many of
+    #: them sit inside a loop's back-edge is how many cache words one pass of that loop walks.
+    cep_sites: dict = field(default_factory=dict)
+    cache_base: int = None           # bus address of cache word 0
     register_cycles: dict = field(default_factory=dict)   # resolved for this point
+    #: "REG3" -> the compile-time immediate ADDED to its cache word. A register loaded as
+    #: `immediate + cache[word]` (an AB+C DSP -- see describe_cache_sums) is a cache-relative
+    #: ADDRESS, not the cache value itself, so the addend is carried alongside register_sources.
+    register_addends: dict = field(default_factory=dict)
     register_overrides: dict = field(default_factory=dict)  # user-supplied cycles
     register_names: dict = field(default_factory=dict)      # "REG0" -> "t_echo"
     resolve_indeterminate: int = 0
@@ -201,7 +288,7 @@ class SequenceTrace:
                       + 1j * array[:, 1].astype(np.float64)) / INT16_FULL_SCALE
                 for key, array in snapshot["memories"].items()}
             self.register_cycles = {
-                name: snapshot["cache"][word]
+                name: snapshot["cache"][word] + int(self.register_addends.get(name, 0))
                 for name, word in self.register_sources.items()
                 if word in snapshot["cache"]}
             self.point_cache = snapshot["cache"]   # full cache, for a cache-pointer stream
@@ -230,27 +317,60 @@ class SequenceTrace:
     def _is_stream_command(self, command):
         """True for the direct DMA command of a cache-pointer stream on its channel.
 
-        The whole DMA word is fetched at runtime, so it comes through as symbolic
-        ``BUS_DATA``; :attr:`stream` marks which channel that stream drives.
+        The whole DMA word is fetched at runtime, so it comes through as symbolic: either
+        ``BUS_DATA`` (the cache read issued in the same instruction) or ``REG<n>`` (the read
+        latched into a register first, which dualrail_rb does when it issues the same word
+        several times per pass -- a raw bus_read result is only valid for a few cycles).
+        :attr:`stream` marks which channel that stream drives, and is only set for a
+        single-channel stream, so the multi-rail XEB idiom cannot reach here.
         """
-        return bool(self.stream and command.symbolic == "BUS_DATA"
-                    and command.channel == self.stream["channel"])
+        symbolic = str(command.symbolic or "")
+        return bool(self.stream and command.channel == self.stream["channel"]
+                    and (symbolic == "BUS_DATA" or symbolic.startswith("REG")))
 
-    def _expand_stream(self, command, placement, start):
+    def _expand_stream(self, command, placement, start, per_pass_extra=0, extras=(),
+                       repeats=1):
         """Unroll a cache-pointer pulse stream into one command per played gate.
 
         The loop plays ``count`` gates, ``count`` read from the cache word the runtime
         computed the pointer bound from; gate ``k`` is ``cache[start_offset + k]``, a DMA
         word decoding to ``addr = word >> 16`` / ``length = (word & 0xFFFF) + 1`` (the same
         ``waveform_dma_command`` packing the static path uses), and ``addr`` names the pulse
-        via :attr:`addr_names`. Gates are laid at the per-pulse *period* ``max(length,
-        floor)`` -- the fifo-refill floor means short pulses cannot play back-to-back.
+        via :attr:`addr_names`.
+
+        Gates are laid at the per-pulse *period* ``max(length + per_pass_extra, floor)`` -- the
+        fifo-refill floor means short pulses cannot play back-to-back, and anything else the loop
+        pass queues on the same channel lengthens the period by its own duration.
+
+        ``repeats`` is how many times the pass issues the SAME word before advancing the
+        pointer. dualrail_rb does this when the half-swap is shorter than the loop can sustain:
+        five copies of a pi/2 beamsplitter are the same logical gate (5*pi/2 = 2*pi + pi/2, and a
+        2*pi rotation in SU(2) is -I) and they queue five pulses' worth of play time in one pass,
+        so the channel stops running dry. They play CONTIGUOUSLY -- measured on the loopback
+        board, a 50 ns half-swap went from 40% duty with 60 ns gaps at one per pass to 87% duty,
+        continuous, at five. Modelling each copy as its own pass would put the floor between them
+        and show gaps that are not there.
+
+        ``per_pass_extra`` / ``extras`` are the other descriptors a pass queues. A pass typically pushes the
+        gate and then an idle dwell (dualrail_rb's ``inter_bs_dwell``), and the dwell is pushed
+        EVERY pass, so it sits between every pair of gates. Without this the model spaced the
+        gates by the pulse alone and drew the dwell once after the whole train -- so a 20 ns
+        inter_bs_dwell was invisible in the view and the predicted gate period was 20 ns short of
+        what the board plays (measured: a 130 ns gate has a 130.0 ns period at dwell 0 and
+        135.0 ns at dwell 5, on every rf line).
 
         :return: the cursor after the train (its start plus ``count`` period slots).
         """
         meta = self.stream
         cache = self.point_cache or {}
         count = int(cache.get(meta["count_word"], 0))
+        # What this train really is, kept for the drawing: the loop's PASS count is deliberately
+        # left unresolved (see _is_stream_count -- resolving it would draw the whole train once per
+        # pass), so without this the tab can only say "the board decides at runtime" about a number
+        # this run's cache pins down exactly. One cache word per pass, `repeats` copies per word.
+        self.stream_words = count
+        self.stream_repeats = max(int(repeats), 1)
+        self.stream_gates = count * max(int(repeats), 1)
         floor = int(meta["floor"])
         post_span = int(meta.get("post_span", floor))
         cnum = meta["channel_num"]
@@ -260,16 +380,27 @@ class SequenceTrace:
             address = word >> 16
             length = (word & 0xFFFF) + 1
             io_name, pulse = self.addr_names.get((cnum, address), (None, None))
-            placement.commands.append(replace(
-                command, start=cursor, length=length, symbolic=None,
-                resolution="cache", pulse=pulse, io_name=io_name, address=address))
+            # `repeats` copies, back to back: one pass queues them together so nothing
+            # separates them.
+            for r in range(max(int(repeats), 1)):
+                placement.commands.append(replace(
+                    command, start=cursor + r * length, length=length, symbolic=None,
+                    resolution="cache", pulse=pulse, io_name=io_name, address=address))
+            played = length * max(int(repeats), 1)
             # Gates are spaced by the per-gate period (max of the pulse length and the push-
             # cadence floor). The LAST gate has no next gate to refill for, so its trailing is
             # the counted post-loop span instead -- the loop exit + drain + next block's push/
             # trigger -- which is where the following block actually begins. (Ending at the bare
             # last-pulse stop would merge the next block into the gate; ending a full floor past
             # it, as before, put the next block ~one refill gap too late.)
-            trailing = max(length, floor) if k < count - 1 else max(length, post_span)
+            # the rest of what this pass queued on the same channel, in order after the gate
+            sub = cursor + played
+            for extra in extras:
+                placement.commands.append(replace(extra, start=sub, symbolic=None,
+                                                  resolution="cache"))
+                sub += int(extra.length or 0)
+            period = played + per_pass_extra
+            trailing = max(period, floor) if k < count - 1 else max(period, post_span)
             cursor += trailing
         return cursor
 
@@ -324,16 +455,22 @@ class SequenceTrace:
         if token in self.register_overrides:
             return int(self.register_overrides[token])
         value = self.register_cycles.get(token)
+        if value is not None:
+            return int(value)
+        # ...and finally a compile-time immediate. `final.load(cache_base + index + rounds)` is
+        # a constant the program carries, so a loop bounded by it is not data-dependent at all --
+        # it only looked that way because nothing read the constant back.
+        value = self.register_immediates.get(token)
         return int(value) if value is not None else None
 
-    def repeat_until_count(self, context):
+    def repeat_until_count(self, context, index=None):
         """Iterations a counter-driven ``repeat_until`` runs, or None if not resolvable.
 
         The idiom (DR_RB.py, the RepeatTomo runtimes): a DSP counter loaded 0 and
         incremented +1 per pass, ``repeat_until(DSP_counter == target)`` where ``target`` is
         a register fed from the per-point cache (or pinned via an override) or a literal. The
-        counter reaches ``target`` after exactly ``target`` passes, so the drawn count is the
-        target's value.
+        counter reaches ``target`` after exactly ``target`` INCREMENTS -- passes only when the
+        body increments once, which :meth:`pointer_cep_per_pass` establishes from the program.
 
         Only that form resolves: exactly one operand must be the ``DSPn`` counter, and the
         other must resolve to a value. Everything else -- a fifo-empty drain, a countdown or
@@ -351,36 +488,349 @@ class SequenceTrace:
         right_dsp = bool(COUNTER_NAME_RE.fullmatch(right))
         if left_dsp == right_dsp:            # need exactly one DSP counter operand
             return None
-        count = self._operand_value(right if left_dsp else left)
-        if count is None or count < 0:
+        counter = left if left_dsp else right
+        target_token = right if left_dsp else left
+        if self._is_stream_count(target_token):
+            return None                      # the stream unroll owns this loop -- see _is_stream_count
+        target = self._operand_value(target_token)
+        if target is None:
+            return None
+        # A counter reaches its exit value after (exit - start) increments. The start is 0 for
+        # the `DSP.load(0)` idiom, which is why taking the target alone was right for every case
+        # that existed -- but a POINTER loop starts at a cache address and ends at that address
+        # plus the round count, so the target alone is a ~1.9-million-pass loop and the model gave
+        # up and drew one assumed pass instead. resonator_number_measurement's counting rounds are
+        # exactly that shape: `length_pointer.load(base + index)`, `final.load(base + index + N)`,
+        # `repeat_until(length_pointer == final)` with `pulse_cep()` once per pass. Both endpoints
+        # are compile-time immediates, so N is arithmetic.
+        start = self.register_immediates.get(counter, 0)
+        count = target - int(start)
+        if count < 0:
+            return None
+        # INCREMENTS, not passes. They are the same number only when the body advances the
+        # counter once, which is every case that existed until interleaved ladder-descent
+        # cooling: its pairing loop sits inside the round loop so the modes descend together,
+        # and one pass pulses the pointer once per PAIRED MODE. Three cavities walk 9 words in 3
+        # rounds, and drawing 9 passes played the whole cooling stage three times over -- while
+        # each pass read word `start + pass`, so all three cavities got one another's swap
+        # lengths. The advances are in the program (describe_cep_sites), so this is measured.
+        per_pass = self.pointer_cep_per_pass(index, counter) if index is not None else 1
+        if count and count % per_pass:
+            # Not a whole number of passes: nobody wrote that sequence, so say the count is
+            # data-dependent rather than round it into a picture.
+            return None
+        count //= per_pass
+        if count == 0:
+            # NOT zero passes -- this loop never exits. MEASURED on the loopback 2026-08-14:
+            # repeat_until_op with loop_count=0 never returns from the board ("Timeout occurred
+            # waiting for line", repeating), while 1..8 all measure clean.
+            #
+            # That measurement also settles what `repeat_until` means. Two models fit every count
+            # from 1 upwards -- test-before-body and test-after-body both give N passes for N >= 1 --
+            # and they disagree only at 0: testing first would exit immediately, testing after runs
+            # the body, increments to 1, finds 1 != 0 and goes round again until the counter wraps.
+            # The board hangs, so the body ALWAYS RUNS AT LEAST ONCE and a target of 0 is a
+            # non-terminating sequence, not an empty one. Reported through `nonterminating` rather
+            # than drawn as a tidy zero-pass body, which is a picture the hardware cannot produce.
             return None
         return count
+
+    def block_address(self, index):
+        """The program address of block ``index``'s DMA trigger, or None.
+
+        Blocks are numbered by ``channel_synchronizer`` entry; the program's trigger addresses
+        are in :attr:`control_flow` in the same order, but only TRIGGERING blocks have one (a
+        ``channel_synchronizer(trigger=False)`` arm only queues, so nothing anchors it to an
+        address). Used to find which loop back-edge a construct sits inside.
+        """
+        triggers = (self.control_flow or {}).get("triggers") or []
+        if not (0 <= index < len(self.blocks)) or not self.blocks[index].trigger:
+            return None
+        nth = sum(1 for block in self.blocks[:index] if block.trigger)
+        return triggers[nth] if nth < len(triggers) else None
+
+    def pointer_cep_per_pass(self, index, counter):
+        """Cache words ONE pass of the loop starting at block ``index`` walks ``counter`` over.
+
+        A ``repeat_until(pointer == final)`` gives a word RANGE, and the pass count is that range
+        divided by how far one pass moves the pointer. Nearly every runtime advances it once
+        (`pulse_cep()` at the end of the body) and the two are the same number, which is why this
+        was implicit for a long time. Interleaved ladder-descent cooling is not that shape: the
+        pairing loop sits INSIDE the round loop so the modes descend together, and one pass
+        advances the pointer once per PAIRED MODE. Three cavities therefore walk 9 words in 3
+        passes, and reading the range as the count drew nine cooling rounds instead of three --
+        each of them, in the same bug, taking word `start + pass` on every channel, so all three
+        cavities were drawn with the SAME swap length per round when their level-1 swaps are
+        176 / 1073 / 344 ns apart.
+
+        Measured from the program, not assumed: ``pulse_cep()`` is the only thing that moves the
+        pointer, and :func:`describe_cep_sites` records where each one is. This counts the ones
+        inside the innermost back-edge that encloses the construct's first block.
+
+        :return: advances per pass, or 1 when the program does not settle it (which is the old
+            behaviour, and right for every one-advance loop).
+        """
+        sites = (self.cep_sites or {}).get(counter)
+        address = self.block_address(index)
+        if not sites or address is None:
+            return 1
+        spans = [(target, branch)
+                 for branch, target in ((self.control_flow or {}).get("back_branches") or ())
+                 if target <= address <= branch]
+        if not spans:
+            return 1
+        # The INNERMOST enclosing loop is the one with the latest target: an active-reset loop
+        # inside a cooling round inside a mode loop all enclose the same address, and only the
+        # innermost one's body is "a pass" here.
+        target, branch = max(spans)
+        return sum(1 for site in sites if target <= site <= branch) or 1
+
+    def _pointer_pair(self, condition):
+        """``(counter, operator, base, target)`` for a CACHE-POINTER comparison, else None.
+
+        The streamed-gate idiom (both XEB runtimes, dualrail_rb): a DSP walks a region of the
+        sequencer cache one word per pass and the loop ends when it reaches a register holding
+        ``region_base + count``, which :func:`describe_cache_sums` resolves from this point's
+        cache. Both operands are therefore ABSOLUTE cache addresses, and the pass count is their
+        difference -- not the target alone, which is a ~1.9-million-pass loop.
+
+        Deliberately narrow: the counter must be a DSP whose initial immediate is inside the
+        cache region (i.e. a real cache pointer), and the target must be a register resolved from
+        the cache or pinned by an override. A counter compared against a LITERAL -- the
+        `DSP0 == 1` cooling loops -- is not this idiom and is left to
+        :meth:`repeat_until_count` exactly as before.
+        """
+        match = COUNTER_RE.match((condition or "").strip())
+        if not match or match.group(2) not in ("==", "!="):
+            return None
+        operator = match.group(2)
+        for counter, target in ((match.group(1), match.group(3)),
+                                (match.group(3), match.group(1))):
+            if not COUNTER_NAME_RE.fullmatch(counter or ""):
+                continue
+            if counter not in self.register_immediates:
+                continue
+            if target not in self.register_cycles and target not in self.register_overrides:
+                continue
+            base = int(self.register_immediates[counter])
+            if self.cache_base is None or base < self.cache_base:
+                continue                      # not a pointer into the cache
+            value = self._operand_value(target)
+            if value is None:
+                continue
+            if self._is_stream_count(target):
+                return None
+            return counter, operator, base, int(value)
+        return None
+
+    def _is_stream_count(self, token):
+        """True when ``token`` is the register a cache-pointer STREAM's loop bound comes from.
+
+        :meth:`_expand_stream` already unrolls that loop out of the same count word -- one command
+        per played gate, all inside ONE pass -- so resolving its PASS count as well draws the whole
+        train once per pass: N**2 gates, which is what the RB folders showed the moment the bound
+        register became resolvable (1791 gates became 3207681). The stream idiom keeps its
+        deliberately unresolved count. XEB's gates are register-latched rather than streamed, so it
+        has no ``stream`` and is unaffected.
+        """
+        return bool(self.stream is not None
+                    and self.register_sources.get(token) is not None
+                    and self.register_sources.get(token) == self.stream.get("count_word"))
+
+    def _pointer_guard(self, context, advance):
+        """Decide ``test(pointer != final)`` -- the guard that makes a skipped streamed family
+        legal -- from where the pointer actually is. None when this is not that shape."""
+        if context.get("kind") != "test":
+            return None
+        pair = self._pointer_pair(context.get("condition"))
+        if pair is None:
+            return None
+        counter, operator, base, target = pair
+        equal = (base + advance.get(counter, 0)) == target
+        return (not equal) if operator == "!=" else equal
+
+    def _pointer_loop_count(self, context, advance, index=None):
+        """``(passes, words per pass)`` for a ``repeat_until(pointer == final)``, else None.
+
+        The condition pins down the WORD RANGE the pointer covers; the program says how far one
+        pass moves it (:meth:`pointer_cep_per_pass`). Passes are the range divided by that, so a
+        body that walks one word per pass is unchanged and an interleaved one -- ladder-descent
+        cooling of several modes, which plays round r on every mode before round r+1 -- is no
+        longer drawn once per WORD.
+
+        None when the shape does not apply, the arithmetic is not credible, or the range is not a
+        whole number of passes: a partial pass is a sequence nobody wrote, so the loop is left
+        honestly data-dependent instead of being rounded into a picture.
+        """
+        if context.get("kind") != "repeat_until":
+            return None
+        pair = self._pointer_pair(context.get("condition"))
+        if pair is None or pair[1] != "==":
+            return None
+        counter, _, base, target = pair
+        words = target - (base + advance.get(counter, 0))
+        # A count outside the cache is not a count -- it is a mis-read. Fail safe: leave the loop
+        # data-dependent rather than draw a train the cache cannot hold.
+        if words < 0 or (self.point_cache and words > len(self.point_cache)):
+            return None
+        per_pass = self.pointer_cep_per_pass(index, counter) if index is not None else 1
+        if words % per_pass:
+            return None
+        return words // per_pass, per_pass
+
+    def _zero_target(self, context):
+        """Is this a counter loop whose exit target resolves to 0 -- i.e. one that never exits?"""
+        if context.get("kind") != "repeat_until":
+            return False
+        match = COUNTER_RE.match((context.get("condition") or "").strip())
+        if not match or match.group(2) != "==":
+            return False
+        left, right = match.group(1), match.group(3)
+        left_dsp = bool(COUNTER_NAME_RE.fullmatch(left))
+        if left_dsp == bool(COUNTER_NAME_RE.fullmatch(right)):
+            return False
+        target = self._operand_value(right if left_dsp else left)
+        counter = left if left_dsp else right
+        if target is None:
+            return False
+        return target - int(self.register_immediates.get(counter, 0)) == 0
 
     def execution_plan(self):
         """``[(block index, iteration), ...]`` in the order the sequencer runs them.
 
-        Consecutive blocks sharing the same innermost ``loop``/``repeat_until`` context form
-        one body. A ``loop`` repeats its own deterministic count. A ``repeat_until`` repeats
-        the count :meth:`repeat_until_count` resolves from its condition register/literal
-        (recorded in :attr:`repeat_counts`); when that can't be resolved the count is
-        data-dependent, so one pass is drawn. A user ``loop_counts[first block]`` overrides
-        either.
+        Control flow NESTS, so this expands the block list depth by depth. At each depth,
+        consecutive blocks sharing that depth's context form one body -- and a body includes
+        everything nested INSIDE it, which is then expanded recursively for every pass. A
+        ``loop`` repeats its own deterministic count. A ``repeat_until`` repeats the count
+        :meth:`repeat_until_count` resolves from its condition register/literal (recorded in
+        :attr:`repeat_counts`); when that can't be resolved the count is data-dependent, so one
+        pass is drawn. A user ``loop_counts[first block of the body]`` overrides either.
+
+        Grouping at the CONTEXT'S OWN DEPTH is what makes a nested body repeat with its parent.
+        Matching the *innermost* context instead (what this did before 2026-08-11) silently
+        dropped nested blocks out of the enclosing body: for feedback cooling inside
+        ``cool_modes`` -- ``repeat_until(mode_DSP == 3)`` wrapping {mode swap, then
+        ``repeat_until(qubit_DSP == 1)`` around the measure/reset} -- the swap block's body
+        stopped at the swap, so the plan drew THREE swaps back to back and then the cooling
+        ONCE, in the wrong order. The compiled program has one swap inside the loop; the
+        sequence was right and the drawing was wrong.
         """
         self.repeat_counts = {}
-        plan, index = [], 0
-        while index < len(self.blocks):
-            block = self.blocks[index]
-            context = block.conditional[-1] if block.conditional else None
-            if context is None:
-                plan.append((index, 0))
-                index += 1
+        self.indeterminate = set()
+        self.entered_paths = {}
+        self.nonterminating = set()
+        self.pointer_decisions = {}
+        self._resolve_every_construct()
+        return self._expand_contexts(list(range(len(self.blocks))), 0, 0)
+
+    def _resolve_every_construct(self):
+        """Read each construct's data-derived value out of the run, reachable or not.
+
+        Resolvability is a property of the RUN'S DATA, not of what is currently drawn. Doing it only
+        while expanding the plan meant a construct whose enclosing loop was pinned to 0 passes never
+        got resolved, and its tab then claimed "the board decides this at runtime" for a count the
+        cache pins down exactly -- a false claim of indeterminacy, which is as misleading as the
+        false claim of certainty this marker exists to prevent.
+        """
+        seen = set()
+        # How far each cache POINTER has already been walked by the guarded streamed loops
+        # resolved above it. A pointer loop's count is (target - where the pointer is NOW), and
+        # where it is now depends on the loops before it: the two XEB families share one pointer
+        # and one shot enters exactly one of them, which is a fact about this run's cache, not
+        # about the program. See _pointer_pair.
+        advance = {}
+        for index, block in enumerate(self.blocks):
+            for depth, context in enumerate(block.conditional or ()):
+                level = depth + 1
+                key = (self._context_id(context, level), level)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # `index` is the first block of this construct's body, which is how every other
+                # part of this module names it
+                if context.get("kind") == "test":
+                    guard = self._pointer_guard(context, advance)
+                    if guard is not None:
+                        self.pointer_decisions[self.construct_key(index, level)] = guard
+                        continue
+                    if self.evaluate_condition(context.get("condition")) is None:
+                        self.indeterminate.add(self.construct_key(index, level))
+                        self.indeterminate.add(index)
+                    continue
+                if context.get("kind") == "loop":
+                    continue                 # a deterministic count, straight from the program
+                # A guarded pointer loop: the guard one level out decides whether it runs at all,
+                # so a count of 0 here is a legally SKIPPED family rather than a loop that never
+                # exits (`repeat_until` is a do-while -- see the zero-target note below).
+                guarded = self.pointer_decisions.get(self.construct_key(index, level - 1))
+                resolved_pointer = self._pointer_loop_count(context, advance, index)
+                pointer_count = None if resolved_pointer is None else resolved_pointer[0]
+                if pointer_count is not None and guarded is not False:
+                    self.repeat_counts[self.construct_key(index, level)] = pointer_count
+                    self.repeat_counts.setdefault(index, pointer_count)
+                    if pointer_count == 0 and guarded is None:
+                        self.nonterminating.add(self.construct_key(index, level))
+                        self.nonterminating.add(index)
+                    else:
+                        counter = self._pointer_pair(context.get("condition"))[0]
+                        # WORDS, not passes: the next loop sharing this pointer starts where this
+                        # one left the pointer, and a pass may have walked several words.
+                        advance[counter] = (advance.get(counter, 0)
+                                            + pointer_count * resolved_pointer[1])
+                    continue
+                if pointer_count is not None:          # guard skips it: zero passes, no advance
+                    self.repeat_counts[self.construct_key(index, level)] = 0
+                    self.repeat_counts.setdefault(index, 0)
+                    continue
+                count = self.repeat_until_count(context, index)
+                if count is None:
+                    # a resolvable target of 0 is not "unknown", it is a loop that never exits
+                    if self._zero_target(context):
+                        self.nonterminating.add(self.construct_key(index, level))
+                        self.nonterminating.add(index)
+                    self.indeterminate.add(self.construct_key(index, level))
+                    self.indeterminate.add(index)
+                else:
+                    self.repeat_counts[self.construct_key(index, level)] = int(count)
+                    self.repeat_counts.setdefault(index, int(count))
+
+    def _expand_contexts(self, members, depth, iteration, path=()):
+        """Expand ``members`` (block indices, in address order) below control-flow ``depth``.
+
+        ``iteration`` is stamped on blocks that bottom out here (no context deeper than
+        ``depth``), so every placement reports the pass of its own innermost loop.
+
+        ``path`` is the tuple of ENCLOSING pass indices -- (0,) inside the first pass of one outer
+        loop, (2, 1) inside the second pass of a loop inside the third pass of another. It exists
+        so an override can name ONE EXECUTION of a construct rather than the construct itself.
+        That distinction is not cosmetic: an inner active-reset loop is compiled once but runs
+        once per outer pass, and how many rounds it takes depends on what the qubit did that
+        time. Keying an override by block alone forced every execution to the same count, so
+        setting the cooling rounds for one mode silently set them for all of them -- a picture
+        that cannot happen on hardware.
+        """
+        plan, i = [], 0
+        while i < len(members):
+            index = members[i]
+            stack = self.blocks[index].conditional
+            if len(stack) <= depth:          # not inside any context at this depth
+                plan.append((index, iteration, tuple(path)))
+                i += 1
                 continue
 
-            body = [index]
-            while (body[-1] + 1 < len(self.blocks)
-                   and self.blocks[body[-1] + 1].conditional
-                   and self.blocks[body[-1] + 1].conditional[-1] == context):
-                body.append(body[-1] + 1)
+            context = stack[depth]
+            # The body is every consecutive member inside THIS context, nesting included.
+            # Identical sibling loops are told apart by the id branch_recorder stamps on each
+            # `with` entry (two cool_qubits calls both read `repeat_until(DSP0 == 1)`); when
+            # that id is absent -- an older trace -- this falls back to comparing the context
+            # by value, which merges such siblings into one body.
+            j = i + 1
+            while (j < len(members)
+                   and len(self.blocks[members[j]].conditional) > depth
+                   and self._same_context(self.blocks[members[j]].conditional[depth], context)):
+                j += 1
+            body = members[i:j]
+            first = body[0]
 
             if context["kind"] == "test" and context.get("speculation") is False:
                 # KI_004: with speculation=False the body is placed OUT OF LINE, so address
@@ -388,39 +838,128 @@ class SequenceTrace:
                 # apply -- measured 25 ns out on the taken arm, and the skipped arm hangs
                 # the sequencer outright. Draw the body but flag the path as unmodelled
                 # rather than assert a timeline we know is wrong.
-                self.assumed_paths.add(index)
-                self.unsupported_paths.add(index)
-                plan.extend((member, 0) for member in body)
+                self.assumed_paths.add(first)
+                self.unsupported_paths.add(first)
+                plan.extend(self._expand_contexts(body, depth + 1, 0))
             elif context["kind"] == "test":
                 # explicit choice wins; otherwise try to decide it from the cache;
                 # otherwise assume the body runs (and say so via `assumed_paths`)
-                taken = self.path_choices.get(index)
+                # Ask the DATA first, always -- even when a pin is in force. Whether the board
+                # decides this arm at runtime is a property of the construct, not of what is being
+                # displayed, and it used to be lost the moment you pinned: the tab dropped its "?"
+                # and a hypothesis then looked exactly like a measured fact.
+                self.entered_paths.setdefault(
+                    self.construct_key(first, depth + 1), set()).add(path)
+                decided = self.pointer_decisions.get(self.construct_key(first, depth + 1))
+                if decided is None:
+                    decided = self.evaluate_condition(context.get("condition"))
+                taken = self._path_override(first, depth + 1, path)
                 if taken is None:
-                    taken = self.evaluate_condition(context.get("condition"))
+                    taken = decided
                     if taken is None:
                         taken = True
-                        self.assumed_paths.add(index)
+                        self.assumed_paths.add(first)
                 if taken:
-                    plan.extend((member, 0) for member in body)
+                    plan.extend(self._expand_contexts(body, depth + 1, 0, path + (0,)))
             elif context["kind"] == "repeat_until":
                 # count from the loop's condition register/literal when resolvable
                 # (recorded so the caption can state it); else data-dependent -> one pass.
-                count = self.loop_counts.get(index)
+                # Same here: resolve from the run's own cache whether or not a pin exists, so
+                # "the board decides this count" stays visible while you explore other values.
+                self.entered_paths.setdefault(
+                    self.construct_key(first, depth + 1), set()).add(path)
+                # established for every construct up front by _resolve_every_construct
+                resolved = self.repeat_counts.get(self.construct_key(first, depth + 1))
+                count = self._count_override(first, depth + 1, path)
                 if count is None:
-                    count = self.repeat_until_count(context)
-                    if count is not None:
-                        self.repeat_counts[index] = int(count)
+                    count = resolved
                 if count is None:
                     count = 1
-                for iteration in range(max(int(count), 0)):
-                    plan.extend((member, iteration) for member in body)
+                for pass_index in range(max(int(count), 0)):
+                    plan.extend(self._expand_contexts(body, depth + 1, pass_index,
+                                                      path + (pass_index,)))
             else:
                 # loop: deterministic count, unrolled.
-                count = self.loop_counts.get(index, context.get("count") or 1)
-                for iteration in range(max(int(count), 1)):
-                    plan.extend((member, iteration) for member in body)
-            index = body[-1] + 1
+                count = self._count_override(first, depth + 1, path)
+                if count is None:
+                    count = context.get("count") or 1
+                for pass_index in range(max(int(count), 1)):
+                    plan.extend(self._expand_contexts(body, depth + 1, pass_index,
+                                                      path + (pass_index,)))
+            i = j
         return plan
+
+    @staticmethod
+    def construct_key(block, depth, path=None):
+        """Canonical identity of a control-flow construct, and optionally of ONE execution.
+
+        The first block of the body is not enough. Nested constructs frequently begin at the same
+        block -- a mode loop, the cooling round inside it and the active reset inside that all
+        start together -- so keying by block alone made three different constructs share one key.
+        Three tabs then all read `@11` and editing any of them edited the same thing, which is
+        exactly the "I changed one and something else moved" symptom.
+
+        ``depth`` disambiguates them: within one nesting stack a construct is uniquely identified
+        by where it sits. It is the ONE-BASED nesting level -- the same number
+        ``control_flow_summary`` and ``branch_regions`` report -- because two conventions for the
+        same quantity is how a key silently matches nothing and an edit appears to do nothing. ``path`` narrows it further to a single EXECUTION (see
+        :meth:`_expand_contexts`); omit it to mean every execution.
+        """
+        return (int(block), int(depth)) if path is None else (int(block), int(depth), tuple(path))
+
+    def _count_override(self, first, depth, path):
+        """The pinned pass count for THIS execution of a construct, or None.
+
+        Looked up most specific first: ``loop_counts[(block, path)]`` pins one execution,
+        ``loop_counts[block]`` pins every execution of that construct. Both are supported because
+        both are wanted -- "draw this one cooling round as 3" and "draw all of them as 3" are
+        different requests, and only the second used to be expressible.
+        """
+        keys = [self.construct_key(first, depth)]                 # every execution
+        if path is not None:
+            keys.insert(0, self.construct_key(first, depth, path))  # this execution
+            keys.append((first, tuple(path)))                       # legacy, pre-depth keys
+        keys.append(first)                                          # legacy, block only
+        for key in keys:
+            value = self.loop_counts.get(key)
+            if value is not None:
+                return value
+        return None
+
+    def _path_override(self, first, depth, path=None):
+        """The pinned arm for a ``test``, or None -- same precedence as :meth:`_count_override`.
+
+        Exists so the layout and the UI cannot disagree about which pin applies. When the panel
+        read ``path_choices[block]`` directly while the layout resolved the depth-qualified key,
+        a pinned arm displayed as "resolved": the control said the value came from the data when
+        it had in fact been set by hand, which is the one thing this panel must never do.
+        """
+        keys = [self.construct_key(first, depth)]
+        if path is not None:
+            keys.insert(0, self.construct_key(first, depth, path))
+        keys.append(first)                                # legacy, pre-depth keys
+        for key in keys:
+            if key in self.path_choices:
+                return self.path_choices[key]
+        return None
+
+    @staticmethod
+    def _context_id(context, level):
+        """Logical identity of a control-flow construct instance, shared by every block in its body.
+
+        The same rule :meth:`_same_context` applies, as a hashable key: prefer the per-entry ``id``
+        acadia puts on the context, and fall back to object identity only when there is none.
+        """
+        marker = context.get("id")
+        return marker if marker is not None else ("anon", level, id(context))
+
+    @staticmethod
+    def _same_context(a, b):
+        """Is this the same control-flow block instance? Prefer the per-entry id."""
+        a_id, b_id = a.get("id"), b.get("id")
+        if a_id is not None and b_id is not None:
+            return a_id == b_id
+        return a == b
 
     @property
     def length_cycles(self):
@@ -436,6 +975,126 @@ class SequenceTrace:
         alias = self.register_names.get(name, name)
         source = self.registers.get(name, {}).get("source")
         return f"{alias} = {source}" if source else alias
+
+    def control_flow_summary(self):
+        """Describe every control-flow construct, for a UI that lets the user pin it.
+
+        The trace already accepts both overrides -- ``loop_counts[block] = N`` for how many times
+        a ``loop``/``repeat_until`` body is drawn, and ``path_choices[block] = True/False`` for
+        which arm of a ``test`` runs -- and :meth:`relayout` re-times everything in place. What
+        was missing is a way to ENUMERATE them, so a caller can offer one control per construct
+        instead of the user having to know block indices.
+
+        Each entry says where its value came from, which is the part that matters when reading a
+        picture: ``resolved`` (read out of the captured cache -- trustworthy), ``assumed`` (the
+        trace could not tell and picked a default -- treat the drawing as one possibility, not as
+        fact), or ``pinned`` (you set it).
+
+        :return: ``[{block, kind, depth, label, count, taken, source, settable}, ...]`` in
+            execution order, outermost first.
+        """
+        # Every EXECUTION of every construct, keyed the way the tabs are. A construct nested in a
+        # loop is compiled once and runs once per enclosing pass, and each of those executions is
+        # independently settable -- an active-reset loop takes a different number of rounds every
+        # time. Listing only the construct hid that: three tabs on the diagram read "@11" and the
+        # panel offered one row for all of them.
+        executions = {}
+        # ...and what ONE MORE PASS of each construct costs, in placements. Counted from the plan,
+        # not from the static block list: a body containing loops expands to far more than its block
+        # count (83 passes of a 3-block body produced 583 placements, because the body has an inner
+        # loop), and the panel derives its pass limit from this number.
+        inside, own_passes = {}, {}
+        for placement in (self.placements or ()):
+            stack = getattr(placement, "conditional", ()) or ()
+            path = tuple(getattr(placement, "path", ()) or ())
+            for level in range(1, len(stack) + 1):
+                context_here = stack[level - 1]
+                key = (id(context_here), level)
+                executions.setdefault(key, set()).add(path[:level - 1])
+                # The BODY cost has to be grouped by the construct, and every block carries its own
+                # COPY of the context dicts -- so id() grouped a single block's placements and said
+                # the body of a three-block loop was one block. `context["id"]` is the logical
+                # identity, the same one _same_context and this method's own dedupe use.
+                logical = (self._context_id(context_here, level), level)
+                inside[logical] = inside.get(logical, 0) + 1
+                own_passes.setdefault(logical, set()).add(
+                    path[level - 1] if len(path) >= level else 0)
+
+        entries, seen = [], set()
+        for index, block in enumerate(self.blocks):
+            for depth, context in enumerate(block.conditional or ()):
+                key = context.get("id", (depth, id(context)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                # The construct is named by the first block of its body AND its nesting level.
+                # ``depth`` here is one-based, matching construct_key / branch_regions: the two
+                # conventions used to differ, so the panel wrote (block, 0) while the drawing read
+                # (block, 1) and an edit made from the panel silently did nothing to that tab.
+                first = index
+                level = depth + 1
+                kind = context.get("kind")
+                # what one extra pass costs, in placements: everything drawn inside this
+                # construct divided by how many of its own passes are drawn. Falls back to the
+                # static block count when nothing of it is drawn at all.
+                instance = (self._context_id(context, level), level)
+                drawn_inside = inside.get(instance, 0)
+                drawn_passes = max(len(own_passes.get(instance, ())), 1)
+                body = (max(drawn_inside // drawn_passes, 1) if drawn_inside else
+                        max(sum(1 for other in self.blocks
+                                if len(other.conditional or ()) >= level
+                                and self._same_context(other.conditional[level - 1], context)), 1))
+                # One entry per EXECUTION of this construct. Taken from what the layout REACHED
+                # (entered_paths), not from what it drew: an execution pinned to zero passes draws
+                # nothing, and reading the drawn placements dropped it from this list -- which
+                # removed its row from the panel and its tab from the diagram, leaving no way back.
+                reached = self.entered_paths.get(self.construct_key(first, level))
+                paths = sorted(reached if reached is not None
+                               else executions.get((id(context), level), set()))
+                runs = [{"path": path,
+                         "key": self.construct_key(first, level, path),
+                         "pinned": self._count_override(first, level, path)
+                         if kind != "test" else self._path_override(first, level, path)}
+                        for path in paths]
+                if kind == "test":
+                    pinned = self._path_override(first, level)
+                    source = ("pinned" if pinned is not None
+                              else "assumed" if first in self.assumed_paths else "resolved")
+                    # Whether the arm RAN is read off the executed plan, not inferred from
+                    # assumed_paths. An assumed test is drawn TAKEN (the tracer's default when it
+                    # cannot decide), so "assumed" and "skipped" are not the same thing -- reading
+                    # one as the other would caption a drawn body as a skipped one.
+                    taken = (pinned if pinned is not None
+                             else any(p.index == first for p in (self.placements or ())))
+                    entries.append({
+                        "block": first, "kind": "test", "depth": level,
+                        # the key a caller must write to change this construct and nothing else
+                        "key": self.construct_key(first, level),
+                        "indeterminate": self.construct_key(first, level) in self.indeterminate,
+                        "executions": runs, "body": body,
+                        "label": f"test {context.get('condition') or ''}".strip(),
+                        "count": None, "taken": taken,
+                        "source": source, "settable": True})
+                else:
+                    pinned = self._count_override(first, level, None)
+                    resolved = self.repeat_counts.get(first)
+                    if pinned is not None:
+                        count, source = int(pinned), "pinned"
+                    elif resolved is not None:
+                        count, source = int(resolved), "resolved"
+                    elif kind == "loop":
+                        count, source = int(context.get("count") or 1), "resolved"
+                    else:
+                        count, source = 1, "assumed"
+                    entries.append({
+                        "block": first, "kind": kind or "loop", "depth": level,
+                        "key": self.construct_key(first, level),
+                        "indeterminate": self.construct_key(first, level) in self.indeterminate,
+                        "nonterminating": self.construct_key(first, level) in self.nonterminating,
+                        "executions": runs, "body": body,
+                        "label": f"{kind} x{count}", "count": count, "taken": None,
+                        "source": source, "settable": True})
+        return entries
 
     def register_summary(self):
         """Describe every register / length-symbol for a per-register UI control.
@@ -454,8 +1113,14 @@ class SequenceTrace:
         :return: ``[{name, label, source, resolution, value_cycles, is_length,
             settable}, ...]``, deduped by name, identified registers first.
         """
+        # A length the COMPILER already fixed is not a register the user can pin. Barrier
+        # padding is built as an acadia Operation (`max(30, 30)`), which arrives here as a
+        # symbolic length and used to be offered in the GUI as a settable register -- a control
+        # over a value nothing can change, captioned with a raw `Operation(<built-in function
+        # max>, ...)` repr. `static_length` marks those; they are excluded.
         resolved = {c.symbolic: (c.resolution, c.length)
-                    for c in self.commands if c.symbolic}
+                    for c in self.commands
+                    if c.symbolic and getattr(c, "static_length", None) is None}
 
         def entry(name, resolution, cycles, is_length):
             return {"name": name, "label": self.register_label(name),
@@ -487,10 +1152,18 @@ class SequenceTrace:
         pulse and ignores anything ``load_pulse`` overrode at runtime.
 
         Falls back to the config when the memory was never loaded (all zeros).
+
+        A memory that was deliberately loaded with amplitude ZERO -- an idle gate written as
+        ``{"scale": "0.0"}``, which still plays for its full duration -- also holds zeros, and is
+        NOT the same thing. :func:`_spy_load_pulse` records which pulses the run actually loaded,
+        so that case keeps its measured zeros: hovering it reads ``|A| = 0.000`` rather than
+        blanking out, and never falls back to the nominal amplitude the board did not play. Older
+        traces carry no record, so they keep the "zeros mean not loaded" reading.
         """
         if source == "memory":
             samples = self.loaded_envelopes.get((io_name, pulse))
-            if samples is not None and len(samples) and np.abs(samples).max() > 0:
+            if samples is not None and len(samples) and (
+                    (io_name, pulse) in self.loaded_pulses or np.abs(samples).max() > 0):
                 return samples
         return self.envelopes.get((io_name, pulse))
 
@@ -676,6 +1349,8 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
         DMASynchronizer.create_schedules = staticmethod(spy_create)
         DMASynchronizer.merge_schedules = staticmethod(spy_merge)
         DMASynchronizer.__exit__ = spy_exit
+        loaded_pulses = set()
+        restore_loads = _spy_load_pulse(runtime, loaded_pulses)
         try:
             with hardware_stubbed(on_run, runtime=runtime,
                                   allow_instruments=allow_instruments), \
@@ -688,6 +1363,8 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
             DMASynchronizer.create_schedules = staticmethod(orig_create)
             DMASynchronizer.merge_schedules = staticmethod(orig_merge)
             DMASynchronizer.__exit__ = orig_exit
+            for klass, original in restore_loads:
+                klass.load_pulse = original
             if restore_iterations is not _MISSING:
                 runtime.iterations = restore_iterations
 
@@ -697,6 +1374,7 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                 "channel_synchronizer, or it stopped earlier than expected")
 
         trace = _build_trace(runtime, raw_blocks, resolve_indeterminate)
+        trace.loaded_pulses = loaded_pulses
         trace.register_overrides = dict(resolve_registers or {})
         trace.register_names = dict(register_names or {})
         trace.iterations_forced = restore_iterations is not _MISSING
@@ -712,6 +1390,49 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
 
     trace.select_point(selected)
     return trace
+
+
+def _spy_load_pulse(runtime, loaded):
+    """Record every ``(io name, memory name)`` the dry run actually LOADS a waveform into.
+
+    Needed because a waveform memory that was never loaded and one deliberately loaded with
+    amplitude ZERO hold the same thing -- zeros -- and :meth:`SequenceTrace.envelope` has to tell
+    them apart. Reading zeros as "not loaded" hides a real zero-amplitude pulse (an idle gate
+    written as ``{"scale": "0.0"}``): its hover readout goes blank, or worse, falls back to the
+    config and reports the nominal amplitude the board never played.
+
+    The memory name is the first argument of ``load_pulse`` in every form the framework uses --
+    ``load_pulse("CR_x")``, ``load_pulse(cfg)`` with a ``name``, ``load_pulse(slot, pulse)`` --
+    which is the same key ``_snapshot`` files the memory under.
+
+    :return: ``[(class, original load_pulse), ...]`` for the caller to restore.
+    """
+    names = {id(io): name for name, io in getattr(runtime, "_ios", {}).items()}
+    restore, patched = [], set()
+    for io in getattr(runtime, "_ios", {}).values():
+        klass = _defining_class(type(io), "load_pulse")
+        if klass is None or klass in patched:
+            continue
+        patched.add(klass)
+        original = klass.load_pulse
+
+        def spy(self, memory=None, *args, _original=original, **kwargs):
+            try:
+                if isinstance(memory, str):
+                    name = memory
+                elif isinstance(memory, dict):
+                    name = memory.get("name")
+                else:
+                    name = getattr(memory, "name", None)
+                if name is not None:
+                    loaded.add((names.get(id(self)), name))
+            except Exception:
+                pass                # recording is an enhancement; never break the load
+            return _original(self, memory, *args, **kwargs)
+
+        klass.load_pulse = spy
+        restore.append((klass, original))
+    return restore
 
 
 def _cache_words(runtime):
@@ -750,6 +1471,13 @@ class Instr:
     "DSP_C", "DSP_CFG", "BUS_DATA", "MASK", "NONE"), with the paired source major in ``s1``/``s2``
     and immediate in ``imm1``/``imm2`` (slot 1 pairs dest1/src1/imm1). ``d1_minor`` is the port
     index -- or, for a PC destination, the branch/hold code.
+
+    ``cep`` is the DSP index whose counter-enable this instruction PULSES, i.e. which counter it
+    advances by one -- ``pulse_cep()`` compiles to an instruction with no destination at all and
+    the DSP named only in the STP's ``dsp_cep`` field, so it is invisible in ``d1``/``d2``. It is
+    the only record of how many times a loop body advances its pointer, which is what turns a
+    cache-pointer loop's word range into a PASS count (see
+    :meth:`SequenceTrace.pointer_cep_per_pass`).
     """
     i: int
     d1: Optional[str]
@@ -764,6 +1492,7 @@ class Instr:
     condition_invert: bool
     op: Optional[str]
     comment: Optional[str]
+    cep: Optional[int] = None
 
 
 def decode_program(acadia):
@@ -785,8 +1514,44 @@ def decode_program(acadia):
                 imm1=ins.imm1, imm2=ins.imm2,
                 conditional=bool(ins.conditional),
                 condition_invert=bool(ins.condition_invert),
-                op=ins.op, comment=ins.comment))
+                op=ins.op, comment=ins.comment,
+                cep=_cep_dsp(ins)))
     return prog
+
+
+def _cep_dsp(ins):
+    """The DSP index whose CEP this instruction pulses, else None.
+
+    ``DSP.pulse_cep()`` emits ``store(src=IMM, dest=None, dsp_cep=<the DSP>)``, and the sequencer
+    turns that into a ``Source(DSP_P, resource id)`` in the instruction's ``dsp_cep`` slot. It is
+    the ONLY place the advance appears: the instruction has no destination, so every predicate
+    that reads ``d1``/``d2`` is blind to it.
+    """
+    cep = getattr(ins, "dsp_cep", None)
+    major = getattr(getattr(cep, "major", None), "name", None)
+    if major != "DSP_P":
+        return None
+    try:
+        return int(cep.minor)
+    except (TypeError, ValueError):
+        return None
+
+
+def describe_cep_sites(acadia):
+    """``{"DSP1": [program address, ...]}`` -- every place a DSP's counter is advanced.
+
+    A cache POINTER loop's condition gives a word RANGE (``final - start``), not a pass count:
+    the two agree only when the body advances the pointer once per pass. A body that walks
+    several cache words per pass -- interleaved ladder-descent cooling reads one flat length per
+    (round, mode), so three paired modes advance the pointer three times per round -- has a range
+    three times its pass count, and taking the range for the count drew the cooling loop three
+    times over. The advances are right here in the program.
+    """
+    sites = {}
+    for r in decode_program(acadia):
+        if r.cep is not None:
+            sites.setdefault(f"DSP{r.cep}", []).append(r.i)
+    return sites
 
 
 def _resolve_imm(imm):
@@ -810,9 +1575,36 @@ def _is_dma_poll(r):
             and r.s2 == "BUS_DATA" and r.op == "and" and not r.condition_invert)
 
 
+def _is_drain_poll(r):
+    """The wait a ``block=False`` batch's drain emits: the same PC-hold as
+    :func:`_is_dma_poll` but in the INVERTED (``fifo_empty``/``almost_empty``) sense."""
+    return (r.d1 == "PC" and r.d1_minor == Destination.PC_ABSOLUTE_HOLD and r.conditional
+            and r.s2 == "BUS_DATA" and r.op == "and" and r.condition_invert)
+
+
 def _is_branch(r):
     """An absolute PC branch (loop back-edge or `test` skip); target is its slot-1 immediate."""
     return r.d1 == "PC" and r.d1_minor == Destination.PC_ABSOLUTE_BRANCH
+
+
+def _static_value(value):
+    """The compile-time value of an acadia ``Operation``/``Symbol``, or None if runtime-dependent.
+
+    ``Acadia.command_dma`` itself distinguishes these exactly this way (an assigned ``Symbol`` or
+    a resolveable ``Operation`` is printed as its value), so this asks the object rather than
+    pattern-matching its repr.
+    """
+    for attribute, check in (("resolveable", None), ("assigned", True)):
+        probe = getattr(value, attribute, None)
+        if probe is None:
+            continue
+        try:
+            ok = probe() if callable(probe) else probe
+            if ok is (True if check is True else ok) and ok:
+                return int(value.value())
+        except Exception:
+            return None
+    return None
 
 
 def _bus_addr(r):
@@ -822,6 +1614,24 @@ def _bus_addr(r):
     if r.d2 == "BUS_ADDR" and r.s2 == "IMM":
         return _resolve_imm(r.imm2)
     return None
+
+
+def _bus_addr_pointer(r):
+    """True when this instruction drives BUS_ADDR from a POINTER rather than a literal.
+
+    ``bus_read(pointer)`` compiles to ``BUS_ADDR <- DSP_P``: the address comes out of a DSP that
+    walks the cache, so there is no immediate to read. Distinguishing this from "no bus address
+    here at all" matters -- see :func:`describe_registers`.
+
+    WHICH DSP drives it is deliberately not reported. The decoded record carries a minor only for
+    DESTINATIONS (``d1_minor``/``d2_minor``); on this instruction that is the bus port, not the
+    counter. Naming a specific "DSP0" from it would be inventing a fact -- the same class of
+    mistake as the wrong device label this predicate exists to remove.
+    """
+    for dest, src in ((r.d1, r.s1), (r.d2, r.s2)):
+        if dest == "BUS_ADDR" and src == "DSP_P":
+            return True
+    return False
 
 
 def _bus_data_load(r, dests):
@@ -880,9 +1690,35 @@ def _build_trace(runtime, raw_blocks, resolve):
         trace.registers = describe_registers(acadia)
     except Exception:
         pass
+    try:
+        # `Register.load(immediate + cache[word])` leaves no BUS_DATA -> REGn for
+        # describe_registers to find; it is an arithmetic DSP. Merge those in so the register
+        # resolves per sweep point like any other cache-fed one.
+        trace.registers.update(describe_cache_sums(acadia))
+    except Exception:
+        pass
     trace.register_sources = {name: info["cache_word"]
                               for name, info in trace.registers.items()
                               if info["cache_word"] is not None}
+    trace.register_addends = {name: info["addend"]
+                              for name, info in trace.registers.items()
+                              if info.get("addend")}
+    try:
+        trace.register_immediates = describe_immediates(acadia)
+    except Exception:
+        pass                    # a constant nobody could read is the old behaviour, not a failure
+    try:
+        # Where each counter is ADVANCED, which is how many cache words a pointer loop's body
+        # walks per pass -- see SequenceTrace.pointer_cep_per_pass.
+        trace.cep_sites = describe_cep_sites(acadia)
+    except Exception:
+        pass                    # one advance per pass is the old assumption, and the fallback
+    try:
+        # where the cache region starts on the bus, so an ABSOLUTE pointer immediate can be
+        # turned into a cache WORD index
+        trace.cache_base = acadia._firmware.sequencer_bus_decoder["cache"].address().value()
+    except Exception:
+        pass
 
     # A cache-pointer pulse stream (randomized benchmarking) is unrolled from the per-point
     # cache in relayout; store the decode map and the stream descriptor here.
@@ -892,6 +1728,10 @@ def _build_trace(runtime, raw_blocks, resolve):
         trace.drain_blocks = drain_block_issue(acadia)
     except Exception:
         pass                    # the machine layout is opt-in; never fail the trace
+    try:
+        trace.direct_words = direct_command_words(acadia)
+    except Exception:
+        trace.direct_words = {}
     try:
         stream = describe_cache_stream(acadia)
         if stream:
@@ -921,18 +1761,34 @@ def _build_trace(runtime, raw_blocks, resolve):
                     # Clifford that way. Nothing about it is knowable off-hardware, so it
                     # is treated as a symbolic length like a register-driven dwell.
                     raw_len = c["length"] if "length" in c else c.get("command")
-                    symbolic = length = None
+                    symbolic = length = static_length = None
+                    resolved = _static_value(raw_len)
                     if isinstance(raw_len, (int, np.integer)):
                         length = int(raw_len) + (1 if c.get("length_is_minus_one")
                                                  else 0)
                     else:
                         symbolic = str(raw_len)
+                        # An Operation/Symbol that resolves at COMPILE time (barrier padding is
+                        # built this way: `max(30, 30)`, `max(30, 30) - 30`). Its value is
+                        # recorded so the UI can stop offering it as something to "pin" -- it is
+                        # not a runtime unknown -- but the command is still NOT given that
+                        # length in the layout.
+                        #
+                        # Laying it out was tried and is wrong: acadia keeps these entries in
+                        # its in-memory schedule and does NOT emit a DMA command for all of
+                        # them. Resolving them added six 30-cycle dwells that the board never
+                        # played, and four archived runs
+                        # (DualRailCCZGateTomographyBasisDebug, DRCCZPhaseCalibration) stopped
+                        # matching their own compiled.log -- with `only_in_archive` empty, so
+                        # the extra commands were purely invented. The archive is the authority.
+                        static_length = resolved
                     io_name = pulse = None
                     address = c.get("address")
                     if address is not None:
                         io_name, pulse = addr_names.get(
                             (ch.num(), address), (None, None))
                     group.append(Command(
+                        static_length=static_length,
                         channel=ch_name,
                         kind=KIND.get(c["command_type"], str(c["command_type"])),
                         start=0, length=length, symbolic=symbolic,
@@ -963,8 +1819,16 @@ def sequencer_control_flow(acadia):
     polls = {}
     for nth, trigger in enumerate(triggers):
         limit = triggers[nth + 1] if nth + 1 < len(triggers) else len(prog)
+        # Either kind of wait ends a block: the blocking `dma_running` poll, or the INVERTED
+        # `fifo_empty`/`almost_empty` poll that drains a block=False batch. Only the blocking one
+        # used to be recorded, so a drain block had no poll here and edge_gap could not cost the
+        # edge leaving it -- it returned None, and the layout silently fell back to the
+        # address-order span from drain_block_issue. That is correct only when control falls
+        # straight through; inside a loop the next executed block is the loop head, reached
+        # backwards over the branch, and the address-order span overcharges by one cycle every
+        # pass (batch_in_loop measured exactly 5.00 ns x (loop_count - 1)).
         poll = next((j for j in range(trigger + 1, limit)
-                     if _is_dma_poll(prog[j])), None)
+                     if _is_dma_poll(prog[j]) or _is_drain_poll(prog[j])), None)
         if poll is not None:
             polls[nth] = poll
 
@@ -984,11 +1848,80 @@ def sequencer_control_flow(acadia):
             "back_branches": [(b, t) for b, t in branches if t < b]}
 
 
-def edge_gap(control_flow, from_nth, to_nth):
+def _branch_is_taken(at, target, goal, triggers, executed, arms):
+    """Would the sequencer take this branch on the path it actually ran?
+
+    Decided from the program and from which blocks executed -- never from the branch's own
+    condition, which is a runtime value the compiled program does not carry.
+
+    ``arms`` is a mutable list of "did it run?" flags for the trigger-less `test` arms on this
+    stretch, in program order. A `channel_synchronizer(trigger=False)` arm emits no DMA trigger,
+    so its branch skips a range containing no trigger at all and there is nothing in the program
+    to match it against; the flags come from the execution plan instead and are consumed in the
+    order the walk meets them, which is program order for both.
+    """
+    if target < at:                       # backward: a loop back edge
+        return goal < at                  # the goal is behind us, so the edge is the only way
+    if at < goal < target:
+        return False                      # taking it would jump OVER the block we are going to
+    skipped = [t for t in triggers if at < t < target]
+    if not skipped:
+        if arms:
+            return not arms.pop(0)        # a queued arm: taken exactly when it did not run
+        return False                      # skips no block at all: not a body-skip branch
+    return not any(t in executed for t in skipped)
+
+
+def _executed_path(control_flow, poll, goal, executed_nths, arms=()):
+    """Instructions FETCHED walking from ``poll`` to ``goal``, and the branch penalty paid.
+
+    Counting an address range is only right while control stays in address order, and it does
+    not: a `test` arm whose condition fails is jumped over, and a loop takes its back edge. The
+    old code handled that by counting one range and then subtracting the one skipped body it
+    could find between the poll and the FIRST branch -- so a CHAIN of skipped arms (the prep
+    selector: one `test(sel == i)` per prep state, at most one taken) had every skip after the
+    first counted as though it had run. Measured on the loopback with test_chain, arm 0 taken:
+
+        arms      1     2     4     8
+        measured  365   390   440   540   ns      <- 25 ns per skipped arm, flat
+        old model 365   390   520   780   ns      <- +40 ns per skipped arm beyond the first
+
+    Walking the path has no such blind spot: every skip costs its own condition plus one taken
+    branch and nothing for the body it jumps over, which is what the hardware does and why the
+    measured slope does not care how big the arm is.
+
+    Returns ``(fetched, penalty)``, or ``None`` if the walk does not reach the goal -- in which
+    case the caller keeps the address-order count rather than trusting a partial walk.
+    """
+    triggers = control_flow["triggers"]
+    branch_at = dict(control_flow["branches"])
+    executed = {triggers[n] for n in (executed_nths or ()) if 0 <= n < len(triggers)}
+    limit = 4 * (max(triggers, default=0) + len(branch_at) + 2)
+    fetched = penalty = 0
+    pc = poll
+    pending = list(arms)                         # consumed in program order by the walk
+    for _ in range(limit):
+        if pc == goal:
+            return fetched + 1, penalty          # the goal instruction is fetched too
+        fetched += 1
+        target = branch_at.get(pc)
+        if target is not None and _branch_is_taken(pc, target, goal, triggers, executed,
+                                                   pending):
+            pc = target
+            penalty += MEASURED_BRANCH_PENALTY
+        else:
+            pc += 1
+    return None
+
+
+def edge_gap(control_flow, from_nth, to_nth, executed_nths=(), arms=()):
     """Dead cycles between two executed blocks, and how it breaks down.
 
     ``from_nth``/``to_nth`` index the compiled program's trigger list. A backward edge picks
     up the branch instructions and the taken-branch penalty.
+
+    :param executed_nths: trigger indices of the blocks that DO execute. Used to tell a skipped
+        `test` body (jumped over, costing nothing but a branch penalty) from one that runs.
     """
     triggers, polls = control_flow["triggers"], control_flow["polls"]
     if from_nth not in polls:
@@ -1001,6 +1934,16 @@ def edge_gap(control_flow, from_nth, to_nth):
         issue = triggers[to_nth] - poll + 1
         penalty = 0
         kind = "fall-through"
+        # ...unless trigger-less `test` arms sit on this stretch. Then control does leave address
+        # order even though the next ANCHORED block is the very next one: each skipped arm's
+        # branch is taken, jumping over pushes the straight count would charge for. Measured on
+        # the loopback (test_chain, trigger=False): 25 ns per skipped arm, against the 15 ns a
+        # plain address count gives -- the branch is paid for and its 2 pushes are not.
+        if arms and not all(arms):
+            walked = _executed_path(control_flow, poll, triggers[to_nth], executed_nths, arms)
+            if walked is not None:
+                issue, penalty = walked
+                kind = f"fall-through, {sum(1 for a in arms if not a)} queued arm(s) skipped"
     else:
         # The executed path leaves address order: find the branch that redirects to a
         # point from which the target block's trigger is reached by running forward.
@@ -1015,6 +1958,45 @@ def edge_gap(control_flow, from_nth, to_nth):
         penalty = MEASURED_BRANCH_PENALTY
         kind = ("taken branch (loop back)" if target < branch
                 else "taken branch (skip)")
+
+        # Prefer WALKING the executed path over counting address ranges: the two agree while
+        # control stays in order and part ways as soon as more than one body is skipped on the
+        # way (see _executed_path). The address count stays as the fallback for a walk that
+        # cannot reach the target, so an unfamiliar program shape degrades to the old answer
+        # instead of to a wrong one.
+        walked = _executed_path(control_flow, poll, triggers[to_nth], executed_nths, arms)
+        if walked is not None:
+            issue, penalty = walked
+            skips = penalty // MEASURED_BRANCH_PENALTY
+            kind = ("taken branch (loop back)" if target < branch
+                    else "taken branch (skip)")
+            if skips > 1:
+                kind += f" x{skips}"
+            return {"issue": issue, "branch_penalty": penalty, "kind": kind}
+
+        # A SKIPPED BLOCK on this stretch was counted as executed. The run above is a straight
+        # instruction count from the poll to `branch`, but if a `test` body between them was
+        # skipped, the sequencer jumped over those instructions and never paid for them -- while
+        # paying one more taken-branch penalty for the skip itself. Correct both.
+        #
+        # This is the feedback-cooling shape (a `test`/`repeat_until(feedback)` inside the round
+        # loop), which 53 of the qudit runtimes build via cool_modes/cool_qubits and which no
+        # case exercised until `test_in_loop_false`. Measured on the loopback: the uncorrected
+        # count is 11 phantom instructions minus the missing 3-cycle penalty = 8 cycles = 40 ns
+        # long, against a measured error of 39.95 ns; corrected it predicts 110 ns and measures
+        # 110.05 ns. Only branches whose whole skipped span lies inside (poll, branch) are
+        # corrected, so a single-branch edge is untouched -- verified identical on loop_2,
+        # loop_3, loop_2_double, test_true, test_false and both nested_cool cases.
+        for skip_at, skip_to in control_flow["branches"]:
+            if not (poll < skip_at < branch and skip_at < skip_to <= branch):
+                continue                              # not a forward skip inside this stretch
+            if not any(skip_at < t < skip_to for t in triggers):
+                continue                              # skips no block: nothing was jumped over
+            if any(skip_at < triggers[n] < skip_to for n in executed_nths or ()):
+                continue                              # that block DID execute -- not skipped
+            issue -= (skip_to - skip_at - 1)          # instructions jumped over
+            penalty += MEASURED_BRANCH_PENALTY        # the skip is itself a taken branch
+            kind += " + skipped body"
     return {"issue": issue, "branch_penalty": penalty, "kind": kind}
 
 
@@ -1057,12 +2039,27 @@ def describe_registers(acadia):
         loaded = _bus_data_load(r, ("REG", "DSP_AB"))   # BUS_DATA -> REGn / DSP_ABn
         if loaded is None:
             continue
-        address = None
+        # Walk back to the bus address THIS read used. The walk must stop at the nearest
+        # BUS_ADDR write of EITHER kind: a literal, or a pointer (BUS_ADDR <- DSP_P, which is
+        # what bus_read(pointer) emits). Only literals used to count, so a pointer-driven read
+        # was walked straight past and attributed to whatever literal came before it -- in
+        # DualRail2XEBRuntime that was the neighbouring fifo poll, and the viewer confidently
+        # labelled the streamed gate commands "REG0 = dac3_dma", a channel they have nothing to
+        # do with. A wrong label is worse than no label; a pointer read is now named as one.
+        address, pointer = None, False
         for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            if _bus_addr_pointer(prog[j]):
+                pointer = True
+                break
             found = _bus_addr(prog[j])
             if found is not None:
                 address = found
                 break
+        if pointer:
+            major, minor = loaded
+            name = f"DSP{minor}" if major == "DSP_AB" else f"REG{minor}"
+            registers[name] = {"source": "cache[pointer]", "cache_word": None}
+            continue
         if address is None:
             continue
         # a DSP unit's output DSPn drives the command length, not DSP_ABn (its input)
@@ -1078,6 +2075,134 @@ def describe_registers(acadia):
     return registers
 
 
+def describe_immediates(acadia):
+    """``{"REG2": 1900548, "DSP0": 1900545}`` -- the compile-time constant each register or DSP
+    counter was INITIALISED with.
+
+    Separate from :func:`describe_registers`, which answers a different question: where a register
+    gets its value at RUN time (a cache word, a bus device, a pointer read). A constant load is
+    not a source in that sense -- it is a number the program carries -- and conflating the two
+    would make a pointer's base look like a data source.
+
+    Only the FIRST load of each name is kept. A counter is initialised once and then incremented
+    by ``pulse_cep()``; a later immediate write to the same register is a different value's life,
+    and taking it would report the end of a reused register as the start of a loop.
+    """
+    immediates = {}
+    for r in decode_program(acadia):
+        for dest, minor, imm, src in ((r.d1, r.d1_minor, r.imm1, r.s1),
+                                      (r.d2, r.d2_minor, r.imm2, r.s2)):
+            if src != "IMM" or dest not in ("REG", "DSP_AB"):
+                continue
+            # DSP_ABn is the DSP's INPUT; the counter is read back as DSPn, which is the name
+            # every condition string uses -- so record it under the name the condition will ask
+            # for, not the one the instruction writes.
+            name = f"DSP{minor}" if dest == "DSP_AB" else f"REG{minor}"
+            value = _resolve_imm(imm)
+            if value is not None and name not in immediates:
+                immediates[name] = value
+    return immediates
+
+
+def describe_cache_sums(acadia):
+    """``{"REG3": {"source": "cache[360] + 0x1D0000", "cache_word": 360, "addend": 1900544}}``
+    -- registers loaded as an IMMEDIATE PLUS a cache word.
+
+    ``Register.load(cache_base + index + cache[word])`` is how a streamed gate loop states its
+    end pointer (both XEB runtimes: ``final_int.load(base + index + num_cycles_cache[0])``). There
+    is no ``BUS_DATA -> REGn`` in it for :func:`describe_registers` to find, because acadia does
+    the addition in a DSP and copies the result across::
+
+        001D0168 -> BUS_ADDR                                          <- the cache word
+        ...bus latency...
+        001D0000 -> DSP_AB5                                           <- the immediate addend
+        DSPConfiguration(mode='AB+C') -> DSP_CFG5  |  BUS_DATA -> DSP_C5
+        DSP_P5 -> REG3                                                <- the sum lands here
+
+    So the register is a cache-RELATIVE address: its value is ``addend + cache[word]``, which the
+    per-point snapshot pins down exactly. Without it the loop `repeat_until(pointer == REG3)` has
+    an unknown bound, and the viewer draws one assumed pass of a train that really runs `L` --
+    the gap README calls out as the one streaming idiom that does not resolve.
+
+    The ``DSP_Pk -> REGm`` copy is matched POSITIONALLY, within a few instructions of the AB+C
+    config: an instruction carries a minor for its DESTINATION only (see
+    :func:`_bus_addr_pointer`), so the source DSP index of that copy is not in the record. The
+    whole pattern is one ``Register.load(Operation)`` emission, so adjacency is what ties them --
+    and the caller sanity-checks the arithmetic it gets (a pointer loop whose count comes out
+    negative or larger than the cache is not resolved), so a mis-association fails safe.
+    """
+    prog = decode_program(acadia)
+    decoder = acadia._firmware.sequencer_bus_decoder
+    cache_base = decoder["cache"].address().value()
+    cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
+
+    sums = {}
+    for r in prog:
+        # this instruction must land BUS_DATA in DSP_Ck *and* configure that same DSP as AB+C
+        loaded = _bus_data_load(r, ("DSP_C",))
+        if loaded is None:
+            continue
+        unit = loaded[1]
+        if _dsp_config_mode(r, unit) != "AB+C":
+            continue
+        # the addend: the immediate most recently written to this DSP's AB input
+        addend = None
+        for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            found = _dsp_ab_immediate(prog[j], unit)
+            if found is not None:
+                addend = found
+                break
+        # the cache word: the nearest preceding LITERAL bus address, as describe_registers does
+        address, pointer = None, False
+        for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            if _bus_addr_pointer(prog[j]):
+                pointer = True
+                break
+            found = _bus_addr(prog[j])
+            if found is not None:
+                address = found
+                break
+        if pointer or addend is None or address is None:
+            continue
+        if not cache_base <= address < cache_base + cache_words:
+            continue
+        # the register the sum is copied into, just after the config
+        for j in range(r.i + 1, min(r.i + 6, len(prog))):
+            target = _dsp_p_to_register(prog[j])
+            if target is not None:
+                word = address - cache_base
+                sums[f"REG{target}"] = {"source": f"cache[{word}] + 0x{addend:X}",
+                                        "cache_word": word, "addend": addend}
+                break
+    return sums
+
+
+def _dsp_config_mode(r, unit):
+    """The mode string a ``DSP_CFG{unit}`` write in this instruction configures, else None."""
+    for dest, minor, imm in ((r.d1, r.d1_minor, r.imm1), (r.d2, r.d2_minor, r.imm2)):
+        if dest == "DSP_CFG" and minor == unit:
+            mode = getattr(imm, "mode", None)
+            return getattr(mode, "name", None) or (mode if isinstance(mode, str) else None)
+    return None
+
+
+def _dsp_ab_immediate(r, unit):
+    """The immediate this instruction writes to ``DSP_AB{unit}``, else None."""
+    for dest, minor, src, imm in ((r.d1, r.d1_minor, r.s1, r.imm1),
+                                  (r.d2, r.d2_minor, r.s2, r.imm2)):
+        if dest == "DSP_AB" and minor == unit and src == "IMM":
+            return _resolve_imm(imm)
+    return None
+
+
+def _dsp_p_to_register(r):
+    """The register index this instruction copies a DSP output into (``DSP_P -> REGm``), else None."""
+    for dest, minor, src in ((r.d1, r.d1_minor, r.s1), (r.d2, r.d2_minor, r.s2)):
+        if dest == "REG" and src == "DSP_P":
+            return minor
+    return None
+
+
 def _dsp_pointer_config(r):
     """The DSP index a ``P+1`` config is written to (the walking pointer), else None.
     ``P+1`` means "from now on only increment", so this marks the cache-stream pointer DSP."""
@@ -1087,6 +2212,89 @@ def _dsp_pointer_config(r):
             if mode == "P+1" or getattr(mode, "name", None) == "P+1":
                 return minor
     return None
+
+
+def direct_command_words(acadia):
+    """``{channel: cache word}`` for direct DMA commands read from a FIXED cache address.
+
+    :func:`describe_cache_stream` handles the WALKING-pointer idiom (randomized benchmarking):
+    a DSP steps through a region of cached DMA words, one gate per pass. Not every streamed
+    sequence is built that way. ``BeamsplitterAmpDetuneCalibrationRuntime`` loads a plain
+    ``Register`` with ONE cache address and replays that single word inside a deterministic
+    ``loop(4N)`` -- no ``P+1`` DSP, no count word -- so the stream detector bails out and every
+    play is left symbolic with ``resolve_indeterminate`` (0 cycles) for its length.
+
+    Zero is badly wrong, and not only for the gate itself: 64 commands of length 0 collapse the
+    whole train, so the readout block after it is drawn ~1.2 us EARLY and the experiment's
+    structure disappears. The word is right there in the captured cache -- ``cache[0] = 0x19``
+    decodes as an ARB of 26 cycles (130 ns) -- so the length is recoverable exactly.
+
+    Nothing here needs the loop: the block containing the command is already unrolled once per
+    iteration by :meth:`SequenceTrace.execution_plan`. Only the LENGTH is missing.
+
+    Resolves the read address through either form acadia emits for a constant:
+    ``BUS_ADDR <- IMM`` directly, or ``BUS_ADDR <- REG`` where that register was loaded from an
+    immediate. A pointer that is stepped (``DSP_P``, or a register written more than once) is
+    deliberately NOT resolved here -- its value differs per play, which is the walking-pointer
+    case :func:`describe_cache_stream` owns.
+    """
+    prog = decode_program(acadia)
+    decoder = acadia._firmware.sequencer_bus_decoder
+    cache_base = decoder["cache"].address().value()
+    cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
+
+    def in_cache(value):
+        return value is not None and cache_base <= value < cache_base + cache_words
+
+    # registers loaded from an immediate, and how many times -- a register written more than
+    # once is being stepped, so its value is not a constant we may rely on
+    reg_value, reg_writes = {}, {}
+    for r in prog:
+        for dest, minor, src, imm in ((r.d1, r.d1_minor, r.s1, r.imm1),
+                                      (r.d2, r.d2_minor, r.s2, r.imm2)):
+            if dest != "REG":
+                continue
+            reg_writes[minor] = reg_writes.get(minor, 0) + 1
+            reg_value[minor] = _resolve_imm(imm) if src == "IMM" else None
+
+    constant_pointers = sorted({v for m, v in reg_value.items()
+                                if reg_writes.get(m) == 1 and in_cache(v)})
+
+    words = {}
+    for r in prog:
+        if not (r.comment and r.comment.startswith("Command DMA for")):
+            continue
+        if not ((r.d1 == "BUS_DATA" and r.s1 == "BUS_DATA")
+                or (r.d2 == "BUS_DATA" and r.s2 == "BUS_DATA")):
+            continue
+        match = re.match(r"Command DMA for (\w+)", r.comment)
+        if not match:
+            continue
+        address = None
+        for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            prev = prog[j]
+            if _bus_addr_pointer(prev):
+                address = None                     # stepped pointer: not a constant
+                break
+            literal = _bus_addr(prev)
+            if literal is not None:
+                address = literal
+                break
+            from_reg = any(d == "BUS_ADDR" and s == "REG"
+                           for d, s in ((prev.d1, prev.s1), (prev.d2, prev.s2)))
+            if from_reg:
+                # WHICH register drives BUS_ADDR is not in the decoded record -- the minor on
+                # this instruction is the destination bus port, not the source register (the
+                # same trap that made describe_registers name a wrong device). So resolve it
+                # only when the answer is unambiguous: exactly one register in the whole
+                # program was loaded, once, with a constant cache address. Anything else is
+                # left unresolved rather than guessed.
+                if len(constant_pointers) == 1:
+                    address = constant_pointers[0]
+                break
+        if in_cache(address):
+            words[match.group(1)] = address - cache_base
+    return words
 
 
 def describe_cache_stream(acadia):
@@ -1105,41 +2313,75 @@ def describe_cache_stream(acadia):
     """
     prog = decode_program(acadia)
 
-    # the played command: BUS_DATA issued straight to a channel's DMA, named in the comment
-    direct = None
+    # The played command: a runtime-fetched DMA word driven into a channel's data port, named in
+    # the comment. Two forms, and both are streams:
+    #
+    #   s == BUS_DATA   the cache read is issued in the same instruction (one push per pass)
+    #   s == REG        the read was latched into a register first, and the register is pushed
+    #
+    # dualrail_rb latches when `bs_repeats` issues the same word several times per pass, because a
+    # raw bus_read result is only valid for a few cycles after the read: measured on the loopback
+    # board, five unlatched pushes delivered the right word only twice (a 90-degree gate group
+    # read 91, 90, 4, 4, 15 degrees) and at 200 ns dropped two descriptors of every five.
+    #
+    # The latched form is accepted ONLY when every register-sourced push in the program is on ONE
+    # channel. The multi-rail XEB runtimes latch too -- three rails, three pointers, three
+    # registers -- and they are laid out by the register-gate path in machine.py instead. Firing
+    # here for them would model a single rail as the whole train.
+    direct, reg_directs = None, []
     for r in prog:
-        if (r.comment and r.comment.startswith("Command DMA for")
-                and ((r.d1 == "BUS_DATA" and r.s1 == "BUS_DATA")
-                     or (r.d2 == "BUS_DATA" and r.s2 == "BUS_DATA"))):
-            match = re.match(r"Command DMA for (\w+)", r.comment)
-            if match:
-                direct = (r.i, match.group(1))
-                break
+        if not (r.comment and r.comment.startswith("Command DMA for")):
+            continue
+        match = re.match(r"Command DMA for (\w+)", r.comment)
+        if not match:
+            continue
+        for dest, src in ((r.d1, r.s1), (r.d2, r.s2)):
+            if dest != "BUS_DATA":
+                continue
+            if src == "BUS_DATA":
+                if direct is None:
+                    direct = (r.i, match.group(1))
+            elif src == "REG":
+                reg_directs.append((r.i, match.group(1)))
+        if direct is not None:
+            break
+    if direct is None and reg_directs and len({c for _i, c in reg_directs}) == 1:
+        direct = reg_directs[0]
     if direct is None:
         return None
     direct_idx, channel = direct
-
-    # the walking pointer: the DSP reconfigured P+1 (loaded once, then only incremented)
-    cfg = next((c for r in prog if (c := _dsp_pointer_config(r)) is not None), None)
-    if cfg is None:
-        return None
 
     decoder = acadia._firmware.sequencer_bus_decoder
     cache_base = decoder["cache"].address().value()
     cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
 
-    # start_offset: the immediate loaded into that DSP's AB input (its first cache address)
-    start_offset = None
+    # The walking pointer: a DSP reconfigured P+1 ("from now on only increment") whose AB input
+    # is loaded with an address INSIDE the command cache.
+    #
+    # Both halves of that matter. Taking merely the first P+1 config in the program is wrong on
+    # every real runtime: DualRailRBRuntime configures four DSPs P+1 (the cooling-round and
+    # gate-sequence counters come first) and the cache pointer is the FOURTH. Picking DSP 0 found
+    # an AB immediate of 0, which is not a cache address, so the whole stream went undetected --
+    # the gate train then stayed a single symbolic BUS_DATA command and drew as one grey block
+    # instead of the individual gates. A synthetic case with one P+1 counter hides this
+    # completely, which is why the harness's own rb_stream case passed throughout.
+    #
+    # Pointing into the cache is what makes a counter a cache pointer, so select on that.
+    pointers = {c for r in prog if (c := _dsp_pointer_config(r)) is not None}
+    cfg = start_offset = None
     for r in prog:
-        addr = None
         for dest, minor, src, imm in ((r.d1, r.d1_minor, r.s1, r.imm1),
                                       (r.d2, r.d2_minor, r.s2, r.imm2)):
-            if dest == "DSP_AB" and minor == cfg and src == "IMM":
-                addr = _resolve_imm(imm)
-        if addr is not None:
-            if cache_base <= addr < cache_base + cache_words:
-                start_offset = addr - cache_base
+            if dest != "DSP_AB" or minor not in pointers or src != "IMM":
+                continue
+            addr = _resolve_imm(imm)
+            if addr is not None and cache_base <= addr < cache_base + cache_words:
+                cfg, start_offset = minor, addr - cache_base
+                break
+        if cfg is not None:
             break
+    if cfg is None:
+        return None
 
     # count_word: the cache read feeding the AB+C 'count' term of the final-pointer DSP
     count_word = None

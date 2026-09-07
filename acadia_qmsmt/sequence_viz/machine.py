@@ -26,10 +26,180 @@ The intra-block subschedule/barrier layout, the blocking-boundary gap model
 loop unrolling via ``execution_plan`` are shared with the rest of the tracer. Hardware-
 validated on the 4-channel loopback (see ``validation/``).
 """
+import re
 from dataclasses import replace
 
 from .tracing import (Destination, Placement, decode_program, edge_gap,
-                      MEASURED_BOUNDARY_OFFSET)
+                      DMA_STATUS_REGISTER)
+
+
+#: ``MASK`` value identifying a ``fifo_almost_empty`` poll, which releases one descriptor
+#: earlier than ``fifo_empty`` (``0x2``). See :func:`drain_block_issue`.
+ALMOST_EMPTY_MASK = 0x8
+
+
+
+#: A `repeat_until` whose exit condition names a DSP -- the loop counter. When that counter is
+#: also the cache POINTER the body reads its per-pass value through, the two facts together turn
+#: an "indeterminate (register)" length into the actual number for every pass.
+_LOOP_COUNTER_RE = re.compile(r"\b(DSP\d+)\b")
+
+
+def _pointer_length(trace, placement, command, seen):
+    """Cycles a ``cache[pointer]`` register holds on THIS read, or None.
+
+    The counting-round idiom (resonator_number_measurement): a DSP pointer is loaded with the
+    cache base plus a word index, configured ``P+1``, advanced by ``pulse_cep()``, and the loop
+    exits when it reaches a register holding base + index + words. The body reads its value with
+    ``bus_read(pointer)``. So the n-th read takes word ``index + n`` -- every term of which the
+    program carries:
+
+      * the pointer's starting address is a compile-time immediate (register_immediates),
+      * the cache base is a firmware constant (cache_base),
+      * and n is how many reads through THAT POINTER have already been laid down.
+
+    ``n`` counts per POINTER, not per (channel, register), and that distinction is the whole
+    point. One pass may read the pointer once per PAIRED MODE -- interleaved ladder-descent
+    cooling plays round r on every cavity before round r+1, so the lengths live round-major in
+    one cache and a single pointer walks them -- and counting per channel gave every cavity
+    ``word + 0, word + 1, ...`` instead of its own stride-K slice. Three cavities were then drawn
+    with the SAME swap length in each round (25, 151, 48 cycles on all three) when their level-1
+    swaps are 176 / 1073 / 344 ns apart, i.e. the picture claimed a cooling schedule the cache
+    does not contain. One shared counter reproduces the pointer exactly: reads are laid in
+    execution order, so read n is word index + n whichever channel it lands on.
+
+    WHICH pointer feeds the register is not in the compiled record -- ``bus_read(pointer)`` emits
+    ``BUS_ADDR <- DSP_P`` and the minor field there is the bus port, not the counter. It is taken
+    from the LOOP the command sits in instead: the exit condition names the counter, and in this
+    idiom the counter IS the pointer. When the enclosing loop's counter is not a cache pointer the
+    link is unknown and this returns None, so the length stays honestly indeterminate rather than
+    being resolved from a guess.
+    """
+    cache, base = trace.point_cache, trace.cache_base
+    if not cache or base is None:
+        return None
+    if (trace.registers or {}).get(command.symbolic, {}).get("source") != "cache[pointer]":
+        return None
+    for context in reversed(getattr(placement, "conditional", ()) or ()):
+        if context.get("kind") != "repeat_until":
+            continue
+        match = _LOOP_COUNTER_RE.search(context.get("condition") or "")
+        if not match:
+            continue
+        counter = match.group(1)
+        start = (trace.register_immediates or {}).get(counter)
+        if start is None:
+            continue
+        word = start - base
+        if word < 0:
+            continue                     # the counter is not a cache pointer at all
+        value = cache.get(word + seen.get(counter, 0))
+        if value is None:
+            return None
+        seen[counter] = seen.get(counter, 0) + 1
+        return int(value)
+    return None
+
+
+def _register_gate(trace, command, gate_index):
+    """Decode a gate word latched through a register, or None if this is not one.
+
+    The multi-rail XEB runtimes issue each gate as ``schedule_direct(channel, regs[n])`` after
+    ``regs[n].load(bus_read(pointers[n]))``, so the compiled command is ``REGn -> BUS_DATA``
+    rather than the ``BUS_DATA -> BUS_DATA`` form describe_cache_stream recognises. The word
+    itself is in the captured cache, so the gate is fully recoverable.
+
+    WHICH cache region belongs to WHICH channel is not stated anywhere in the program -- the
+    pointer DSP's index is not in the decoded record. It is therefore established from the DATA
+    and checked, not guessed: a region belongs to a channel only if its word decodes to an
+    address that names a pulse ON THAT CHANNEL (``addr_names``). A rail's gates live at
+    addresses that resolve for its own DAC and nowhere else, so a wrong pairing simply fails to
+    resolve and is rejected.
+    """
+    symbolic = command.symbolic
+    if not (symbolic and str(symbolic).startswith("REG")):
+        return None
+    # A CONTINUATION command's symbolic value is a LENGTH, not a command word. `use_stretch`
+    # splits a pulse into ARB / CONST_CONT / ARB_CONT and puts the register into the MIDDLE
+    # command's length field, so `symbolic` there names a hold length -- and decoding a length as
+    # a packed `(address << 16) | (length - 1)` invents both an address and a wrong duration.
+    # resonator_number_measurement's counting rounds are that shape: every ladder length was drawn
+    # one cycle too long, read one cache word too early, and attributed to a pulse the cache word
+    # never named. It looked plausible, which is what made it worth guarding rather than noticing.
+    if command.kind in ("CONST_CONT", "ARB_CONT"):
+        return None
+    source = (trace.registers or {}).get(symbolic, {}).get("source")
+    if source != "cache[pointer]":
+        return None
+    cache, names = trace.point_cache or {}, trace.addr_names or {}
+    if not cache or not names:
+        return None
+    try:
+        channel_num = int("".join(ch for ch in command.channel if ch.isdigit()))
+    except ValueError:
+        return None
+
+    starts = trace.register_stream_starts
+    if command.channel not in starts:
+        # First gate on this channel: find the cache offset whose word names a pulse here.
+        #
+        # "names a pulse here" is NOT enough on its own. The rails hold DUPLICATES of the same
+        # shape, so one address can name a valid pulse on several channels at once -- measured:
+        # in the 3-rail XEB, address 196 is xeb_0_sqrtW on DAC10 and xeb_1_sqrtY on DAC3. Taking
+        # the first offset that merely resolved handed DAC3 rail 1's region, and rail 2's gates
+        # were then drawn with rail 1's LENGTH (33 cycles instead of 40). Where the register value
+        # could not be decoded at all the raw command word was used as a duration, which drew a
+        # 42.6 ms dwell for a 200 ns gate.
+        #
+        # Two rules make the choice unambiguous, both from the data rather than from a guess:
+        #   1. an offset already claimed by another channel is not a candidate -- each rail owns
+        #      a disjoint cache region;
+        #   2. an offset whose address resolves on EXACTLY ONE channel beats one that resolves
+        #      on several, so an ambiguous word is only ever used as a last resort.
+        # Each rail's gates are written CONTIGUOUSLY from its own cache base, so the non-zero
+        # words form one cluster per rail (measured: offsets 0,1 | 16,17 | 32,33 at depth 2, and
+        # 0,1 | 64,65 | 128,129 in a deeper run). Assign whole CLUSTERS, not single words: a
+        # cluster belongs to the one channel every word in it resolves on. Intersecting across
+        # the cluster kills the ambiguity that a single word cannot settle, and taking the
+        # cluster's FIRST offset keeps the gate order right -- picking merely the first word that
+        # resolved uniquely would start rail 1 at its SECOND gate and mislabel every one after.
+        clusters = []
+        for offset in sorted(cache):
+            if not int(cache.get(offset, 0)):
+                continue
+            if clusters and offset == clusters[-1][-1] + 1:
+                clusters[-1].append(offset)
+            else:
+                clusters.append([offset])
+        for cluster in clusters:
+            channels = None
+            for offset in cluster:
+                address = int(cache[offset]) >> 16
+                here = {ch for (ch, addr) in names if addr == address}
+                channels = here if channels is None else (channels & here)
+            if channels and len(channels) == 1:
+                only = next(iter(channels))
+                for chan_name, chan_start in list(starts.items()):
+                    if chan_start == cluster[0]:
+                        only = None                     # already claimed; leave it alone
+                        break
+                if only is not None and only == channel_num:
+                    starts[command.channel] = cluster[0]
+                    break
+        chosen = starts.get(command.channel)
+        if chosen is None:
+            return None
+
+    offset = starts[command.channel] + gate_index.get(command.channel, 0)
+    word = int(cache.get(offset, 0))
+    if not word:
+        return None
+    address = word >> 16
+    io_name, pulse = names.get((channel_num, address), (None, None))
+    if pulse is None:
+        return None
+    return {"length": (word & 0xFFFF) + 1, "address": address,
+            "pulse": pulse, "io_name": io_name}
 
 
 def _is_hold(r):
@@ -53,6 +223,37 @@ def drain_block_issue(acadia):
     next block playing. With the firmware detect/propagate terms it forms the same
     boundary gap a blocking edge pays (see :func:`~.tracing.edge_gap`): the next block
     still starts one boundary gap after the drain releases, not immediately.
+
+    WHICH drain it is matters, and the two are not interchangeable. The status bit polled is
+    written to ``MASK`` by the instruction just before the hold:
+
+    ==========  ====================  =====================================================
+    ``MASK``    primitive             releases when
+    ==========  ====================  =====================================================
+    ``0x1``     ``dma_running``       (blocking poll -- not a drain at all)
+    ``0x2``     ``fifo_empty``        the LAST descriptor is pulled
+    ``0x8``     ``fifo_almost_empty`` ONE DESCRIPTOR EARLIER than that
+    ==========  ====================  =====================================================
+
+    The two compile to byte-identical poll instructions -- only this mask differs -- so a model
+    that keys off the poll alone cannot tell them apart, and treating ``almost_empty`` as
+    ``fifo_empty`` puts every following block one descriptor late.
+
+    Both the masks and the one-descriptor offset are the firmware's, not a fitted constant.
+    ``acadia_dma.vhd`` publishes the DMA status bus as ``miso(1) <= fifo_empty`` (mask ``0x2``)
+    and ``miso(3) <= fifo_almost_empty`` (mask ``0x8``), which is what
+    ``Acadia.channel_is_fifo_empty`` / ``channel_is_fifo_almost_empty`` read; the FIFO is an XPM
+    macro with ``USE_ADV_FEATURES`` bit 11 enabled, whose ``almost_empty`` asserts while ONE word
+    is still queued. One descriptor earlier, exactly. The loopback then measures that offset
+    independently: ``batch_drain_almost`` ran 119.92 ns (24 cycles = one 120 ns descriptor) ahead
+    of the old prediction per drain, and 239.97 ns over two.
+
+    This is not a corner case. An audit of the 121 qudit-branch runtimes found
+    ``channel_is_fifo_empty`` in *none* of them and ``channel_is_fifo_almost_empty`` in all
+    seven that stream (dualrail_rb, xeb_1DR/2DR/3DR, beamsplitter_amp_detune_calibration):
+    they refill the FIFO while it is still playing, which is the whole point of the primitive.
+
+    :return: ``{nth: {"issue": cycles, "almost_empty": bool}}``
     """
     prog = decode_program(acadia)
     triggers = [r.i for r in prog if r.comment == "Trigger DMAs"]
@@ -63,7 +264,11 @@ def drain_block_issue(acadia):
             if _is_hold(prog[j]):
                 if prog[j].condition_invert:
                     nxt = triggers[nth + 1] if nth + 1 < len(triggers) else None
-                    drains[nth] = (nxt - j + 1) if nxt is not None else 0
+                    # the nearest preceding MASK write is the status bit this poll tests
+                    mask = next((prog[k].imm1 for k in range(j - 1, trigger - 1, -1)
+                                 if prog[k].d1 == "MASK"), None)
+                    drains[nth] = {"issue": (nxt - j + 1) if nxt is not None else 0,
+                                   "almost_empty": mask == ALMOST_EMPTY_MASK}
                 break
     return drains
 
@@ -80,6 +285,7 @@ def machine_layout(trace):
     self.unresolved = 0
     self.placements = []
     self.assumed_paths = set()
+    self.length_underflows = []      # per-layout, like the two above
     self.unsupported_paths = set()
 
     nth_of_block, nth = {}, -1
@@ -94,10 +300,42 @@ def machine_layout(trace):
     # Two clocks: `t_seq` is where the sequencer's program counter is; `cursor[c]` is
     # where channel c's DAC output has played to. A blocking block resynchronises them
     # for every channel; a non-blocking batch lets `t_seq` run ahead of the cursors.
+    # how many register-sourced gates have already been laid on each channel, so consecutive
+    # plays read consecutive cache words the way the walking pointer does
+    gate_index = {}
+    # how many reads through each cache POINTER have been laid down, which IS how far that
+    # pointer has walked -- same bookkeeping as gate_index, for lengths. Per POINTER, not per
+    # channel: one pass may read it once per paired mode (see _pointer_length).
+    pointer_reads = {}
     cursor, t_seq = {}, 0
-    for step, (index, iteration) in enumerate(plan):
+    # Instruction span of the gap the sequencer is currently paying, i.e. how long BEFORE t_seq
+    # the next block's descriptors start being pushed. Needed to tell a seamless continuation
+    # from a real bubble (see play_start below).
+    pending_issue = 0
+    # Per-channel FIFO state, which is what decides whether playback continues seamlessly.
+    # A channel drained to `fifo_empty` has NOTHING queued -- it stops and restarts at the next
+    # trigger. A channel drained to `fifo_almost_empty` still holds one descriptor, so it plays
+    # on, and commands pushed before it finishes continue without a bubble. The state belongs to
+    # the CHANNEL and outlives the drain block: in `batch_almost -> batch` an unrelated marker
+    # block runs in between, and the batched channel is still playing throughout it.
+    queued = {}
+    # Which blocks execute at all, for edge_gap to discount a skipped `test` body. A property of
+    # the PLAN, so it is computed once: rebuilding it per placement made the layout quadratic --
+    # 3000 placements meant 9.1 million dict lookups and 3 seconds, and pinning a loop to 1000
+    # passes took 12 s (100 000, which the panel's spin box allowed, never finished at all).
+    executed_nths = {nth_of_block.get(entry[0]) for entry in plan}
+    executed_nths.discard(None)
+    # Blocks with NO trigger of their own -- a `channel_synchronizer(trigger=False)` only queues,
+    # so nothing anchors it to a program address. `executed_nths` cannot speak for them, and a
+    # `test` arm built that way is invisible to the branch accounting unless it is named
+    # separately. Both are properties of the plan, so both are computed once (see the note above:
+    # rebuilding per placement made the layout quadratic).
+    executed_indices = {entry[0] for entry in plan}
+    unanchored_blocks = [i for i, b in enumerate(self.blocks)
+                         if nth_of_block.get(i) is None and (getattr(b, "conditional", ()) or ())]
+    for step, (index, iteration, path) in enumerate(plan):
         block = self.blocks[index]
-        placement = Placement(index=index, iteration=iteration,
+        placement = Placement(index=index, iteration=iteration, path=path,
                               trigger=block.trigger, blocking=block.blocking,
                               conditional=block.conditional)
         channels = {c.channel for c in block.commands}
@@ -106,10 +344,39 @@ def machine_layout(trace):
         # begins at whichever is later -- the sequencer reaching the block (t_seq) or
         # that channel finishing what it was already playing (cursor[c]). Lock-step
         # channels share one value -- a single block-wide start.
-        play_start = {ch: max(t_seq, cursor.get(ch, 0)) for ch in channels}
+        # A channel that is STILL PLAYING when this block's descriptors are pushed continues
+        # seamlessly -- the player pulls the next descriptor the moment it finishes the current
+        # one, so playback resumes at `cursor`, not at the trigger. It only restarts at the
+        # trigger if its FIFO had already run dry by the time the pushes arrived.
+        #
+        # The distinction is invisible after a `fifo_empty` drain (the FIFO is empty by
+        # definition) but decides the answer after `fifo_almost_empty`, which releases the
+        # sequencer while one descriptor is still queued. Measured on the loopback:
+        # `batch_almost -> batch` predicted 725 ns and measured 720.0 -- the model inserted a
+        # one-cycle bubble at cursor=157 / t_seq=158 that the hardware does not have. The same
+        # pair with a plain `fifo_empty` drain has cursor=157 / t_seq=182, a genuine 25-cycle
+        # bubble, and there the trigger IS the start -- which is why `batch -> batch` was right
+        # all along and only the almost_empty variants drifted.
+        push_start = t_seq - pending_issue
+        play_start = {}
+        for ch in channels:
+            at = cursor.get(ch, 0)
+            # STRICTLY inside the push window. A channel whose playout ends exactly ON
+            # push_start has not overlapped the pushes at all -- it finished as they began, so
+            # there is nothing queued behind it and it restarts at the trigger like any other.
+            # That boundary is precisely what a loop back-edge produces: on re-entry the cursor
+            # lands on push_start, and treating it as seamless shortened every pass after the
+            # first by 6 cycles. Measured on batch_in_loop_almost (dualrail_rb's exact shape):
+            # hardware is a uniform 390 ns/pass at loop_count 3,4,5, while `<=` gave 390 then
+            # 360, 360, 360 -- a drift that grows with the loop count (+30, +60, +90 ns).
+            seamless = queued.get(ch, False) and push_start < at < t_seq
+            play_start[ch] = at if seamless else max(t_seq, at)
         stream_here = False
-        # last descriptor length per channel, for the last-pulled drain time
+        # last descriptor length per channel, for the last-pulled drain time, and the one
+        # before it -- `fifo_almost_empty` releases a descriptor earlier than `fifo_empty`,
+        # so it needs both (see drain_block_issue)
         last_len = {}
+        prev_len = {}
         # each channel's block-relative end. For a cache stream this is the full period
         # cursor (the trailing fifo-refill period past the last gate), not just the last
         # gate's stop -- that trailing period is where the loop exit/drain happens and the
@@ -122,34 +389,119 @@ def machine_layout(trace):
         t_sub = 0
         for i_sub, group in enumerate(block.subschedules):
             per_channel, sub_len = {}, 0
+            # Commands already placed by a stream expansion: the repeat copies of the same word,
+            # and the per-pass extras that were laid between the gates. Checked BEFORE the stream
+            # branch, because a repeat copy IS a stream command and would otherwise expand the
+            # whole train again -- five copies of a three-gate train gave 75 pulses, not 15.
+            placed_by_stream = set()
             for command in group:
+                if id(command) in placed_by_stream:
+                    continue
                 if self._is_stream_command(command):
                     stream_here = True
                     start_rel = per_channel.get(command.channel, t_sub)
                     base = play_start[command.channel]
-                    end = self._expand_stream(command, placement, base + start_rel)
+                    # Everything else this subschedule puts on the stream's channel belongs to
+                    # EVERY pass of the loop, not once after it: the loop body is its own
+                    # subschedule holding the gate and whatever follows it (an inter-gate dwell).
+                    # Laying those after the train, as before, drew one dwell at the end and left
+                    # the gate period short by its duration.
+                    extras = [c for c in group
+                              if c.channel == command.channel
+                              and c is not command
+                              and not self._is_stream_command(c)]
+                    extra_len = sum(int(c.length or 0) for c in extras)
+                    # The same word issued more than once in a pass: dualrail_rb repeats a short
+                    # half-swap so the loop can keep up. Every such command is a stream command
+                    # on this channel, so counting them gives the repeat factor -- and they must
+                    # be expanded ONCE with that factor, not once each, or the model puts the
+                    # refill floor between copies that actually abut.
+                    same = [c for c in group
+                            if c.channel == command.channel and self._is_stream_command(c)]
+                    end = self._expand_stream(command, placement, base + start_rel,
+                                              per_pass_extra=extra_len, extras=extras,
+                                              repeats=len(same))
+                    placed_by_stream.update(id(c) for c in extras)
+                    placed_by_stream.update(id(c) for c in same[1:])
                     end_rel = end - base
                     per_channel[command.channel] = end_rel
+                    prev_len[command.channel] = 0
                     last_len[command.channel] = 0
                     sub_len = max(sub_len, end_rel - t_sub)
                     continue
                 length = command.length
                 resolution = command.resolution
-                if command.symbolic:
+                gate = _register_gate(self, command, gate_index)
+                if gate is not None:
+                    # A gate word latched through a REGISTER before being issued
+                    # (`regs[n].load(bus_read(pointers[n]))` then `schedule_direct(ch, regs[n])`
+                    # -- the multi-rail XEB idiom). The word is in the captured cache, so the
+                    # gate's length AND identity are known; without this it stayed symbolic and
+                    # drew as an indeterminate grey box captioned with the register name.
+                    length, resolution = gate["length"], "cache"
+                    command = replace(command, pulse=gate["pulse"], io_name=gate["io_name"],
+                                      address=gate["address"])
+                    gate_index[command.channel] = gate_index.get(command.channel, 0) + 1
+                elif command.symbolic == "BUS_DATA" and (self.direct_words or {}).get(
+                        command.channel) is not None and (self.point_cache or {}):
+                    # A direct DMA command replayed from a FIXED cache address: the word is in
+                    # the captured cache, so its length is known exactly rather than falling
+                    # back to `resolve_indeterminate` (0). Acadia packs an arbitrary command as
+                    # `(address << 16) | (length - 1)` (see compiled_log.parse), so the low 16
+                    # bits plus one are the cycles. Leaving it at 0 collapsed the whole train --
+                    # BeamsplitterAmpDetuneCalibration plays one 26-cycle word 64 times, and
+                    # drawing 64 zero-length commands put the readout after it ~1.2 us early.
+                    word = self.direct_words[command.channel]
+                    dma = self.point_cache.get(word)
+                    if dma is not None:
+                        length = (int(dma) & 0xFFFF) + 1
+                        resolution = "cache"
+                    else:
+                        length = command.length or 0
+                elif command.symbolic:
                     override = self.register_overrides.get(command.symbolic)
                     resolved = self.register_cycles.get(command.symbolic)
+                    if resolved is None and override is None:
+                        # a walking pointer read: the n-th read takes cache word index + n
+                        resolved = _pointer_length(self, placement, command, pointer_reads)
                     value = (override if override is not None else
                              resolved if resolved is not None else fallback)
                     length = int(value)
                     resolution = ("override" if override is not None
                                   else "cache" if resolved is not None
                                   else "fallback")
+                    # ONLY when the value is genuinely KNOWN to be zero. An unresolved length
+                    # also reads as 0 -- `fallback` is `resolve_indeterminate`, which defaults to
+                    # 0 -- and that means "we could not tell", not "the register held zero".
+                    # Treating those as underflows would draw a 21-second command on every trace
+                    # with an indeterminate length, which is far more misleading than the bug
+                    # being guarded against.
+                    if length == 0 and resolution in ("cache", "override"):
+                        # ZERO UNDERFLOWS -- and the board does something enormous, so the picture
+                        # must not quietly show nothing. `Acadia.command_dma` emits `length - 1`
+                        # (system.py), so a register holding 0 becomes -1, i.e. an all-ones length
+                        # field: 2**16-1 cycles for an ARB command, 2**32-1 for a 32-bit DWELL or
+                        # CONST_CONT -- 328 us and ~21 SECONDS respectively, per shot, instead of
+                        # nothing at all.
+                        #
+                        # This is not hypothetical. dual_rail_ramsey._delay_cycles floors its
+                        # register dwell at 1 cycle for exactly this reason and says so; a delay
+                        # sweep that starts at 0 is otherwise a 21-second first point. Drawing it
+                        # as a 0-length command would hide the single most confusing failure a
+                        # length sweep can produce, so it is modelled and flagged instead.
+                        width_bits = 16 if command.kind in ("ARB", "ARB_CONT") else 32
+                        length = (1 << width_bits) - 1
+                        resolution = "underflow"
+                        self.length_underflows.append(
+                            {"channel": command.channel, "kind": command.kind,
+                             "register": command.symbolic, "cycles": length})
                     self.unresolved += 1
                 start_rel = per_channel.get(command.channel, t_sub)
                 placement.commands.append(replace(
                     command, start=play_start[command.channel] + start_rel,
                     length=length, resolution=resolution))
                 per_channel[command.channel] = start_rel + length
+                prev_len[command.channel] = last_len.get(command.channel, 0)
                 last_len[command.channel] = length
                 sub_len = max(sub_len, per_channel[command.channel] - t_sub)
             for ch, end_rel in per_channel.items():
@@ -170,22 +522,51 @@ def machine_layout(trace):
         for ch in channels:
             cursor[ch] = chan_end.get(ch, play_start[ch])
 
-        # gap to whatever executes NEXT (loop back-edges included)
-        if placement.blocking and step + 1 < len(plan):
+        # gap to whatever executes NEXT (loop back-edges included).
+        # Computed for a drain block as well as a blocking one: a drain's issue span has the
+        # same address-order-vs-execution-order problem every other edge has (below).
+        drain_edge = None
+        if (placement.blocking or nth_of_block.get(index) in drains) and step + 1 < len(plan):
             from_nth = nth_of_block.get(index)
-            to_nth = nth_of_block.get(plan[step + 1][0])
+            # The next block ANCHORED IN THE PROGRAM, not simply the next one executed. A
+            # `channel_synchronizer(trigger=False)` block emits no DMA trigger, so it has no
+            # trigger address and no entry here -- and the old lookup then found None and gave
+            # up, charging NOTHING for the whole stretch: the queued block's own command pushes,
+            # the `channel_trigger` bus write that fires them, and the condition-plus-branch of
+            # every `test` arm skipped along the way. Measured on the loopback (test_chain,
+            # trigger=False, arm 0 taken) the sequencer really spends 75 ns on that stretch with
+            # no skips at all, plus 25 ns for each arm skipped, while the model predicted a flat
+            # 305 ns for 1, 2, 4 and 8 arms alike. Looking ahead to the next block that DOES have
+            # a trigger puts those instructions back inside one edge, which is where the hardware
+            # pays them: the sequencer fetches straight through the queued blocks without
+            # stopping, because there is nothing to stop for until something is triggered.
+            to_nth, ahead = None, step + 1
+            while ahead < len(plan):
+                to_nth = nth_of_block.get(plan[ahead][0])
+                if to_nth is not None:
+                    break
+                ahead += 1
             if from_nth is not None and to_nth is not None:
-                edge = edge_gap(self.control_flow, from_nth, to_nth)
-                if edge:
+                # Which trigger-less `test` arms lie on THIS stretch, and which of them ran.
+                # In program order, because the compiled branches are in program order too, so
+                # the k-th such branch the path walk meets is the k-th arm here.
+                arms = [i in executed_indices for i in unanchored_blocks
+                        if index < i < plan[ahead][0]]
+                edge = edge_gap(self.control_flow, from_nth, to_nth, executed_nths, arms)
+                drain_edge = edge
+                if edge and not placement.blocking:
+                    pass          # a drain block carries no gap_after; it advances t_seq below
+                elif edge:
                     detect = self.gap_terms.get("detect", 3)
                     propagate = self.gap_terms.get("propagate", 2)
                     total = (detect + edge["issue"] + propagate
-                             + MEASURED_BOUNDARY_OFFSET + edge["branch_penalty"])
+                             + DMA_STATUS_REGISTER + edge["branch_penalty"])
                     placement.gap_after = total
+                    pending_issue = edge["issue"]
                     placement.gap_breakdown = {
                         "total": total, "detect": detect, "issue": edge["issue"],
                         "propagate": propagate,
-                        "measured_offset": MEASURED_BOUNDARY_OFFSET,
+                        "status_register": DMA_STATUS_REGISTER,
                         "branch_penalty": edge["branch_penalty"],
                         "edge": edge["kind"]}
 
@@ -196,18 +577,62 @@ def machine_layout(trace):
             # of playout minus that last (still-playing) descriptor. The sequencer then
             # still spends one boundary gap issuing the next block's pushes+trigger, so
             # the next block plays at last-pulled + that gap, not immediately.
+            #
+            # `fifo_almost_empty` asserts ONE DESCRIPTOR EARLIER than `fifo_empty`, so it also
+            # backs off the descriptor before the last one. Both compile to the same poll and
+            # differ only in the polled MASK bit; see drain_block_issue for the measurement.
+            drain = drains[nth]
             detect = self.gap_terms.get("detect", 3)
             propagate = self.gap_terms.get("propagate", 2)
-            gap = detect + drains[nth] + propagate + MEASURED_BOUNDARY_OFFSET
-            pulled = [cursor[ch] - last_len.get(ch, 0) for ch in channels]
-            t_seq = max([t_seq] + pulled) + gap
+            # Prefer the EXECUTED edge. drain_block_issue counts from the drain poll to the next
+            # trigger in ADDRESS order, which is only the next executed block when control falls
+            # straight through. Inside a loop the next block executed is the loop head, reached
+            # backwards over the branch, so the address-order span charges the wrong instructions
+            # -- one cycle too many per pass here, which a loop then multiplies (batch_in_loop
+            # measured exactly 5.00 ns x (loop_count - 1): 5.05 / 10.12 / 15.12 / 19.97 / 25.01 ns
+            # at loop_count 2..6). edge_gap already walks the taken path and charges the branch,
+            # so it is the authority whenever it resolves the edge.
+            issue = drain_edge["issue"] if drain_edge else drain["issue"]
+            penalty = drain_edge["branch_penalty"] if drain_edge else 0
+            pending_issue = issue
+            # this block's channels are the ones the drain polled
+            for ch in channels:
+                queued[ch] = drain["almost_empty"]
+            back = ((lambda ch: last_len.get(ch, 0) + prev_len.get(ch, 0))
+                    if drain["almost_empty"] else (lambda ch: last_len.get(ch, 0)))
+            pulled = [cursor[ch] - back(ch) for ch in channels]
+            release = max([t_seq] + pulled)
+            # `detect` is the latency between the FIFO status CHANGING and the sequencer seeing
+            # it. When the drain condition is already satisfied at the moment the poll executes
+            # there is no transition to wait for, and the poll costs one cycle less. That is only
+            # reachable when the release time does not run past the sequencer -- i.e. the batch
+            # was short enough that it had already emptied to the polled level.
+            #
+            # Measured directly by sweeping the descriptor count of an almost_empty drain
+            # (batch_drain_almost, batch_resync_pulses 2..10): n=2 missed by exactly one cycle per
+            # drain (-4.94 ns, then -9.97 ns cumulative over two), while n=3,4,5,6,8,10 all agreed
+            # to <=0.19 ns. With 2 descriptors the "one word left" level is reached as soon as the
+            # first is pulled, so the condition is true on arrival; with 3 or more the sequencer
+            # genuinely waits.
+            already_true = max(pulled, default=0) <= t_seq
+            # The state register is charged only when there IS a transition to wait for; see
+            # DMA_STATUS_REGISTER. Arithmetically identical to the two constants this replaces
+            # (detect - 1 ... + 1), but it says which cycle of hardware is being counted.
+            gap = (detect + issue + propagate + penalty
+                   + (0 if already_true else DMA_STATUS_REGISTER))
+            t_seq = release + gap
         elif placement.blocking or stream_here:
             # blocking block (or a cache stream whose post-loop drain holds the whole
             # sequencer): playout completes for every channel before the next block.
             t_seq = placement.stop + placement.gap_after
             for ch in channels:
                 cursor[ch] = t_seq
-        # else: a plain non-blocking batch -- t_seq unchanged, channels keep playing.
+                queued[ch] = False     # a blocking block waits for playout: nothing left queued
+        else:
+            # a plain non-blocking batch: t_seq unchanged, channels keep playing. No new gap was
+            # paid, so there is no fresh push window either -- clear it rather than let the
+            # previous block's issue span widen the seamless-continuation band below.
+            pending_issue = 0
 
         self.placements.append(placement)
     return self
