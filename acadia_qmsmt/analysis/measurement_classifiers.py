@@ -106,3 +106,47 @@ class MaximalVarianceAxisClassifier(RealQuadratureClassifier):
         i_center = (np.min(data_rotated.real) + np.max(data_rotated.real)) / 2
         data_centered = data_rotated - i_center
         return super().classify(data_centered)
+
+# added this 
+class MaximalVarianceReal(UnsupervisedClassifier):
+    """
+    Finds the rotation axis that maximises variance along the real axis (same as
+    MaximalVarianceAxisClassifier), but returns the continuous rotated+centred real
+    values instead of thresholded 0/1 labels.
+
+    Useful when readout blobs are not cleanly separated and you want to preserve
+    analog SNR rather than hard-threshold to binary outcomes.
+    """
+
+    def __getstate__(self):
+        raise ValueError("A MaximalVarianceReal has no state.")
+
+    def __setstate__(self, state: dict):
+        if len(state) == 0:
+            return
+        raise ValueError("A MaximalVarianceReal has no state.")
+
+    def classify(self, data: NDArray) -> NDArray:
+        def std_q(theta_):
+            return np.std((data * np.exp(1j * theta_)).imag)
+
+        angle = minimize_scalar(std_q, bounds=[0, 2*np.pi]).x
+        data_rotated = data * np.exp(1j * angle)
+        i_center = (np.min(data_rotated.real) + np.max(data_rotated.real)) / 2
+        return (data_rotated - i_center).real
+
+class Real(UnsupervisedClassifier):
+    """
+    returns real part of data
+    """
+
+    def __getstate__(self):
+        raise ValueError("A real has no state.")
+
+    def __setstate__(self, state: dict):
+        if len(state) == 0:
+            return
+        raise ValueError("A real has no state.")
+
+    def classify(self, data: NDArray) -> NDArray:
+        return data.real
