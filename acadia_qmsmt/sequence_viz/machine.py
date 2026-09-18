@@ -101,6 +101,133 @@ def _pointer_length(trace, placement, command, seen):
     return None
 
 
+#: Command kinds whose register operand is a PACKED ``(address << 16) | (length - 1)``
+#: waveform_dma_command rather than a bare number of cycles. Only ``schedule_direct`` issues
+#: one, and it compiles to an ARB. Every other kind's operand is a plain cycle count:
+#: ``CONST_CONT`` / ``ARB_CONT`` hold the middle of a ``use_stretch`` pulse, and ``DWELL`` is a
+#: wait -- on an ADC just as often as on a DAC. This is an ALLOW-list on purpose: excluding the
+#: continuations one by one left DWELL decoding as a command word, which is how an ADC capture
+#: dwell came back named after a DAC pulse and one cycle too long.
+PACKED_COMMAND_KINDS = ("ARB",)
+
+
+def _dac_num(trace, channel):
+    """The DAC number for a command's channel, or None when the channel is not a DAC.
+
+    ``addr_names`` is built for DAC channels ONLY and is keyed by ``channel.num()``
+    (tracing._pulse_address_map), so a command's channel has to be mapped through the trace's
+    own DAC table before it can be looked up there -- and a channel missing from that table must
+    NOT be looked up at all.
+
+    Stripping the digits out of the channel string instead makes ``ADC1`` and ``DAC1`` the same
+    key. Measured: a capture dwell on ADC1 held a bare 54 cycles, which decodes to address 0;
+    address 0 names the first slot of the Trotter train on DAC1, so the dwell was drawn as
+    ``trotter_leg2_0000`` and 55 cycles -- a wrong name and an off-by-one duration, on a channel
+    that cannot play a pulse at all.
+    """
+    table = getattr(trace, "dac_channel_nums", None)
+    if not table:
+        # An older trace with no table: refuse rather than guess. Declining to decode leaves a
+        # raw length, which is honest; guessing the channel invents a name and a duration.
+        return None
+    return table.get(str(channel))
+
+
+def _packs_commands(trace, dac):
+    """True if the captured cache holds packed DMA command words for ``dac``, not bare lengths.
+
+    Judged from the cache as a whole and memoised per DAC: at least one word must decode to a
+    NON-ZERO address that names a pulse on this DAC. Lengths are all below 0x10000, so a cache
+    of lengths has an all-zero address field in every word and cannot pass.
+    """
+    cache = trace.point_cache or {}
+    names = trace.addr_names or {}
+    if not cache or not names:
+        return False
+    memo = getattr(trace, "_packs_commands_memo", None)
+    if memo is None:
+        memo = {}
+        try:
+            trace._packs_commands_memo = memo
+        except AttributeError:                                   # a frozen trace: judge afresh
+            memo = {}
+    if dac not in memo:
+        memo[dac] = any((int(v) >> 16) and (dac, int(v) >> 16) in names for v in cache.values())
+    return memo[dac]
+
+
+def _pointer_gate(trace, placement, command, seen, sub_reads=None):
+    """Resolve a ``cache[pointer]`` command from the pointer's OWN arithmetic. Never None.
+
+    ``_pointer_length`` already knows exactly which cache word a given read takes -- start
+    address, cache base and the per-pointer read count are all in the program -- so for a
+    pointer-fed command there is nothing to guess about WHICH word applies. What it cannot do on
+    its own is say what KIND of number that word is, and the two idioms that put such a register
+    into a command's length field carry different kinds:
+
+      * a CONTINUATION command (CONST_CONT / ARB_CONT) holds a bare hold length. ``use_stretch``
+        splits a pulse into ARB / CONST_CONT / ARB_CONT and puts the register in the middle
+        command; the counting rounds' ladder descent walks a cache of exactly these.
+      * an ARB command is a ``schedule_direct``, whose operand is a PACKED
+        ``(address << 16) | (length - 1)`` waveform_dma_command.
+
+    Reading the first as the second invents an address and a wrong duration. Reading the second
+    as the first is what drew the controlled-swap Trotter train's words 524295 / 1048583 /
+    1572871 as 524 us / 1.0 ms / 1.6 ms dwells -- a 37.9 SECOND sequence for a 40 ns pulse
+    train, which is the "lots of gap" the viewer showed.
+
+    This is the general path that ``_register_gate``'s region clustering is not: the pointer
+    hands over the word and the COMMAND hands over the channel, so the address is looked up on
+    the DAC that is actually playing it. A train that interleaves both legs' words into ONE
+    cache region -- which the clustering cannot attribute, since every address then resolves on
+    both DACs -- resolves here without ambiguity.
+    """
+    # A register already read in THIS subschedule keeps its value: one bus_read, one word,
+    # however many channels are padded from it. Only the first command through here consumes a
+    # step of the pointer's walk.
+    if sub_reads is not None and command.symbolic in sub_reads:
+        word = sub_reads[command.symbolic]
+    else:
+        word = _pointer_length(trace, placement, command, seen)
+        if sub_reads is not None and word is not None:
+            sub_reads[command.symbolic] = word
+    if word is None:
+        return None
+    bare = {"length": int(word), "pulse": command.pulse, "io_name": command.io_name,
+            "address": command.address}
+    # Only a schedule_direct (an ARB) carries a packed command word. A continuation's register
+    # IS a length, and so is a DWELL's -- nothing to decode in either.
+    if command.kind not in PACKED_COMMAND_KINDS:
+        return bare
+    dac = _dac_num(trace, command.channel)
+    if dac is None:                      # not a DAC: it has no pulse address space at all
+        return bare
+    address, length = int(word) >> 16, (int(word) & 0xFFFF) + 1
+    names = trace.addr_names or {}
+    named = names.get((dac, address))
+    if named is None or not _packs_commands(trace, dac):
+        # Not a command word -- left as the raw value rather than decoded into a duration
+        # nothing supports. Two ways to fail: the decoded address names no pulse on this DAC,
+        # or the cache this pointer walks does not hold command words at all.
+        #
+        # The second test is what makes address 0 safe. A bare length SMALLER than 0x10000 --
+        # every length is -- decodes to address 0, and address 0 nearly always names some pulse,
+        # so `named is not None` alone would read a 25-cycle hold as "address 0, 26 cycles". The
+        # region test settles it from the data: a cache of packed commands contains words with a
+        # NON-ZERO address field, and a cache of lengths cannot (a length that large would be a
+        # 0.3 ms pulse). The Trotter train's own first slot IS at address 0, so excluding address
+        # 0 outright would have mis-drawn it -- the region has to be judged as a whole.
+        return bare
+    # addr_names maps (channel num, word addr) -> (IO NAME, PULSE), in that order
+    # (tracing.py:262, and tracing.py:382 unpacks it the same way). Reversing the two puts the
+    # slot name in io_name, and SequenceTrace.envelope looks its samples up under
+    # (io_name, pulse) -- so the waveform silently vanished and every train pulse drew as a
+    # plain box even though all 760 slot envelopes were sitting in loaded_envelopes.
+    io_name, pulse = (named if isinstance(named, tuple) and len(named) == 2
+                      else (command.io_name, named))
+    return {"length": length, "pulse": pulse, "io_name": io_name, "address": address}
+
+
 def _register_gate(trace, command, gate_index):
     """Decode a gate word latched through a register, or None if this is not one.
 
@@ -126,7 +253,7 @@ def _register_gate(trace, command, gate_index):
     # resonator_number_measurement's counting rounds are that shape: every ladder length was drawn
     # one cycle too long, read one cache word too early, and attributed to a pulse the cache word
     # never named. It looked plausible, which is what made it worth guarding rather than noticing.
-    if command.kind in ("CONST_CONT", "ARB_CONT"):
+    if command.kind not in PACKED_COMMAND_KINDS:
         return None
     source = (trace.registers or {}).get(symbolic, {}).get("source")
     if source != "cache[pointer]":
@@ -134,9 +261,8 @@ def _register_gate(trace, command, gate_index):
     cache, names = trace.point_cache or {}, trace.addr_names or {}
     if not cache or not names:
         return None
-    try:
-        channel_num = int("".join(ch for ch in command.channel if ch.isdigit()))
-    except ValueError:
+    channel_num = _dac_num(trace, command.channel)
+    if channel_num is None:              # not a DAC: it has no pulse address space at all
         return None
 
     starts = trace.register_stream_starts
@@ -389,6 +515,16 @@ def machine_layout(trace):
         t_sub = 0
         for i_sub, group in enumerate(block.subschedules):
             per_channel, sub_len = {}, 0
+            # ONE REGISTER IN ONE SUBSCHEDULE IS ONE READ. A bus_read loads a register once,
+            # and every channel the block pads from it uses that SAME value -- so the counting
+            # rounds' hold and all the companion dwells beside it share a word. Walking the
+            # pointer per COMMAND instead gave each channel the next cache word: a 108-cycle
+            # hold drawn beside dwells of 53, 154, 76 and 77, and further down the block the
+            # walk ran past the written words and produced lengths of -1.
+            #
+            # Keyed by register, so the streamed train is unaffected: its four schedule_direct
+            # per pass come from four DISTINCT registers (REG0..REG3), each its own read.
+            sub_reads = {}
             # Commands already placed by a stream expansion: the repeat copies of the same word,
             # and the per-pass extras that were laid between the gates. Checked BEFORE the stream
             # branch, because a repeat copy IS a stream command and would otherwise expand the
@@ -432,6 +568,13 @@ def machine_layout(trace):
                 length = command.length
                 resolution = command.resolution
                 gate = _register_gate(self, command, gate_index)
+                if gate is None:
+                    # The clustering could not attribute a cache region to this channel. Fall
+                    # back to the pointer's own arithmetic, which needs no attribution at all.
+                    # Consumes one read of the pointer, so the generic `elif command.symbolic`
+                    # branch below must NOT call _pointer_length again -- it no longer does.
+                    gate = _pointer_gate(self, placement, command, pointer_reads,
+                                         sub_reads)
                 if gate is not None:
                     # A gate word latched through a REGISTER before being issued
                     # (`regs[n].load(bus_read(pointers[n]))` then `schedule_direct(ch, regs[n])`
@@ -461,9 +604,10 @@ def machine_layout(trace):
                 elif command.symbolic:
                     override = self.register_overrides.get(command.symbolic)
                     resolved = self.register_cycles.get(command.symbolic)
-                    if resolved is None and override is None:
-                        # a walking pointer read: the n-th read takes cache word index + n
-                        resolved = _pointer_length(self, placement, command, pointer_reads)
+                    # No _pointer_length call here: a cache[pointer] register is resolved
+                    # above by _pointer_gate, which consumes the read. Calling it again would
+                    # advance the per-pointer counter twice for one command and hand every
+                    # later read its successor's word.
                     value = (override if override is not None else
                              resolved if resolved is not None else fallback)
                     length = int(value)

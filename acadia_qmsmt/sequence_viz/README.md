@@ -10,6 +10,45 @@ view = sv.explore_folder("/path/to/data_folder")   # interactive, drag to zoom
 fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 ```
 
+## THE RULE: SeeQuence never hardcodes
+
+**SeeQuence is a decompiler, not a recogniser.** Every number it draws must be *derived* from
+the compiled program and the captured cache. A pulse name, channel index, DAC number, runtime
+class, address, length or step count written into `sequence_viz` source is a bug **even when the
+picture looks right** — it makes the viewer agree with the one run you tested and silently lie
+about every other.
+
+```python
+# WRONG -- the viewer now only works for this one experiment
+if command.pulse == 'Q1C1_swap_count_stretch':
+    length = 154
+if dac == 10:
+    length = cache[637]
+
+# RIGHT -- read it out of the program/cache, keyed on KIND and on what the data says
+word = _pointer_length(trace, placement, command, seen)
+if command.kind in ('CONST_CONT', 'ARB_CONT'):
+    length = int(word)                      # a bare hold length
+else:                                       # a packed waveform_dma_command
+    length = (int(word) & 0xFFFF) + 1
+    pulse  = (trace.addr_names or {}).get((dac, int(word) >> 16))
+```
+
+The **only** literals allowed are protocol facts that come from acadia itself and hold for every
+program: the DMA packing `(address << 16) | (length - 1)` (hence `>> 16` and `& 0xFFFF`),
+acadia's own command-kind names (`ARB`, `ARB_CONT`, `CONST_CONT`, `DWELL`), and `ns_per_cycle`.
+The two genuinely *measured* constants are the documented exception and live in one place with
+their provenance: [`docs/EMPIRICAL_CONSTANTS.md`](docs/EMPIRICAL_CONSTANTS.md).
+
+Why it is stated this strongly: a hardcoded value does not fail loudly. It produces a picture
+that is right for the run you tested and wrong for the next one — and SeeQuence is the tool
+people use to decide whether a sequence is correct. A viewer that can be wrong silently is worse
+than no viewer at all.
+
+**How to test for it:** trace at least two runs with *different* configs — different pulse names,
+ladder depth, step counts, channels — and check both. If a change only helps one of them, it is
+recognition, not decoding, and it does not belong in `sequence_viz`.
+
 ## Layout
 
 | file | role |

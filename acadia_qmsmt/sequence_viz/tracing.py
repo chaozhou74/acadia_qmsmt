@@ -260,6 +260,12 @@ class SequenceTrace:
     # via `addr_names` (see describe_cache_stream / relayout). None when there is no stream.
     stream: Optional[dict] = None
     addr_names: dict = field(default_factory=dict)   # (channel num, word addr) -> (io, pulse)
+    # str(channel) -> channel.num(), for DAC channels ONLY. `addr_names` is keyed by DAC number,
+    # so anything looking a command up in it must map the command's channel through here first
+    # and give up when the channel is absent. Deriving the number by stripping digits out of the
+    # channel string instead makes ADC1 and DAC1 the same key, and the lookup then silently
+    # returns another channel's pulse. Built by _pulse_address_map from io.channel.is_dac.
+    dac_channel_nums: dict = field(default_factory=dict)
     point_cache: dict = field(default_factory=dict)  # this point's full cache, word -> value
     # Phase 2 execution-model layout (sequence_viz/machine.py), run in parallel behind a
     # `drain_blocks` maps a block=False batch's trigger index (nth) to the issue span of its
@@ -1645,11 +1651,16 @@ def _bus_data_load(r, dests):
 
 
 def _pulse_address_map(runtime):
-    """(channel number, word address) -> (io name, pulse name) for scheduled pulses."""
-    names, spc = {}, {}
+    """(channel number, word address) -> (io name, pulse name) for scheduled pulses.
+
+    Also returns str(channel) -> channel.num() for the DAC channels, which is the ONLY
+    supported way to turn a command's channel back into a key for the map above.
+    """
+    names, spc, dac_nums = {}, {}, {}
     for io_name, io in runtime._ios.items():
         if not io.channel.is_dac:
             continue
+        dac_nums[str(io.channel)] = io.channel.num()
         width = io.channel.interface_width_bytes
         spc[str(io.channel)] = getattr(io, "_samples_per_cycle", None)
         for pulse, entry in io._pulse_cache.items():
@@ -1657,14 +1668,14 @@ def _pulse_address_map(runtime):
             if mem is not None and getattr(mem, "_resource", None) is not None:
                 names[(io.channel.num(), mem._resource._resource_id // width)] = \
                     (io_name, pulse)
-    return names, spc
+    return names, spc, dac_nums
 
 
 def _build_trace(runtime, raw_blocks, resolve):
     """Build the structure. Times are filled in by :meth:`SequenceTrace.relayout`,
     which is re-run whenever a point with different register values is selected."""
     acadia = runtime.acadia
-    addr_names, spc = _pulse_address_map(runtime)
+    addr_names, spc, dac_nums = _pulse_address_map(runtime)
 
     channel_ios = {}
     for io_name, io in runtime._ios.items():
@@ -1723,6 +1734,7 @@ def _build_trace(runtime, raw_blocks, resolve):
     # A cache-pointer pulse stream (randomized benchmarking) is unrolled from the per-point
     # cache in relayout; store the decode map and the stream descriptor here.
     trace.addr_names = addr_names
+    trace.dac_channel_nums = dac_nums
     try:
         from .machine import drain_block_issue
         trace.drain_blocks = drain_block_issue(acadia)
