@@ -228,6 +228,61 @@ def _pointer_gate(trace, placement, command, seen, sub_reads=None):
     return {"length": length, "pulse": pulse, "io_name": io_name, "address": address}
 
 
+def _assign_regions_from_pointers(trace, names):
+    """Pair each streamed channel with its cache region, using the POINTERS' own immediates.
+
+    A multi-rail streamed runtime gives every rail its own ``CacheArray`` and its own pointer
+    DSP, loaded with ``cache_base + that array's index`` and stepped ``P+1``. Those loads are
+    compile-time immediates, so ``register_immediates`` already holds every region's first word
+    -- exactly the quantity ``_register_gate`` otherwise has to guess from where the zeros fall.
+
+    What is NOT in the record is which pointer feeds which channel, so that part is still settled
+    from the data, but now over a region whose extent is known rather than over a cluster whose
+    extent was inferred: a region belongs to the one channel on which EVERY non-zero word in it
+    decodes to a pulse address. The scan runs over every captured snapshot, not only the selected
+    point, so a point that wrote nothing (depth 0) costs nothing.
+
+    Writes into ``trace.register_stream_starts`` and returns nothing. Leaves it untouched when
+    there are fewer than two candidate regions, since one region cannot be attributed this way
+    and the caller's data-driven path is the better answer there.
+    """
+    base = trace.cache_base
+    if base is None or not names:
+        return
+    offsets = sorted({int(value) - int(base)
+                      for value in (trace.register_immediates or {}).values()
+                      if int(value) - int(base) >= 0})
+    if len(offsets) < 2:
+        return
+    # Every rail's array is the same length (they all hold `max(depths)` words), so the smallest
+    # gap between consecutive starts IS that length. Bounding the LAST region by it matters: it
+    # is what keeps the words after the gate arrays -- a family-selector cache, a length cache --
+    # out of the intersection, where a small value decodes to address 0 and can name a pulse.
+    span = min(b - a for a, b in zip(offsets, offsets[1:]) if b > a)
+    caches = [snapshot["cache"] for snapshot in (trace.snapshots or [])] or [trace.point_cache]
+
+    starts = trace.register_stream_starts
+    claimed = set(starts.values())
+    for start in offsets:
+        if start in claimed:
+            continue
+        channels = None
+        for cache in caches:
+            for offset in range(start, start + span):
+                word = int((cache or {}).get(offset, 0))
+                if not word:
+                    continue
+                here = {channel for (channel, address) in names if address == word >> 16}
+                channels = here if channels is None else (channels & here)
+        if channels and len(channels) == 1:
+            number = next(iter(channels))
+            for channel_name, channel_number in (trace.dac_channel_nums or {}).items():
+                if channel_number == number and channel_name not in starts:
+                    starts[channel_name] = start
+                    claimed.add(start)
+                    break
+
+
 def _register_gate(trace, command, gate_index):
     """Decode a gate word latched through a register, or None if this is not one.
 
@@ -267,6 +322,24 @@ def _register_gate(trace, command, gate_index):
 
     starts = trace.register_stream_starts
     if command.channel not in starts:
+        # FIRST, the boundaries the PROGRAM states. Each rail's pointer DSP is initialised with
+        # `cache_base + its CacheArray's index`, and that immediate is in the compiled record
+        # (register_immediates), so the region starts do not have to be inferred from the data
+        # at all. Doing so is not a refinement -- the data-driven version below reads the rail
+        # boundaries off the ZEROS between the regions, so it only works while some word in
+        # every rail's region is still unwritten. It therefore fails on exactly the two points
+        # a reader is most likely to look at:
+        #   * the DEEPEST point of a run, where every word of every region is written and the
+        #     three regions fuse into one cluster that intersects to no channel;
+        #   * a depth-0 point, where NOTHING is written, there are no clusters at all, and the
+        #     starts then stay empty for the whole trace because this dict persists.
+        # Measured on xeb_streamed_3DR_state_tomo with seq_lengths=[0, 2]: rails 1 and 2 drew
+        # their gates as ~26 ms and ~52 ms dwells (the raw register word used as a duration) and
+        # rail 3 drew rail 2's LENGTH. The same runtime with seq_lengths=[2, 4] was exact,
+        # which is the tell that this is about which point the layout happened to see first.
+        _assign_regions_from_pointers(trace, names)
+    if command.channel not in starts:
+        # No usable pointer immediates: fall back to reading the boundaries off the data.
         # First gate on this channel: find the cache offset whose word names a pulse here.
         #
         # "names a pulse here" is NOT enough on its own. The rails hold DUPLICATES of the same
