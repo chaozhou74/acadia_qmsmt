@@ -223,16 +223,24 @@ Two corollaries used throughout:
 
 **Edge detection vs. amplitude-varying back-to-back trains (measurement systematic).** The rising
 edge is taken at 50% of the *merged region's* peak — deliberate, because it is robust to ramp shape
-and pulse length (a low fixed threshold re-introduces the ramp bias above). But when back-to-back
-pulses of *different amplitude* merge into one region (e.g. `rb_stream`'s "8 basic gates" =
-lo/mid/hi), the low/mid gates never cross the high gate's half-max, so the detected edge latches
-onto the first *high* gate — the region reads late by (leading low gates) × (gate period). This is
-a **measurement** artifact, not a model error: the region *start* (first above-threshold sample)
-still matches the tracer to a few ns. Amplitude variation exists for gate-**identity** readability,
-which is orthogonal to timing — so for **timing** of a back-to-back train, use one amplitude
-(`rb_final_gate` makes the 8 final gates uniform; `rb_final_gate="rb_gate_hi"` validates to ~0–5 ns
-where the varying pattern reads ~70 ns late). Fixing the detector itself would need per-sub-pulse
-segmentation and would trade a well-understood artifact for a subtler one; not worth it.
+and pulse length (a low fixed threshold re-introduces the ramp bias above).
+
+**Mixed amplitudes in one region (fixed 2026-10-08).** When back-to-back pulses of different
+amplitude merge into one region, the half level used to come from the region's overall peak. A
+quiet leading pulse then never crossed it, and the edge latched onto the first LOUD pulse:
+`rb_stream`'s lo/mid/hi final block read 69.98 ns (2 gates) late, and `batch_uneven` (0.3-scale
+test_pulse, then 0.45-scale rb_gate_hi) read its batch 131.6 ns late. `_first_peak` now takes the
+half level from the region's FIRST local maximum, i.e. the first pulse's own plateau. A single
+pulse's first maximum is its peak, so nothing else moves. Re-scoring the whole archive changed
+every other case by at most 0.04 ns (worst overall 0.13 ns). batch_uneven now scores 0.04 ns
+and rb_stream 0.44 ns.
+
+**Pulses quieter than the crosstalk floor are invisible.** `REGION_FLOOR_FRACTION` (0.20 of the
+channel's maximum POWER) rejects crosstalk. A real pulse under it is rejected too: `rb_gate_lo`
+at scale 0.15 next to 0.45 is 11 % power, so every lo gate was dropped. rb_stream lost a region
+and split its final block, and rb_stream_uniform scored nothing ("7 vs 8 regions"). Its scale is
+now 0.25 (31 %). When designing a case, keep every pulse above ~25 % of the loudest one on the
+same channel, i.e. amplitude above half of it.
 
 ## Timing (straight-line + barriers)
 

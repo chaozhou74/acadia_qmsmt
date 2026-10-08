@@ -204,13 +204,6 @@ KNOWN_SYSTEMATIC = {
         "live CMACC quadrant of the loopback signal, which no static trace can know (the tracer "
         "correctly reports the block in assumed_paths). Only ch0's unconditional readout pulses are "
         "a timing result; a count mismatch on the conditional channel is expected, not an error.",
-    "rb_stream":
-        "the final '8 basic gates' block plays lo/mid/hi amplitudes back-to-back, merging into "
-        "one region; the 50%-of-region-peak rising edge then latches onto the first HIGH gate, "
-        "reading the block ~70 ns (2 gates) late. Measurement systematic, not a model error -- "
-        "the region START matches the tracer to ~5 ns. The amplitude variation is for gate "
-        "IDENTITY; for timing of that block, set rb_final_gate to one shape (rb_stream_uniform / "
-        "rb_final_gate='rb_gate_hi' validates to ~0-5 ns). The stream unroll itself is exact.",
 }
 
 
@@ -268,6 +261,23 @@ def pulse_regions_ns(runtime, label, threshold_sigmas=10.0):
             for a, b in regions if b > a and y[a:b + 1].max() >= floor]
 
 
+def _first_peak(y, a, b, peak):
+    """Level of the FIRST pulse in region y[a:b], for its half-level edge.
+
+    A region can hold several abutting pulses of different amplitude. Taking the half level from
+    the region's overall peak then skips every leading pulse that never reaches it: batch_uneven
+    (a 0.3-scale test_pulse followed by 0.45-scale rb_gate_hi) read its batch 131.6 ns late,
+    and rb_stream's lo/mid/hi block 2 gates late, both by latching onto the first LOUD pulse.
+    The first local maximum (held for two samples, above the region floor) is the first
+    pulse's plateau. A single pulse's first local maximum is its own peak, so nothing else moves.
+    """
+    floor = REGION_FLOOR_FRACTION * peak
+    for i in range(max(a, 1), min(b, len(y) - 2)):
+        if y[i] > floor and y[i] >= y[i - 1] and y[i] > y[i + 1] and y[i] > y[i + 2]:
+            return float(y[i])
+    return float(peak)
+
+
 def pulse_edges_ns(runtime, label, threshold_sigmas=10.0):
     """Rising-edge times of every pulse on one channel, in ns, sub-sample resolved."""
     t = np.asarray(runtime.t_data) * 1e9
@@ -281,7 +291,7 @@ def pulse_edges_ns(runtime, label, threshold_sigmas=10.0):
         b = int(np.searchsorted(t, stop_ns))
         if b <= a:
             continue
-        half = peak / 2.0
+        half = _first_peak(y, a, b, peak) / 2.0
         rising = np.where(y[max(a - 4, 1):b + 1] > half)[0]
         if not len(rising):
             continue

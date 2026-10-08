@@ -310,7 +310,7 @@ stimulus0:
       data: hann
       flat: 20e-9
       ramp: 10e-9
-      scale: 0.15
+      scale: 0.25  # was 0.15: (0.15/0.45)^2 = 11% power fell under REGION_FLOOR_FRACTION (20%) and every lo gate was discarded as crosstalk
       use_stretch: false
     rb_gate_mid:
       data: hann
@@ -518,7 +518,7 @@ stimulus1:
       data: hann
       flat: 20e-9
       ramp: 10e-9
-      scale: 0.15
+      scale: 0.25  # was 0.15: (0.15/0.45)^2 = 11% power fell under REGION_FLOOR_FRACTION (20%) and every lo gate was discarded as crosstalk
       use_stretch: false
     rb_gate_mid:
       data: hann
@@ -726,7 +726,7 @@ stimulus2:
       data: hann
       flat: 20e-9
       ramp: 10e-9
-      scale: 0.15
+      scale: 0.25  # was 0.15: (0.15/0.45)^2 = 11% power fell under REGION_FLOOR_FRACTION (20%) and every lo gate was discarded as crosstalk
       use_stretch: false
     rb_gate_mid:
       data: hann
@@ -934,7 +934,7 @@ stimulus3:
       data: hann
       flat: 20e-9
       ramp: 10e-9
-      scale: 0.15
+      scale: 0.25  # was 0.15: (0.15/0.45)^2 = 11% power fell under REGION_FLOOR_FRACTION (20%) and every lo gate was discarded as crosstalk
       use_stretch: false
     rb_gate_mid:
       data: hann
