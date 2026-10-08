@@ -238,9 +238,15 @@ class SequenceTrace:
     #: loop (`repeat_until(pointer == final)`) has both of its endpoints here, so its
     #: pass count is arithmetic rather than a guess -- see repeat_until_count.
     register_immediates: dict = field(default_factory=dict)
+    #: "REG4" -> [(program address, immediate or None), ...]: EVERY write to that register or
+    #: counter, in program order (describe_register_writes). A register reused for two loops
+    #: holds a different value at each, and the loop sees the LAST write before it starts.
+    register_writes: dict = field(default_factory=dict)
     #: "DSP1" -> the program addresses that PULSE that counter (describe_cep_sites). How many of
     #: them sit inside a loop's back-edge is how many cache words one pass of that loop walks.
     cep_sites: dict = field(default_factory=dict)
+    #: {program address: [pointer event, ...]} -- see describe_pointer_events
+    pointer_events: dict = field(default_factory=dict)
     cache_base: int = None           # bus address of cache word 0
     register_cycles: dict = field(default_factory=dict)   # resolved for this point
     #: "REG3" -> the compile-time immediate ADDED to its cache word. A register loaded as
@@ -448,11 +454,13 @@ class SequenceTrace:
                 "<": value < literal, "<=": value <= literal,
                 ">": value > literal, ">=": value >= literal}.get(operator)
 
-    def _operand_value(self, token):
+    def _operand_value(self, token, index=None):
         """Resolve a condition operand to an int, or None.
 
         A literal, or a register pinned by an override / fed from this point's cache.
-        Counters (DSPs) and anything unknown return None.
+        Counters (DSPs) and anything unknown return None. With ``index`` (the loop's first
+        block), a register whose last write before that loop was a constant takes THAT constant
+        -- a register reused for a second loop holds its second value there.
         """
         try:
             return int(token, 0)
@@ -460,6 +468,9 @@ class SequenceTrace:
             pass
         if token in self.register_overrides:
             return int(self.register_overrides[token])
+        entering = self._entering_immediate(token, index)
+        if entering is not None:
+            return int(entering)
         value = self.register_cycles.get(token)
         if value is not None:
             return int(value)
@@ -498,7 +509,7 @@ class SequenceTrace:
         target_token = right if left_dsp else left
         if self._is_stream_count(target_token):
             return None                      # the stream unroll owns this loop -- see _is_stream_count
-        target = self._operand_value(target_token)
+        target = self._operand_value(target_token, index)
         if target is None:
             return None
         # A counter reaches its exit value after (exit - start) increments. The start is 0 for
@@ -509,7 +520,8 @@ class SequenceTrace:
         # exactly that shape: `length_pointer.load(base + index)`, `final.load(base + index + N)`,
         # `repeat_until(length_pointer == final)` with `pulse_cep()` once per pass. Both endpoints
         # are compile-time immediates, so N is arithmetic.
-        start = self.register_immediates.get(counter, 0)
+        entering = self._entering_immediate(counter, index)
+        start = entering if entering is not None else self.register_immediates.get(counter, 0)
         count = target - int(start)
         if count < 0:
             return None
@@ -591,7 +603,46 @@ class SequenceTrace:
         target, branch = max(spans)
         return sum(1 for site in sites if target <= site <= branch) or 1
 
-    def _pointer_pair(self, condition):
+    def _loop_head(self, index):
+        """Program address where the loop whose body starts at block ``index`` begins, or None.
+
+        The innermost back-edge enclosing the block's trigger, as in pointer_cep_per_pass.
+        """
+        address = self.block_address(index) if index is not None else None
+        if address is None:
+            return None
+        spans = [(target, branch)
+                 for branch, target in ((self.control_flow or {}).get("back_branches") or ())
+                 if target <= address <= branch]
+        return max(spans)[0] if spans else None
+
+    def _entering_write(self, token, index):
+        """``(address, immediate or None)``: the last write to ``token`` before the loop at
+        ``index`` starts -- the value the loop actually sees. None when that cannot be told."""
+        head = self._loop_head(index)
+        writes = (self.register_writes or {}).get(token)
+        if head is None or not writes:
+            return None
+        before = [w for w in writes if w[0] < head]
+        return before[-1] if before else None
+
+    def _entering_immediate(self, token, index):
+        """The constant ``token`` holds when the loop at ``index`` starts, if its last write
+        before the loop was a constant load; else None (the whole-program value then applies)."""
+        entry = self._entering_write(token, index)
+        return None if entry is None else entry[1]
+
+    @staticmethod
+    def _advanced(advance, counter, load_at=None):
+        """Words earlier loops walked ``counter`` since the load this loop starts from. A pointer
+        RELOADED in between starts afresh, so what the earlier loops walked no longer counts."""
+        record = advance.get(counter)
+        if record is None:
+            return 0
+        words, since = record
+        return words if (load_at is None or since is None or since == load_at) else 0
+
+    def _pointer_pair(self, condition, index=None):
         """``(counter, operator, base, target)`` for a CACHE-POINTER comparison, else None.
 
         The streamed-gate idiom (both XEB runtimes, dualrail_rb): a DSP walks a region of the
@@ -618,10 +669,11 @@ class SequenceTrace:
                 continue
             if target not in self.register_cycles and target not in self.register_overrides:
                 continue
-            base = int(self.register_immediates[counter])
+            entering = self._entering_immediate(counter, index)
+            base = int(entering if entering is not None else self.register_immediates[counter])
             if self.cache_base is None or base < self.cache_base:
                 continue                      # not a pointer into the cache
-            value = self._operand_value(target)
+            value = self._operand_value(target, index)
             if value is None:
                 continue
             if self._is_stream_count(target):
@@ -652,7 +704,7 @@ class SequenceTrace:
         if pair is None:
             return None
         counter, operator, base, target = pair
-        equal = (base + advance.get(counter, 0)) == target
+        equal = (base + self._advanced(advance, counter)) == target
         return (not equal) if operator == "!=" else equal
 
     def _pointer_loop_count(self, context, advance, index=None):
@@ -670,11 +722,13 @@ class SequenceTrace:
         """
         if context.get("kind") != "repeat_until":
             return None
-        pair = self._pointer_pair(context.get("condition"))
+        pair = self._pointer_pair(context.get("condition"), index)
         if pair is None or pair[1] != "==":
             return None
         counter, _, base, target = pair
-        words = target - (base + advance.get(counter, 0))
+        entry = self._entering_write(counter, index)
+        words = target - (base + self._advanced(advance, counter,
+                                                None if entry is None else entry[0]))
         # A count outside the cache is not a count -- it is a mis-read. Fail safe: leave the loop
         # data-dependent rather than draw a train the cache cannot hold.
         if words < 0 or (self.point_cache and words > len(self.point_cache)):
@@ -778,11 +832,14 @@ class SequenceTrace:
                         self.nonterminating.add(self.construct_key(index, level))
                         self.nonterminating.add(index)
                     else:
-                        counter = self._pointer_pair(context.get("condition"))[0]
+                        counter = self._pointer_pair(context.get("condition"), index)[0]
                         # WORDS, not passes: the next loop sharing this pointer starts where this
-                        # one left the pointer, and a pass may have walked several words.
-                        advance[counter] = (advance.get(counter, 0)
-                                            + pointer_count * resolved_pointer[1])
+                        # one left the pointer, and a pass may have walked several words --
+                        # counted from the load this loop started from (see _advanced).
+                        entry = self._entering_write(counter, index)
+                        load_at = None if entry is None else entry[0]
+                        advance[counter] = (self._advanced(advance, counter, load_at)
+                                            + pointer_count * resolved_pointer[1], load_at)
                     continue
                 if pointer_count is not None:          # guard skips it: zero passes, no advance
                     self.repeat_counts[self.construct_key(index, level)] = 0
@@ -1236,7 +1293,9 @@ class SequenceTrace:
                 out.append(f"  -> {blk.gap_after * self.ns_per_cycle:.1f} ns dead "
                            f"before the next block "
                            f"(detect {g['detect']} + issue {g['issue']} + "
-                           f"propagate {g['propagate']} cycles)")
+                           f"propagate {g['propagate']} cycles"
+                           + (f", one-cycle join {g['one_cycle_join']}"
+                              if g.get("one_cycle_join") else "") + ")")
         if max_blocks is not None and len(self.blocks) > max_blocks:
             out.append(f"... {len(self.blocks) - max_blocks} more blocks")
         return "\n".join(out)
@@ -1499,6 +1558,13 @@ class Instr:
     op: Optional[str]
     comment: Optional[str]
     cep: Optional[int] = None
+    #: The SOURCE minors. For ``BUS_ADDR <- DSP_P`` -- what ``bus_read(pointer)`` compiles to --
+    #: this is the index of the DSP whose output drives the address, i.e. WHICH pointer was read.
+    #: It used to be dropped (only ``d1_minor``/``d2_minor`` were kept), and the tracer then had to
+    #: guess the pointer from the enclosing loop's counter. Checked on Z2HiggsSimulation's program:
+    #: on all 35 pointer reads it names the same DSP as the ``pulse_cep()`` that follows the read.
+    s1_minor: int = 0
+    s2_minor: int = 0
 
 
 def decode_program(acadia):
@@ -1521,7 +1587,9 @@ def decode_program(acadia):
                 conditional=bool(ins.conditional),
                 condition_invert=bool(ins.condition_invert),
                 op=ins.op, comment=ins.comment,
-                cep=_cep_dsp(ins)))
+                cep=_cep_dsp(ins),
+                s1_minor=int(ins.src1.minor) if ins.src1 is not None else 0,
+                s2_minor=int(ins.src2.minor) if ins.src2 is not None else 0))
     return prog
 
 
@@ -1629,10 +1697,9 @@ def _bus_addr_pointer(r):
     walks the cache, so there is no immediate to read. Distinguishing this from "no bus address
     here at all" matters -- see :func:`describe_registers`.
 
-    WHICH DSP drives it is deliberately not reported. The decoded record carries a minor only for
-    DESTINATIONS (``d1_minor``/``d2_minor``); on this instruction that is the bus port, not the
-    counter. Naming a specific "DSP0" from it would be inventing a fact -- the same class of
-    mistake as the wrong device label this predicate exists to remove.
+    WHICH DSP drives it is the SOURCE minor (``s1_minor``/``s2_minor``) -- see
+    :func:`describe_pointer_events`, which uses it. (The DESTINATION minor on this instruction is
+    the bus port, not the counter; reading the pointer from that would be inventing a fact.)
     """
     for dest, src in ((r.d1, r.s1), (r.d2, r.s2)):
         if dest == "BUS_ADDR" and src == "DSP_P":
@@ -1719,11 +1786,22 @@ def _build_trace(runtime, raw_blocks, resolve):
     except Exception:
         pass                    # a constant nobody could read is the old behaviour, not a failure
     try:
+        trace.register_writes = describe_register_writes(acadia)
+    except Exception:
+        pass                    # without it every loop reads the whole-program values, as before
+    try:
         # Where each counter is ADVANCED, which is how many cache words a pointer loop's body
         # walks per pass -- see SequenceTrace.pointer_cep_per_pass.
         trace.cep_sites = describe_cep_sites(acadia)
     except Exception:
         pass                    # one advance per pass is the old assumption, and the fallback
+    try:
+        # Every pointer load / advance / read and register latch, so the layout can replay them
+        # along the executed path (pointer_register_words) instead of guessing which pointer a
+        # register was read through.
+        trace.pointer_events = describe_pointer_events(acadia)
+    except Exception:
+        trace.pointer_events = {}
     try:
         # where the cache region starts on the bus, so an ABSOLUTE pointer immediate can be
         # turned into a cache WORD index
@@ -2012,6 +2090,130 @@ def edge_gap(control_flow, from_nth, to_nth, executed_nths=(), arms=()):
     return {"issue": issue, "branch_penalty": penalty, "kind": kind}
 
 
+def describe_pointer_events(acadia):
+    """``{program address: [event, ...]}`` -- every instruction that moves a cache POINTER or
+    latches a register through one. Read straight off the compiled program.
+
+    Events, in the order they apply within one instruction:
+
+      ``("ptr_load", n, word)``  DSP n's input loaded with an IMMEDIATE (``pointer.load(base +
+                                 index)``): from here on DSP n points at cache ``word`` (None
+                                 when the immediate is not a cache address)
+      ``("ptr_unknown", n)``     DSP n's input loaded from anything else -- position unknown
+      ``("cep", n)``             ``pulse_cep()`` on DSP n: the pointer steps one word on
+      ``("bus_ptr", n)``         ``BUS_ADDR <- DSP_P`` with source minor n: the next bus read is
+                                 through pointer n (``bus_read(pointer)``)
+      ``("bus_other",)``         any other BUS_ADDR write: the next read is not a pointer read
+      ``("reg_from_bus", m)``    ``BUS_DATA -> REGm``: register m latches whatever the bus reads
+      ``("reg_other", m)``       any other write to REGm: it no longer holds a pointer word
+
+    :func:`pointer_register_words` replays these along the executed path.
+    """
+    decoder = acadia._firmware.sequencer_bus_decoder
+    cache_base = decoder["cache"].address().value()
+    cache_words = acadia._firmware["sequencer_cache_memory"]["size_bits"] // 8
+    events = {}
+    for r in decode_program(acadia):
+        here = []
+        for dest, dminor, src, sminor, imm in ((r.d1, r.d1_minor, r.s1, r.s1_minor, r.imm1),
+                                               (r.d2, r.d2_minor, r.s2, r.s2_minor, r.imm2)):
+            if dest == "DSP_AB":
+                if src == "IMM":
+                    value = _resolve_imm(imm)
+                    word = (value - cache_base
+                            if value is not None and cache_base <= value < cache_base + cache_words
+                            else None)
+                    here.append(("ptr_load", dminor, word))
+                else:
+                    here.append(("ptr_unknown", dminor))
+            elif dest == "BUS_ADDR":
+                here.append(("bus_ptr", sminor) if src == "DSP_P" else ("bus_other",))
+            elif dest == "REG":
+                here.append(("reg_from_bus", dminor) if src == "BUS_DATA"
+                            else ("reg_other", dminor))
+        if r.cep is not None:
+            here.append(("cep", r.cep))
+        if here:
+            events[r.i] = here
+    return events
+
+
+def pointer_register_words(trace, plan, nth_of_block, executed_nths):
+    """For each step of ``plan``: ``{"REGm": cache word}`` for every register that, when that block
+    is triggered, holds a word read through a cache POINTER. None if the walk cannot be made.
+
+    This is the exact version of what :func:`machine._pointer_length` estimates. The estimate takes
+    the pointer from the enclosing loop's EXIT COUNTER and counts reads per counter as commands
+    are laid down. That is right when one pointer feeds the loop, and wrong as soon as a loop body
+    reads several pointers -- the Z2 Trotter step reads its LOC, L13-B, L13-A and L2 pointers
+    inside a loop counted on the LOC pointer, and PREFETCHES the next layer's words, so registers
+    are loaded long before (and in a different order from) the commands that use them.
+
+    Here nothing is estimated. The walk follows the program counter along the path that actually
+    executes -- the same branch decisions edge_gap costs, via :func:`_branch_is_taken` -- from the
+    start of the program to each executed block's trigger, and replays every pointer event on the
+    way: a pointer's position is its loaded immediate plus the ``pulse_cep()`` advances executed
+    since, and a register latched through pointer n holds that pointer's word AT THE READ.
+
+    ``trigger=False`` blocks anchor no program address; they take the state of the walk so far.
+    """
+    events = getattr(trace, "pointer_events", None)
+    cf = trace.control_flow or {}
+    triggers = cf.get("triggers")
+    if not events or not triggers:
+        return None
+    branch_at = dict(cf.get("branches") or [])
+    executed = {triggers[n] for n in (executed_nths or ()) if 0 <= n < len(triggers)}
+    position, bus, words = {}, None, {}
+    out, pc = [], 0
+    limit = 4 * (max(triggers) + len(branch_at) + 2)
+
+    def apply(at):
+        nonlocal bus
+        for event in events.get(at, ()):
+            kind = event[0]
+            if kind == "ptr_load":
+                position[event[1]] = event[2]
+            elif kind == "ptr_unknown":
+                position[event[1]] = None
+            elif kind == "cep":
+                if position.get(event[1]) is not None:
+                    position[event[1]] += 1
+            elif kind == "bus_ptr":
+                bus = event[1]
+            elif kind == "bus_other":
+                bus = None
+            elif kind == "reg_from_bus":
+                word = position.get(bus) if bus is not None else None
+                if word is None:
+                    words.pop(f"REG{event[1]}", None)
+                else:
+                    words[f"REG{event[1]}"] = word
+            elif kind == "reg_other":
+                words.pop(f"REG{event[1]}", None)
+
+    for index, _iteration, _path in plan:
+        nth = nth_of_block.get(index)
+        if nth is None:
+            out.append(dict(words))
+            continue
+        goal = triggers[nth]
+        for _ in range(limit):
+            apply(pc)
+            if pc == goal:
+                break
+            target = branch_at.get(pc)
+            if target is not None and _branch_is_taken(pc, target, goal, triggers, executed, []):
+                pc = target
+            else:
+                pc += 1
+        else:
+            return None                       # the walk did not reach the block: do not guess
+        out.append(dict(words))
+        pc = goal + 1
+    return out
+
+
 def describe_registers(acadia):
     """Work out where each sequencer register gets its value from.
 
@@ -2114,6 +2316,29 @@ def describe_immediates(acadia):
             if value is not None and name not in immediates:
                 immediates[name] = value
     return immediates
+
+
+def describe_register_writes(acadia):
+    """``{"REG4": [(address, 1900562 or None), ...]}`` -- every write to each register / counter.
+
+    The value is the immediate for a constant load and None for anything else (a cache read, a
+    DSP sum, a bus device). :func:`describe_immediates` keeps only the FIRST constant, which is
+    the right start for a counter that is loaded once. It is wrong for a register REUSED for a
+    second loop. controlled_swap_trotter_test loads ``final_pointer`` with the train's end (a
+    cache sum) and later RELOADS it with ``base + index + 2 * rounds`` for the counting loop, so
+    the counting loop was read as the train's 9 passes instead of 1. Passes 2..9 then took the
+    train's command words as stretch lengths and drew 22 ms swaps.
+    """
+    writes = {}
+    for r in decode_program(acadia):
+        for dest, minor, imm, src in ((r.d1, r.d1_minor, r.imm1, r.s1),
+                                      (r.d2, r.d2_minor, r.imm2, r.s2)):
+            if dest not in ("REG", "DSP_AB"):
+                continue
+            name = f"DSP{minor}" if dest == "DSP_AB" else f"REG{minor}"
+            value = _resolve_imm(imm) if src == "IMM" else None
+            writes.setdefault(name, []).append((r.i, value))
+    return writes
 
 
 def describe_cache_sums(acadia):

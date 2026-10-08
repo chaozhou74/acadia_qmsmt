@@ -483,6 +483,81 @@ fire today because that path is not reached for these runtimes.
 on both sides. The oracle is structurally blind to exactly the commands that were wrong -- which
 is why the loopback measurements, not the archive comparison, are the authority.
 
+### 10. A cache pointer was attributed to the loop counter (2026-10-07)
+
+The Z2 Higgs train reads each step's slot word through pointer DSPs, and several `P+1` DSPs
+were live at once. The layout guessed which one fed each `BUS_ADDR <- DSP_P` read, and it
+picked the loop counter. So the drawn train used the wrong cache words: wrong phases, and
+counting swaps of 30 ns instead of 130 ns. In count_detune the same misread showed up as
+12.8 ms "gaps".
+
+The source DSP IS in the compiled record. It is the read's `src1.minor`, which
+`decode_program` now keeps as `Instr.s1_minor`. It matched the following `pulse_cep` DSP on
+35 of 35 reads. `tracing.pointer_register_words` walks the EXECUTED path (branches resolved by
+the same `_branch_is_taken` as the layout) and replays every pointer load, `pulse_cep` and bus
+read. It returns the exact cache word in each register at each executed block, and
+`machine._exact_pointer_gate` uses it ahead of the older estimates. Board check: the Z2 whole
+shot (`z2_layer_check.py --vs-model --phases`, 3 and 2 links) matches on every line, with every
+phase within 0.33 deg.
+
+### 11. A one-cycle dwell join from idle releases 2 cycles early (2026-10-08)
+
+`dwell(one_cycle)` in a blocking synchronizer is the join that ends a feedback reset or a
+counting round. When it is the block's whole playout and every channel is idle at the trigger,
+the next block starts 2 cycles (10 ns) sooner than detect + issue + propagate + status
+predicts. `join_dwell_n` (marker, join, marker; `--scan join_dwell_n:join_cycles=...`) measured:
+
+| join | channels | channel still playing a batch | measured - old model |
+|---|---|---|---|
+| 1 cycle | 1 | no | -10.00 ns |
+| 1 cycle | 3 | no | -10.01 ns |
+| 1 cycle | 1 or 3 | yes | -0.01 ns |
+| 1 cycle, after a pulse on ANOTHER channel drained by fifo_almost_empty or fifo_empty (`join_marker=almost/empty`) | 1 | no | early, as the first rows |
+| 1 cycle, after a pulse on the SAME channel drained by fifo_almost_empty (`join_marker=almost_same`) | 1 | one descriptor still queued | not early |
+| 2, 3, 4, 5, 6, 8, 12, 20, 40 cycles | 1 or 3 | either | <= 0.05 ns |
+
+`machine.ONE_CYCLE_JOIN_EARLY = 2` is charged only when the join is the block's whole
+playout and every channel is idle. Idle means the channel starts at the trigger and nothing
+was left queued by an almost_empty drain (`tail_queued`). The second condition is needed
+because a cache stream's cursor lands exactly on the trigger. In xeb_streamed_1DR the join is
+on the gate-train channel, and a first version of the rule drew its readout 10 ns early. The
+board says it isn't (q1 interval 2570.1 ns measured, 2570 model). The charge shows up in
+the block's `gap_breakdown` as `one_cycle_join`. All 21 join points agree to <= 0.1 ns,
+`--revalidate` of the whole archive is unchanged (worst 0.05 ns), and `--dryrun all` is
+identical to before apart from the new case. Found because the Z2 counting rounds drew the
+next round 10 ns late on two lines (rf1, ro1) of the whole-shot comparison.
+
+### 12. A register reused for a second loop kept its first loop's value (2026-10-08)
+
+`controlled_swap_trotter_test` loads `final_pointer` with the train's end (a cache sum, base + 18)
+and later reloads it with an immediate (base + 2) for the counting loop. The loop resolver took
+one value per register for the whole program, so it read the counting loop as (18 - 0) / 2 = 9
+passes instead of 1. Passes 2-9 then took the train's command words as stretch lengths, and the
+counting swaps were drawn tens of milliseconds long.
+
+`tracing.describe_register_writes` now records every write to each register and counter, and a
+loop takes the LAST write before its head (`_entering_write`). Pointer advances carried over
+from earlier loops are dropped when the pointer is reloaded in between (`_advanced`). The
+counting loop now runs once, with holds of 63 / 75 cycles (315 / 375 ns), and the board measures
+312 / 378 ns. The fix is general: any register or pointer reused for a second loop gets the
+value the loop actually sees.
+
+### 13. Back-to-back block=False blocks were drawn starting in the same cycle (2026-10-08)
+
+After a plain non-blocking batch the layout left the sequencer clock where it was. So the next
+block, typically a second `block=False` arm on another channel, started in the same cycle. On
+hardware the sequencer first runs every instruction up to the next trigger (that block's pushes,
+its trigger, and the condition and branch of any `test` on the way). The clock now advances by
+that executed path (`_executed_path`, the same walk the blocking edges use).
+
+`join_dwell_n` with `join_batch_channels=2` (two pulses on two channels, each in its own
+block=False synchronizer, then a join) measured 389.98 ns. The old model said 365.0 and the new
+one says 390.0. That is the shape of the two feedback-reset arms in controlled_swap_trotter_test,
+whose counting round was drawn 26-32 ns early whenever the round-0 resets fired. With the
+branches pinned to each deploy's recorded quadrants, every counting-section interval now agrees
+within 4.3 ns, and to 0.5 ns when no reset fired. In the 2-rail XEB the q1 / q2 prep pulses' line
+delay moved 17.5 ns, into line with the other lines of the same runtime.
+
 ## Results of the exhaustive sweeps
 
 - **100 ordered pairs** of the 10 scheduling primitives, deployed and measured. After the fixes

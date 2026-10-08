@@ -53,6 +53,9 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          "measure_multi",
          # parametric variants, for sweeps (see timing_validation --scan)
          "loop_n", "nested_cool_n", "blocks_n", "dwell_n",
+         # a SHORT blocking block (the dwell(one_cycle) join after a feedback test or a
+         # counting round): does the gap after it still scale with its length?
+         "join_dwell_n",
          # COMPOSITIONS: the interactions, which is where the model broke before
          "loop_with_measure", "batch_in_loop", "test_then_batch", "stretch_in_loop",
          "three_deep_nest",
@@ -201,6 +204,19 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
     # test_chain: the PREP-SELECTOR shape -- N mutually exclusive tests on one register, at
     # most one taken. `test_register_value` picks which arm is taken (>= chain_tests -> none).
     chain_tests: int = 4              # how many tests in the chain
+    join_cycles: int = 1              # join_dwell_n: length of the blocking dwell join, cycles
+    join_channels: int = 1            # join_dwell_n: how many channels (ch1, ch2, ...) dwell
+    join_after_batch: bool = False    # join_dwell_n: ch1 is still playing a block=False pulse
+                                      # when the join is triggered (a feedback reset that fired)
+    join_batch_pulse: str = None      # join_dwell_n + join_after_batch: the still-playing pulse
+                                      # (None = the test pulse; "stretch_pulse" = 3 descriptors)
+    join_batch_channels: int = 1      # ...on this many channels (ch1, ch2, ...)
+    join_in_test: bool = False        # ...each inside its own TAKEN test(), as a feedback reset is
+    join_marker: str = "block"        # join_dwell_n: what precedes the join -- "block" (blocking
+                                      # marker), "almost" / "empty" (a block=False pulse on ch0
+                                      # drained by repeat_until fifo_almost_empty / fifo_empty),
+                                      # or "almost_same" (that drained pulse is on the JOIN's own
+                                      # channel, still queued when the join fires: xeb 1DR's shape)
     chain_sync: str = "blocking"      # "blocking" | "trigger_false" | "block_false"
     chain_join: str = "dwell"         # trigger_false only: "dwell" (1-cycle join) | "none"
     chain_after: str = "other"        # the block after the chain: "other" channel | "same"
@@ -904,6 +920,46 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         stim.schedule_pulse(pulse)
                         stim.dwell(self.dwell_length)
                         stim.schedule_pulse(pulse)
+
+            elif self.case == "join_dwell_n":
+                # A blocking block that only dwells `join_cycles` -- the dwell(one_cycle) join that
+                # ends a feedback reset or a counting round -- between two markers, so the marker
+                # interval says what the join and the gaps around it really cost.
+                #   join_marker="block": marker A (ch0, blocking), join on ch1.., marker B (ch0).
+                #   "almost" / "empty": what comes BEFORE the join is instead a block=False pulse
+                #   on ch0 drained by repeat_until(fifo_almost_empty / fifo_empty), the shape
+                #   xeb_streamed_1DR has. The markers then sit on ch1, the join's own channel:
+                #   on ch0 they would merge with the drained pulse into one region.
+                clk = self.acadia.sequencer_clock_frequency()
+                marker = stimuli[1] if self.join_marker in ("almost", "empty") else stimuli[0]
+                with a.channel_synchronizer():
+                    marker.schedule_pulse(pulse)                  # marker A
+                if self.join_marker != "block":
+                    batch_io = stimuli[1] if self.join_marker == "almost_same" else stimuli[0]
+                    with a.channel_synchronizer(block=False):
+                        batch_io.schedule_pulse(pulse)
+                    drained = (a.channel_is_fifo_empty if self.join_marker == "empty"
+                               else a.channel_is_fifo_almost_empty)
+                    with a.sequencer().repeat_until(drained(batch_io.channel)):
+                        pass
+                if self.join_after_batch:
+                    batch_pulse = self.join_batch_pulse or pulse
+                    if self.join_in_test:
+                        sel = a.sequencer().Register()
+                        sel.load(cache[0])                      # = test_register_value
+                    for stim in stimuli[1:1 + int(self.join_batch_channels)]:
+                        if self.join_in_test:
+                            with a.sequencer().test(sel == int(self.test_register_value)):
+                                with a.channel_synchronizer(block=False):
+                                    stim.schedule_pulse(batch_pulse)
+                        else:
+                            with a.channel_synchronizer(block=False):
+                                stim.schedule_pulse(batch_pulse)
+                with a.channel_synchronizer():
+                    for stim in stimuli[1:1 + int(self.join_channels)]:
+                        stim.dwell(int(self.join_cycles) / clk)
+                with a.channel_synchronizer():
+                    marker.schedule_pulse(pulse)                  # marker B
 
             elif self.case == "batch_in_loop":
                 # A block=False batch inside a counter loop: the FIFO drain and the loop back-edge

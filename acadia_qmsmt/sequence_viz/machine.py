@@ -29,9 +29,23 @@ validated on the 4-channel loopback (see ``validation/``).
 import re
 from dataclasses import replace
 
-from .tracing import (Destination, Placement, decode_program, edge_gap,
-                      DMA_STATUS_REGISTER)
+from .tracing import (Destination, Placement, decode_program, edge_gap, _executed_path,
+                      DMA_STATUS_REGISTER, pointer_register_words)
 
+
+#: A blocking block whose ENTIRE playout is one cycle of dwell, started from idle, releases the
+#: sequencer this many cycles earlier than the usual detect + status-register wait. This is the
+#: ``dwell(one_cycle)`` join that ends a feedback reset or a counting round. Measured on the loopback
+#: (validation join_dwell_n, 2026-10-08): marker -> join -> marker was 10.0 ns short of the model at
+#: 1 cycle, on one channel and on three alike. At 2, 3, 4, 5, 6, 8, 12, 20 and 40 cycles it agreed to
+#: <= 0.05 ns. It also agreed at 1 cycle when the join's channel was still playing a block=False
+#: pulse, or still held one descriptor after a fifo_almost_empty drain (join_marker="almost_same";
+#: xeb_streamed_1DR's join on its gate-train channel, board-checked there too). A pulse drained on
+#: ANOTHER channel, by either drain, does not stop it (join_marker="almost"/"empty", 15 ns step
+#: from 1 to 2 cycles). So it is the one-cycle-from-idle case only. The likely reason is that a one-cycle descriptor
+#: leaves the FIFO and finishes in the same cycle, so the poll's flag is already set when the
+#: poll arrives. Found because the Z2 counting rounds drew the next round 10 ns late.
+ONE_CYCLE_JOIN_EARLY = 2
 
 #: ``MASK`` value identifying a ``fifo_almost_empty`` poll, which releases one descriptor
 #: earlier than ``fifo_empty`` (``0x2``). See :func:`drain_block_issue`.
@@ -193,6 +207,16 @@ def _pointer_gate(trace, placement, command, seen, sub_reads=None):
             sub_reads[command.symbolic] = word
     if word is None:
         return None
+    return _decode_register_value(trace, command, word)
+
+
+def _decode_register_value(trace, command, word):
+    """What a register-driven command plays, given the VALUE its register holds.
+
+    A ``schedule_direct`` (ARB) register holds a packed ``(address << 16) | (length - 1)`` word;
+    every other kind's register is a bare length. Shared by the estimate (``_pointer_gate``) and
+    the exact executed-path walk (``_exact_pointer_gate``), so both decode a word the same way.
+    """
     bare = {"length": int(word), "pulse": command.pulse, "io_name": command.io_name,
             "address": command.address}
     # Only a schedule_direct (an ARB) carries a packed command word. A continuation's register
@@ -226,6 +250,25 @@ def _pointer_gate(trace, placement, command, seen, sub_reads=None):
     io_name, pulse = (named if isinstance(named, tuple) and len(named) == 2
                       else (command.io_name, named))
     return {"length": length, "pulse": pulse, "io_name": io_name, "address": address}
+
+
+def _exact_pointer_gate(trace, command, words):
+    """Resolve a register-driven command from the EXACT word its register holds, or None.
+
+    ``words`` is this block's entry from :func:`~.tracing.pointer_register_words`: the cache word
+    each register latched through a pointer, found by replaying every pointer load, advance and
+    read along the executed path. Where it has an answer there is nothing to estimate -- not which
+    pointer fed the register (the read's own source minor says), not how far that pointer had
+    walked (the advances executed before the read say), and not which channel a cache region
+    belongs to (the command names its channel). Returns None, leaving the estimates in charge,
+    when the register was not latched through a pointer or the captured cache lacks the word.
+    """
+    if not words or command.symbolic not in words:
+        return None
+    value = (trace.point_cache or {}).get(words[command.symbolic])
+    if value is None:
+        return None
+    return _decode_register_value(trace, command, int(value))
 
 
 def _assign_regions_from_pointers(trace, names):
@@ -518,12 +561,24 @@ def machine_layout(trace):
     # the CHANNEL and outlives the drain block: in `batch_almost -> batch` an unrelated marker
     # block runs in between, and the batched channel is still playing throughout it.
     queued = {}
+    # Channels whose last descriptor may still be in the FIFO because the last thing that waited
+    # on them was a fifo_almost_empty drain -- a batch's, or a cache stream's post-loop drain,
+    # which the layout folds into the block and so leaves out of `queued` and the cursor. Only
+    # the one-cycle join below reads it (see ONE_CYCLE_JOIN_EARLY).
+    tail_queued = {}
     # Which blocks execute at all, for edge_gap to discount a skipped `test` body. A property of
     # the PLAN, so it is computed once: rebuilding it per placement made the layout quadratic --
     # 3000 placements meant 9.1 million dict lookups and 3 seconds, and pinning a loop to 1000
     # passes took 12 s (100 000, which the panel's spin box allowed, never finished at all).
     executed_nths = {nth_of_block.get(entry[0]) for entry in plan}
     executed_nths.discard(None)
+    # The EXACT word every pointer-fed register holds at each executed block (see
+    # pointer_register_words), or None when the executed path could not be walked -- in which
+    # case every register-driven command keeps the estimates below.
+    try:
+        exact_words = pointer_register_words(self, plan, nth_of_block, executed_nths)
+    except Exception:
+        exact_words = None
     # Blocks with NO trigger of their own -- a `channel_synchronizer(trigger=False)` only queues,
     # so nothing anchors it to a program address. `executed_nths` cannot speak for them, and a
     # `test` arm built that way is invisible to the branch accounting unless it is named
@@ -640,7 +695,13 @@ def machine_layout(trace):
                     continue
                 length = command.length
                 resolution = command.resolution
-                gate = _register_gate(self, command, gate_index)
+                # Exact first: the word the register really holds, from the executed-path walk.
+                # The two estimates below stay as the fallback for a register the walk cannot
+                # answer (not latched through a pointer, or a walk that did not complete).
+                gate = (_exact_pointer_gate(self, command, exact_words[step])
+                        if exact_words is not None and step < len(exact_words) else None)
+                if gate is None:
+                    gate = _register_gate(self, command, gate_index)
                 if gate is None:
                     # The clustering could not attribute a cache region to this channel. Fall
                     # back to the pointer's own arithmetic, which needs no attribution at all.
@@ -778,6 +839,18 @@ def machine_layout(trace):
                     propagate = self.gap_terms.get("propagate", 2)
                     total = (detect + edge["issue"] + propagate
                              + DMA_STATUS_REGISTER + edge["branch_penalty"])
+                    # a one-cycle dwell join from idle (see ONE_CYCLE_JOIN_EARLY)
+                    # -- every channel idle at the trigger: not still playing an earlier batch,
+                    # and nothing left queued by an almost_empty drain. The second is needed
+                    # because a cache stream's cursor lands exactly on t_seq (xeb_streamed_1DR's
+                    # join on the gate-train channel), and then play_start alone looks idle.
+                    one_cycle_join = (placement.length == 1 and not stream_here and block.commands
+                                      and all(c.kind == "DWELL" for c in block.commands)
+                                      and all(play_start[ch] == t_seq
+                                              and not tail_queued.get(ch, False)
+                                              for ch in channels))
+                    if one_cycle_join:
+                        total -= ONE_CYCLE_JOIN_EARLY
                     placement.gap_after = total
                     pending_issue = edge["issue"]
                     placement.gap_breakdown = {
@@ -785,6 +858,7 @@ def machine_layout(trace):
                         "propagate": propagate,
                         "status_register": DMA_STATUS_REGISTER,
                         "branch_penalty": edge["branch_penalty"],
+                        "one_cycle_join": -ONE_CYCLE_JOIN_EARLY if one_cycle_join else 0,
                         "edge": edge["kind"]}
 
         # advance the sequencer clock to the next block
@@ -815,6 +889,7 @@ def machine_layout(trace):
             # this block's channels are the ones the drain polled
             for ch in channels:
                 queued[ch] = drain["almost_empty"]
+                tail_queued[ch] = drain["almost_empty"]
             back = ((lambda ch: last_len.get(ch, 0) + prev_len.get(ch, 0))
                     if drain["almost_empty"] else (lambda ch: last_len.get(ch, 0)))
             pulled = [cursor[ch] - back(ch) for ch in channels]
@@ -842,14 +917,39 @@ def machine_layout(trace):
             # blocking block (or a cache stream whose post-loop drain holds the whole
             # sequencer): playout completes for every channel before the next block.
             t_seq = placement.stop + placement.gap_after
+            stream_tail = bool(stream_here and nth in drains and drains[nth]["almost_empty"])
             for ch in channels:
                 cursor[ch] = t_seq
                 queued[ch] = False     # a blocking block waits for playout: nothing left queued
+                tail_queued[ch] = stream_tail
         else:
-            # a plain non-blocking batch: t_seq unchanged, channels keep playing. No new gap was
-            # paid, so there is no fresh push window either -- clear it rather than let the
-            # previous block's issue span widen the seamless-continuation band below.
+            # A plain non-blocking batch: nothing waits, channels keep playing. But the sequencer
+            # still has to RUN everything between this block's trigger and the next one -- the
+            # next block's pushes, its trigger, the condition and branch of any test on the way --
+            # before the next block can start. Leaving t_seq where it was drew two back-to-back
+            # block=False blocks starting in the same cycle. Measured on the loopback
+            # (join_dwell_n, join_batch_channels=2): two pulses on two channels, each in its own
+            # block=False synchronizer, then a join -- 389.98 ns against 365.0 modelled, the second
+            # pulse's 5 issue cycles exactly. It is the two feedback-reset arms of
+            # controlled_swap_trotter_test, whose counting round was drawn 26-32 ns early.
             pending_issue = 0
+            from_nth = nth_of_block.get(index)
+            to_nth, ahead = None, step + 1
+            while ahead < len(plan):
+                to_nth = nth_of_block.get(plan[ahead][0])
+                if to_nth is not None:
+                    break
+                ahead += 1
+            if from_nth is not None and to_nth is not None and to_nth > from_nth:
+                triggers = self.control_flow["triggers"]
+                arms = [i in executed_indices for i in unanchored_blocks
+                        if index < i < plan[ahead][0]]
+                walked = _executed_path(self.control_flow, triggers[from_nth] + 1,
+                                        triggers[to_nth], executed_nths, arms)
+                if walked is not None:
+                    issue, penalty = walked
+                    t_seq += issue + penalty
+                    pending_issue = issue
 
         self.placements.append(placement)
     return self
