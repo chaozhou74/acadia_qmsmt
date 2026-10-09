@@ -642,7 +642,7 @@ class SequenceTrace:
         words, since = record
         return words if (load_at is None or since is None or since == load_at) else 0
 
-    def _pointer_pair(self, condition, index=None):
+    def _pointer_pair(self, condition, index=None, allow_stream=False):
         """``(counter, operator, base, target)`` for a CACHE-POINTER comparison, else None.
 
         The streamed-gate idiom (both XEB runtimes, dualrail_rb): a DSP walks a region of the
@@ -676,7 +676,10 @@ class SequenceTrace:
             value = self._operand_value(target, index)
             if value is None:
                 continue
-            if self._is_stream_count(target):
+            # A stream's count register belongs to the stream unroll for the LOOP (see
+            # _is_stream_count). A `test` guard on it is just a comparison of two known
+            # addresses, though, so the guard may still be decided (allow_stream=True).
+            if self._is_stream_count(target) and not allow_stream:
                 return None
             return counter, operator, base, int(value)
         return None
@@ -700,7 +703,11 @@ class SequenceTrace:
         legal -- from where the pointer actually is. None when this is not that shape."""
         if context.get("kind") != "test":
             return None
-        pair = self._pointer_pair(context.get("condition"))
+        # allow_stream: a ONE-rail streamed XEB has a single walking pointer, so its loop is the
+        # stream idiom and its count register a stream count -- which left the
+        # test(pointer != final) guard in front of the interleaved loop undecided, although both
+        # sides are known addresses (xeb_streamed_1DR, 2026-10-08).
+        pair = self._pointer_pair(context.get("condition"), allow_stream=True)
         if pair is None:
             return None
         counter, operator, base, target = pair
@@ -2583,7 +2590,17 @@ def describe_cache_stream(acadia):
         if direct is not None:
             break
     if direct is None and reg_directs and len({c for _i, c in reg_directs}) == 1:
-        direct = reg_directs[0]
+        # ...and only when those pushes sit inside ONE loop body, as dualrail_rb's repeats do.
+        # The one-rail streamed XEB (xeb_streamed_1DR) also latches on one channel, but from TWO
+        # loops on the same pointer -- the interleaved family's and the reference's -- so it is
+        # not this idiom: the stream path drew its reference string as no gates at all and its
+        # interleaved one as a jumble. The register-gate path lays it out exactly, as it does
+        # the multi-rail XEB runtimes.
+        loops = sequencer_control_flow(acadia)["back_branches"]
+        enclosing = {next(((t, b) for b, t in sorted(loops, key=lambda bt: bt[0] - bt[1])
+                           if t <= i <= b), None) for i, _c in reg_directs}
+        if len(enclosing) == 1 and None not in enclosing:
+            direct = reg_directs[0]
     if direct is None:
         return None
     direct_idx, channel = direct

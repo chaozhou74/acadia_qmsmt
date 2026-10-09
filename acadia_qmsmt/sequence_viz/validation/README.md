@@ -566,6 +566,28 @@ branches pinned to each deploy's recorded quadrants, every counting-section inte
 within 4.3 ns, and to 0.5 ns when no reset fired. In the 2-rail XEB the q1 / q2 prep pulses' line
 delay moved 17.5 ns, into line with the other lines of the same runtime.
 
+### 14. The one-rail streamed XEB was taken for the RB stream idiom (2026-10-08)
+
+`xeb_streamed_1DR` latches each cache word into a register and pushes it on one channel, and it
+walks a single pointer. That is enough to match `describe_cache_stream`'s latched form, which was
+written for dualrail_rb's repeated pushes inside ONE loop. The XEB pushes from TWO loops on the
+same pointer (the interleaved family's and the reference's). Taken as one stream, the reference
+string was drawn with no gates at all and the interleaved one as a jumble. Its
+`test(pointer != final)` guard was left undecided too, because the guard's register was a stream
+count.
+
+Two narrow changes:
+- The latched form is accepted only when every register push sits inside one loop body.
+- A `test` guard on a stream-count register is still decided (`_pointer_pair(...,
+  allow_stream=True)`), since both sides are known addresses. The loop count stays the
+  stream unroller's.
+
+With the stream path no longer claiming it, the register-gate path lays the 1-rail runtime out
+exactly, as it does the 2- and 3-rail ones. Board: the whole shot of both families
+(`xeb_board_check.py --rt streamed_1DR --full-shot`, `--rt streamed_1DR_e1f0`) agrees on every
+line, with intervals within 1.6 ns and phases within 0.5°. dualrail_rb (`rb_standard`, `rb_e1f0`)
+and state tomography draw the same as before.
+
 ## Results of the exhaustive sweeps
 
 - **100 ordered pairs** of the 10 scheduling primitives, deployed and measured. After the fixes
