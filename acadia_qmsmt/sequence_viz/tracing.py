@@ -234,6 +234,9 @@ class SequenceTrace:
     gap_terms: dict = field(default_factory=dict)   # detect/propagate, from firmware
     registers: dict = field(default_factory=dict)         # "REG0" -> {source, cache_word}
     register_sources: dict = field(default_factory=dict)  # "REG0" -> cache word
+    #: every cache-literal load per register, {"REG1": {address: word}} -- for a register that is
+    #: loaded more than once (see describe_register_cache_loads)
+    register_cache_loads: dict = field(default_factory=dict)
     #: "REG2"/"DSP0" -> the compile-time IMMEDIATE it was initialised with. A pointer
     #: loop (`repeat_until(pointer == final)`) has both of its endpoints here, so its
     #: pass count is arithmetic rather than a guess -- see repeat_until_count.
@@ -430,7 +433,7 @@ class SequenceTrace:
         contains, so cross-checks must use it rather than the unrolled view."""
         return [c for b in self.blocks for c in b.commands]
 
-    def evaluate_condition(self, condition):
+    def evaluate_condition(self, condition, index=None):
         """Try to decide a ``test`` condition from the register values of this point.
 
         Only the simple ``REGn <op> literal`` forms are handled -- which is what
@@ -438,12 +441,18 @@ class SequenceTrace:
         value is known because the cache is captured per sweep point. Anything else (a
         measurement result, register arithmetic) returns None and the caller falls back to
         ``path_choices`` or to assuming the body runs.
+
+        ``index`` (the first block of the test's body) picks the load IN FORCE there: the last
+        write to the register before the first triggering block from ``index`` on. Without it,
+        or when that write is not a cache load, the whole-program value applies as before.
         """
         match = CONDITION_RE.match((condition or "").strip())
         if not match:
             return None
         name, operator, literal = match.group(1), match.group(2), match.group(3)
-        value = self.register_cycles.get(name)
+        value = self._value_in_force(name, index)
+        if value is None:
+            value = self.register_cycles.get(name)
         if value is None:
             return None
         try:
@@ -453,6 +462,26 @@ class SequenceTrace:
         return {"==": value == literal, "!=": value != literal,
                 "<": value < literal, "<=": value <= literal,
                 ">": value > literal, ">=": value >= literal}.get(operator)
+
+    def _value_in_force(self, name, index):
+        """``name``'s value from this point's cache at the test whose body starts at block
+        ``index``, when the register is loaded more than once; else None."""
+        loads = (self.register_cache_loads or {}).get(name) or {}
+        writes = (self.register_writes or {}).get(name) or []
+        if index is None or len(writes) < 2 or not loads or not self.point_cache:
+            return None
+        anchor = None
+        for k in range(index, len(self.blocks)):
+            anchor = self.block_address(k)
+            if anchor is not None:
+                break
+        if anchor is None:
+            return None
+        before = [at for at, _v in writes if at < anchor]
+        if not before or before[-1] not in loads:
+            return None
+        word = loads[before[-1]]
+        return int(self.point_cache[word]) if word in self.point_cache else None
 
     def _operand_value(self, token, index=None):
         """Resolve a condition operand to an int, or None.
@@ -820,7 +849,7 @@ class SequenceTrace:
                     if guard is not None:
                         self.pointer_decisions[self.construct_key(index, level)] = guard
                         continue
-                    if self.evaluate_condition(context.get("condition")) is None:
+                    if self.evaluate_condition(context.get("condition"), index) is None:
                         self.indeterminate.add(self.construct_key(index, level))
                         self.indeterminate.add(index)
                     continue
@@ -922,7 +951,7 @@ class SequenceTrace:
                     self.construct_key(first, depth + 1), set()).add(path)
                 decided = self.pointer_decisions.get(self.construct_key(first, depth + 1))
                 if decided is None:
-                    decided = self.evaluate_condition(context.get("condition"))
+                    decided = self.evaluate_condition(context.get("condition"), first)
                 taken = self._path_override(first, depth + 1, path)
                 if taken is None:
                     taken = decided
@@ -1797,6 +1826,10 @@ def _build_trace(runtime, raw_blocks, resolve):
     except Exception:
         pass                    # without it every loop reads the whole-program values, as before
     try:
+        trace.register_cache_loads = describe_register_cache_loads(acadia)
+    except Exception:
+        pass                    # without it a reused register reads its last load, as before
+    try:
         # Where each counter is ADVANCED, which is how many cache words a pointer loop's body
         # walks per pass -- see SequenceTrace.pointer_cep_per_pass.
         trace.cep_sites = describe_cep_sites(acadia)
@@ -2249,6 +2282,30 @@ def describe_registers(acadia):
 
     :return: ``{"REG0": {"source": "cache[0]", "cache_word": 0}, ...}``
     """
+    registers = {}
+    for _at, name, info in _register_bus_loads(acadia):
+        registers[name] = info
+    return registers
+
+
+def describe_register_cache_loads(acadia):
+    """``{"REG1": {address: cache word, ...}}`` -- EVERY cache-literal load of each register.
+
+    describe_registers keeps only the LAST load in program order, which is right for a
+    register loaded once. A register REUSED -- Z2HiggsSimulation's prep selector is a stream
+    register that the Trotter train reloads from a pointer later -- then reads as the later
+    load, and a test on its first value cannot be decided. With every load and its address,
+    SequenceTrace.evaluate_condition takes the one in force where the test runs.
+    """
+    loads = {}
+    for at, name, info in _register_bus_loads(acadia):
+        if info.get("cache_word") is not None:
+            loads.setdefault(name, {})[at] = info["cache_word"]
+    return loads
+
+
+def _register_bus_loads(acadia):
+    """Yield ``(address, "REGn", {"source": ..., "cache_word": ...})`` for every BUS_DATA load."""
     prog = decode_program(acadia)
 
     decoder = acadia._firmware.sequencer_bus_decoder
@@ -2262,7 +2319,6 @@ def describe_registers(acadia):
         except Exception:
             pass
 
-    registers = {}
     for r in prog:
         loaded = _bus_data_load(r, ("REG", "DSP_AB"))   # BUS_DATA -> REGn / DSP_ABn
         if loaded is None:
@@ -2286,7 +2342,7 @@ def describe_registers(acadia):
         if pointer:
             major, minor = loaded
             name = f"DSP{minor}" if major == "DSP_AB" else f"REG{minor}"
-            registers[name] = {"source": "cache[pointer]", "cache_word": None}
+            yield r.i, name, {"source": "cache[pointer]", "cache_word": None}
             continue
         if address is None:
             continue
@@ -2295,12 +2351,11 @@ def describe_registers(acadia):
         name = f"DSP{minor}" if major == "DSP_AB" else f"REG{minor}"
         if cache_base <= address < cache_base + cache_words:
             word = address - cache_base
-            registers[name] = {"source": f"cache[{word}]", "cache_word": word}
+            yield r.i, name, {"source": f"cache[{word}]", "cache_word": word}
         else:
-            registers[name] = {
+            yield r.i, name, {
                 "source": devices.get(address, f"bus 0x{address:X}"),
                 "cache_word": None}
-    return registers
 
 
 def describe_immediates(acadia):
