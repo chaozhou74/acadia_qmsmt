@@ -107,8 +107,8 @@ def zoom_invariance(view, trace, name, samples=12):
         elif wide_text != near_text:
             problems.append(f"{name}: {entry_name!r} reads {wide_text!r} zoomed out and "
                             f"{near_text!r} zoomed in -- the same pulse, two answers")
-        elif wide_text != f"{length_ns:.0f} ns" and wide_text != entry_name:
-            problems.append(f"{name}: {entry_name!r} ({length_ns:.0f} ns) tooltips "
+        elif wide_text != f"{length_ns:.1f} ns" and wide_text != entry_name:
+            problems.append(f"{name}: {entry_name!r} ({length_ns:.1f} ns) tooltips "
                             f"{wide_text!r}, which is neither its length nor its name")
     view.reset()
     return problems, checked

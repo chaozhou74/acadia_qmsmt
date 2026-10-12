@@ -993,10 +993,10 @@ class SequenceView:
             lo, hi = self.ax.get_ylim()
             anchor = ((x0 + x1) / 2, lane_y if lane_y is not None else (lo + hi) / 2)
             if kind == "time":
-                text = f"{length_ns:.0f} ns"
+                text = f"{length_ns:.1f} ns"
             else:                       # toggle: the attribute not shown as a label
                 mode = self.draw_kwargs.get("pulse_label", "name")
-                text = f"{length_ns:.0f} ns" if mode == "name" else name
+                text = f"{length_ns:.1f} ns" if mode == "name" else name
         else:
             region = self._hit_branch(event)
             if region is None:
@@ -1018,9 +1018,15 @@ class SequenceView:
         return True
 
     def _compute_readout(self, event):
-        """Update the bottom-left readout: the cursor time, plus the pulse amplitude and
-        IQ when the cursor is on a pulse (just the time otherwise). Returns True if the
-        text changed (so a redraw is worthwhile)."""
+        """Update the bottom-left readout: the cursor time, plus the pulse amplitude, IQ and
+        PHASE when the cursor is on a pulse (just the time otherwise). Returns True if the
+        text changed (so a redraw is worthwhile).
+
+        The phase is that of the hovered sample of the waveform the run LOADED (the memory
+        envelope -- the same sample |A| and IQ come from), so it is the phase actually played:
+        the pulse's own phase plus any phase the runtime loaded onto it, and it advances along
+        a detuned pulse. Undefined at zero amplitude, where it reads "--". Time is to 0.1 ns;
+        every other number to five decimals."""
         if self._readout is None:
             return False
         if event.inaxes is not self.ax or event.xdata is None:
@@ -1030,12 +1036,19 @@ class SequenceView:
             self._readout_text = None
             return True
         t_ns = event.xdata * self.divisor
-        time_str = (f"t = {t_ns / 1000:.4f} µs" if self.divisor >= 1000
-                    else f"t = {t_ns:.1f} ns")
+        time_str = f"t = {t_ns:.1f} ns"
         iq = self._iq_at(event)
-        text = (time_str if iq is None else
-                f"{time_str}   |A| = {abs(iq):.3f}   "
-                f"IQ = {iq.real:+.3f}{iq.imag:+.3f}j")
+        if iq is None:
+            text = time_str
+        else:
+            if abs(iq) > 0:
+                import cmath
+                phase = cmath.phase(iq)
+                phase_str = f"phase = {phase * 180 / cmath.pi:+.5f} deg ({phase:+.5f} rad)"
+            else:
+                phase_str = "phase = --"
+            text = (f"{time_str}   |A| = {abs(iq):.5f}   "
+                    f"IQ = {iq.real:+.5f}{iq.imag:+.5f}j   {phase_str}")
         if text == self._readout_text:
             return False
         self._readout.set_text(text)

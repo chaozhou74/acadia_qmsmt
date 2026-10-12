@@ -1958,7 +1958,14 @@ def _branch_is_taken(at, target, goal, triggers, executed, arms):
     order the walk meets them, which is program order for both.
     """
     if target < at:                       # backward: a loop back edge
-        return goal < at                  # the goal is behind us, so the edge is the only way
+        # Taken only when the goal lies INSIDE this loop. A goal further back belongs to an
+        # ENCLOSING loop, and this edge is then an inner loop that must exit: taking it whenever
+        # the goal is merely "behind" spun the walk forever in a fifo-poll spin loop
+        # (repeat_until(fifo_almost_empty): pass) placed after the goal, so a block revisited by
+        # an outer loop -- the second round of feedback cooling -- was never reached, the exact
+        # pointer replay gave up, and every streamed word after cooling fell back to a stale
+        # register (Z2 Trotter train drawn as 9.8 ms "pulses", 2026-10-10).
+        return target <= goal < at
     if at < goal < target:
         return False                      # taking it would jump OVER the block we are going to
     skipped = [t for t in triggers if at < t < target]

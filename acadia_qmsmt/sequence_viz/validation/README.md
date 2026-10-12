@@ -588,6 +588,25 @@ exactly, as it does the 2- and 3-rail ones. Board: the whole shot of both famili
 line, with intervals within 1.6 ns and phases within 0.5°. dualrail_rb (`rb_standard`, `rb_e1f0`)
 and state tomography draw the same as before.
 
+### 15. The executed-path walk took an inner spin loop's back edge forever (2026-10-10)
+
+`tracing._branch_is_taken` took EVERY backward branch whose goal lay behind it ("the goal is behind
+us, so the edge is the only way"). Right for the loop that CONTAINS the goal; wrong for an inner
+loop placed after it -- a `repeat_until(channel_is_fifo_almost_empty): pass` spin inside an outer
+loop whose next pass revisits an earlier block. The walk spun on that edge until its step limit,
+`pointer_register_words` gave up for the whole plan, and every register-fed word fell back to a
+stale register. Feedback cooling has exactly that shape, so a Z2 simulation run WITH cooling drew
+its Trotter train as ~9.8 ms "pulses" (a cooling DMA word read as a length) and every counting
+swap as a 10 ns stub; the same folder with `cooling_config=None` drew correctly.
+
+Fix: take a back edge only when the goal lies inside its loop, `target <= goal < at`. Checks:
+`validation/branch_walk_check.py [run folder]` (fails 5 ways on the old rule, passes on the new);
+`timing_validation.py --dryrun all` 83/83 OK and identical before/after; `seqviz_regress.py` --
+all 42 loopback runtimes draw every pulse identically; real run folders (cooling on): the three Z2
+simulation runs of 2026-10-09 now draw the full train (6 legs x 4 x steps) and the real counting
+ladder; the Z2 and CSWAP phase calibrations and the CSWAP Trotter runs are unchanged (and draw
+2 x pairs x depth drives per firing channel, back to back).
+
 ## Results of the exhaustive sweeps
 
 - **100 ordered pairs** of the 10 scheduling primitives, deployed and measured. After the fixes
