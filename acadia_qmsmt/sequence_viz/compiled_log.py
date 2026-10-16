@@ -51,15 +51,33 @@ def compare(trace, folder):
     Compares the multiset of ``(channel, kind, length)`` and the block/trigger
     count. Returns a dict; ``match`` is True when the re-trace reproduces the
     archived program exactly.
+
+    Two kinds of traced command are excluded, because the archive cannot contain them and
+    counting them would report a mismatch that is not one. Both are reported in the result so
+    they stay visible rather than silently dropped:
+
+    * ``symbolic`` -- a register/DSP-driven length. The archived word holds whatever the register
+      actually contained, which a static re-trace cannot know.
+    * ``zero_length`` -- a command of 0 cycles. ``Acadia.command_dma`` encodes the length as
+      ``length - 1`` (see :func:`parse`), so 0 is not representable and acadia emits no DMA
+      command at all; the tracer still sees it, because it reads acadia's in-memory schedule,
+      where a zero-cycle dwell is a real (if inert) entry. Observed on the leading dwell of a
+      ``MeasurableResonator.measure()`` block on both the stimulus and capture channels -- 8 of
+      161 archived runs in the 2026-08-13 sweep, across BeamsplitterAmpDetune, DualRailRB and
+      four qcq/qc tomography classes.
     """
     archived, triggers = parse(folder)
     archived_counts = Counter((ch, kind, length) for ch, kind, _, length in archived)
 
     retrace_counts = Counter()
     symbolic = 0
+    zero_length = 0
     for c in trace.static_commands:
         if c.symbolic:
             symbolic += 1
+            continue
+        if not c.length:
+            zero_length += 1
             continue
         retrace_counts[(c.channel, c.kind, c.length)] += 1
 
@@ -72,6 +90,7 @@ def compare(trace, folder):
         "commands_retrace": sum(retrace_counts.values()),
         "commands_archive": sum(archived_counts.values()),
         "symbolic_retrace": symbolic,
+        "zero_length_retrace": zero_length,
         "only_in_archive": dict(only_archive),
         "only_in_retrace": dict(only_retrace),
     }
