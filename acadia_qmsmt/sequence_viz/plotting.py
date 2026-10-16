@@ -905,6 +905,67 @@ def _stretched_values(values, half):
     return np.concatenate([values[:half], np.full(2, held), values[half:]])
 
 
+def _played_samples(trace, io_name, pulse, envelope_source, channel, cycles):
+    """The samples a command of `cycles` cycles ACTUALLY plays from this pulse's memory.
+
+    A DMA word plays (length) cycles starting at the memory's address. Usually that is the whole
+    memory, but a merged train is played as a PREFIX -- the first N pulses of a longer train
+    (SidebandPhaseCalibrationStreamed) -- and then only the first cycles * samples_per_cycle
+    samples are played. Stretching the whole memory over the command instead would squeeze
+    every pulse of the memory into the command's width: a picture the board never plays.
+    """
+    samples = trace.envelope(io_name, pulse, envelope_source)
+    if samples is None:
+        return None
+    spc = (trace.samples_per_cycle or {}).get(channel)
+    if spc and cycles:
+        n_play = int(round(cycles * spc))
+        if 0 < n_play < len(samples):
+            samples = samples[:n_play]
+    return samples
+
+
+def _live_runs(trace, io_name, pulse, envelope_source, cache, channel=None, cycles=None):
+    """Where a pulse's OWN samples are non-zero, as fractions of its length, or None when it
+    is one continuous drive (or its samples are unknown).
+
+    A merged train (CustomRuntime.merged_train, 2026-10-13) is ONE DMA command whose memory
+    holds several pulses with zeros between them -- the alternation and pads are in the samples.
+    The DAC plays those zeros as silence, so drawing the command as one solid bar shows a drive
+    the board never plays. Splitting the fill at the zero runs draws what the board plays.
+    A hann pulse's own zero end samples are not a gap: runs shorter than 2 % of the memory, or a
+    single run, leave the bar whole.
+    """
+    key = (io_name, pulse, envelope_source, cycles)
+    if key in cache:
+        return cache[key]
+    runs = None
+    try:
+        samples = _played_samples(trace, io_name, pulse, envelope_source, channel, cycles)
+    except Exception:                                            # noqa: BLE001
+        samples = None
+    if samples is not None and len(samples) > 2:
+        mag = np.abs(np.asarray(samples))
+        peak = float(mag.max())
+        if peak > 0:
+            live = mag > 1e-6 * peak
+            edges = np.flatnonzero(np.diff(np.r_[0, live.astype(int), 0]))
+            spans = list(zip(edges[0::2], edges[1::2]))
+            n = float(len(mag))
+            # merge across gaps shorter than 2 % of the memory (a hann's zero end samples)
+            merged = []
+            for a, b in spans:
+                if merged and a - merged[-1][1] < 0.02 * n:
+                    merged[-1][1] = b
+                else:
+                    merged.append([a, b])
+            if len(merged) > 1 or (merged and (merged[0][0] > 0.02 * n
+                                                or n - merged[0][1] > 0.02 * n)):
+                runs = [(a / n, b / n) for a, b in merged]
+    cache[key] = runs
+    return runs
+
+
 def _reference_peaks(trace, envelope_scale, envelope_source):
     """Peak each envelope is divided by, per ``(io_name, pulse)``.
 
@@ -1164,6 +1225,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
     # rather than one ax.plot() per pulse -- the dominant zoom-render cost
     env_mag, env_iq_real, env_iq_imag = [], [], []
     pulse_rects = []       # solid pulse fills, batched into one PatchCollection
+    run_cache = {}         # (io, pulse, source) -> non-zero runs of a merged waveform
     flow_frames = []       # (Rectangle, info) per control-flow span; published on the axes below
     tabbed = set()         # construct executions that already have a handle drawn
 
@@ -1383,18 +1445,31 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                     drew_dwell = True      # a dwell you scheduled (plain grey)
 
                 lw = 0.0 if edge == "none" else (0.5 if hatch else 1.0)
-                rect = Rectangle(
-                    (x0 * ns, y - LANE_HEIGHT / 2), width * ns, LANE_HEIGHT,
-                    facecolor=face, edgecolor=edge, hatch=hatch, alpha=alpha,
-                    linewidth=lw, zorder=2)
-                if pulse and hatch is None:   # plain pulse fill -> batch it
-                    pulse_rects.append(rect)
-                else:                          # capture/padding/symbolic/dwell
-                    mark(ax.add_artist(rect))
+                # a merged waveform: fill only where its samples drive (see _live_runs)
+                runs = (_live_runs(trace, head.io_name, pulse, envelope_source, run_cache,
+                                   ch, x1 - x0)
+                        if (pulse and not group and hatch is None) else None)
+                for f0, f1 in (runs or [(0.0, 1.0)]):
+                    rect = Rectangle(
+                        ((x0 + f0 * width) * ns, y - LANE_HEIGHT / 2),
+                        (f1 - f0) * width * ns, LANE_HEIGHT,
+                        facecolor=face, edgecolor=edge, hatch=hatch, alpha=alpha,
+                        linewidth=lw, zorder=2)
+                    if pulse and hatch is None:   # plain pulse fill -> batch it
+                        pulse_rects.append(rect)
+                    else:                          # capture/padding/symbolic/dwell
+                        mark(ax.add_artist(rect))
 
-                if show_envelopes and detailed and pulse and not head.symbolic:
+                # A register-driven command whose word the model RESOLVED from the cache (a
+                # streamed train) names a real memory too, so its envelope is drawn like any
+                # other; only an unresolved ("fallback") register has no samples to show.
+                resolved = (not head.symbolic
+                            or getattr(head, "resolution", None) in ("cache", "override"))
+                if show_envelopes and detailed and pulse and resolved:
                     bar_px = (x1 - x0) * ns / span * axes_px
-                    samples = trace.envelope(head.io_name, pulse, envelope_source)
+                    samples = (_played_samples(trace, head.io_name, pulse, envelope_source,
+                                               ch, x1 - x0) if not group else
+                               trace.envelope(head.io_name, pulse, envelope_source))
                     reference = peaks.get((head.io_name, pulse), 0.0)
                     if (bar_px >= ENVELOPE_MIN_PX and samples is not None
                             and len(samples) and reference > 0):

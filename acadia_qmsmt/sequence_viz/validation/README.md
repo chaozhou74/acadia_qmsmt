@@ -607,6 +607,21 @@ simulation runs of 2026-10-09 now draw the full train (6 legs x 4 x steps) and t
 ladder; the Z2 and CSWAP phase calibrations and the CSWAP Trotter runs are unchanged (and draw
 2 x pairs x depth drives per firing channel, back to back).
 
+### 16. A test on a REUSED register read the register's last load in the whole program (2026-10-12)
+
+`tracing.py` `describe_registers` / `SequenceTrace.evaluate_condition`: describe_registers keeps
+one source per register: the last load in program order. Z2HiggsSimulation's multi-prep selector
+is a stream register (all eight are taken) loaded from the prep cache word, tested once per prep,
+and reloaded later by the Trotter train from a pointer, so the prep tests read the train's load,
+came out undecided, and every sweep point drew ALL the preps back to back (24 prep swaps instead
+of 8). Fix: `describe_register_cache_loads` keeps every cache load with its address, and
+`_value_in_force` takes the last write before the first triggering block from the test's body on
+(a queued `trigger=False` arm has no address, so the deferred trigger anchors it); a register
+loaded once reads as before. seqviz_regress: 42/42 cases identical. Board: each prep point's own
+record against the model at that point, every line, count/intervals/phase
+(`z2_layer_check.py --vs-model --multiprep`). Check: `validation/reused_register_check.py
+<notebook dir>` (passes on the new model, 24-vs-8 swaps on the old).
+
 ## Results of the exhaustive sweeps
 
 - **100 ordered pairs** of the 10 scheduling primitives, deployed and measured. After the fixes
