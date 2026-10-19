@@ -748,6 +748,16 @@ def machine_layout(trace):
                     resolution = ("override" if override is not None
                                   else "cache" if resolved is not None
                                   else "fallback")
+                    if resolution in ("cache", "override") and command.kind in PACKED_COMMAND_KINDS:
+                        # `reg.load(cache[i])` then `schedule_direct(ch, reg)` from a FIXED cache
+                        # word (the CD runtimes' trim_slot): the register holds a PACKED
+                        # `(address << 16) | (length - 1)` word, not cycles. Drawn raw, the CD
+                        # train's 0x04B00133 became a 78643507-cycle (0.4 s) box.
+                        gate = _decode_register_value(self, command, length)
+                        if gate["length"] != length or gate["pulse"] != command.pulse:
+                            length = gate["length"]
+                            command = replace(command, pulse=gate["pulse"],
+                                              io_name=gate["io_name"], address=gate["address"])
                     # ONLY when the value is genuinely KNOWN to be zero. An unresolved length
                     # also reads as 0 -- `fallback` is `resolve_indeterminate`, which defaults to
                     # 0 -- and that means "we could not tell", not "the register held zero".
