@@ -210,12 +210,22 @@ def _pointer_gate(trace, placement, command, seen, sub_reads=None):
     return _decode_register_value(trace, command, word)
 
 
-def _decode_register_value(trace, command, word):
+def _decode_register_value(trace, command, word, judge_region=True):
     """What a register-driven command plays, given the VALUE its register holds.
 
     A ``schedule_direct`` (ARB) register holds a packed ``(address << 16) | (length - 1)`` word;
     every other kind's register is a bare length. Shared by the estimate (``_pointer_gate``) and
     the exact executed-path walk (``_exact_pointer_gate``), so both decode a word the same way.
+
+    ``judge_region`` (default True) also requires the cache as a whole to hold packed words
+    (``_packs_commands``) -- the guard for a POINTER walk, whose region could be a table of
+    lengths. A register loaded from ONE FIXED cache word and handed to ``schedule_direct`` needs
+    no such judgement: an ARB's operand is a packed word by construction (acadia writes it to the
+    DMA verbatim; ``use_stretch`` puts its register on the CONST_CONT, never on the ARB). The
+    caller for that idiom passes False, so a word whose memory sits at ADDRESS 0 still decodes:
+    qubit_rb_merged's single train memory is at address 0 on its DAC, so every word it writes
+    has an all-zero address field, the region test failed, and the train drew as a grey,
+    unnamed box one cycle short (43 for 44 cycles at L = 10).
     """
     bare = {"length": int(word), "pulse": command.pulse, "io_name": command.io_name,
             "address": command.address}
@@ -229,7 +239,7 @@ def _decode_register_value(trace, command, word):
     address, length = int(word) >> 16, (int(word) & 0xFFFF) + 1
     names = trace.addr_names or {}
     named = names.get((dac, address))
-    if named is None or not _packs_commands(trace, dac):
+    if named is None or (judge_region and not _packs_commands(trace, dac)):
         # Not a command word -- left as the raw value rather than decoded into a duration
         # nothing supports. Two ways to fail: the decoded address names no pulse on this DAC,
         # or the cache this pointer walks does not hold command words at all.
@@ -753,7 +763,7 @@ def machine_layout(trace):
                         # word (the CD runtimes' trim_slot): the register holds a PACKED
                         # `(address << 16) | (length - 1)` word, not cycles. Drawn raw, the CD
                         # train's 0x04B00133 became a 78643507-cycle (0.4 s) box.
-                        gate = _decode_register_value(self, command, length)
+                        gate = _decode_register_value(self, command, length, judge_region=False)
                         if gate["length"] != length or gate["pulse"] != command.pulse:
                             length = gate["length"]
                             command = replace(command, pulse=gate["pulse"],
