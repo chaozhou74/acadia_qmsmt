@@ -43,6 +43,9 @@ logger = logging.getLogger("acadia_qmsmt")
 TOLERANCE = 1e-15
 # This is the list of kwargs which aren't passed to waveform shape functions (hann etc) defined in InputOutputWaveforms.
 KWARG_EXCLUDE_LIST = ["data", "scale", "phase", "detune", "ramp", "flat", "use_stretch", "memory_length", "name"]
+# Extra time before the second body of a complementary test() pair starts: the taken jump over the
+# first body plus the second test. Measured 25.0 ns (5 cycles), independent of the bodies.
+TEST_PAIR_SECOND_BODY_DELAY = 25e-9 # todo: this ideally should be read from the firmware, but for now we'll use a fixed value
 
 def make_hash(val):
     '''Converts a dict/list/tuple to a hashable type'''
@@ -2410,6 +2413,31 @@ def define_msmt_dirs(num_qubits:int, symmetrize:bool):
 
     return all_msmt_dirs
 
+
+def time_matched_test(acadia: Acadia, conditions: Tuple[Operation, Operation],
+                            bodies: Tuple[Callable, Callable], pad_io: "InputOutput",
+                            pad: float = TEST_PAIR_SECOND_BODY_DELAY):
+    """
+    Two mutually exclusive ``test()`` blocks whose bodies start at the same time in both branches.
+
+    ``bodies[i](acadia)`` is scheduled inside its own ``channel_synchronizer(block=True)`` under
+    ``test(conditions[i])``; the two conditions must be complementary and the two bodies equal in
+    length. Without padding the second body starts ``pad`` later, while the block after the pair
+    starts at the same time on both paths. So the first body gets ``pad`` before it and the second
+    ``pad`` after it: a dwell on ``pad_io`` (any channel) and a barrier, which delay every channel of
+    the block. Both paths then take ``pad`` longer than an unpadded pair.
+    """
+    first, second = bodies
+    with acadia.sequencer().test(conditions[0]):
+        with acadia.channel_synchronizer(block=True):
+            pad_io.dwell(pad)
+            acadia.barrier()
+            first(acadia)
+    with acadia.sequencer().test(conditions[1]):
+        with acadia.channel_synchronizer(block=True):
+            second(acadia)
+            acadia.barrier()
+            pad_io.dwell(pad)
 
 
 def n_qubit_tomo(qubits: List[Qubit], tomo_cache, core:callable, qubit_pi_pulse_names:List[str], 
