@@ -18,9 +18,11 @@ Re-rendering on every viewport change is what makes zooming useful: label
 density, the ns/µs unit and the envelope overlay are all chosen for the window
 currently in view, and marks outside it are culled.
 """
+import math
 import time
 
 from matplotlib.backend_bases import TimerBase
+from matplotlib.transforms import Bbox
 
 from .plotting import draw, fit_layout
 
@@ -61,7 +63,9 @@ class SequenceView:
         self._last_click = None
         self._rubber = None
         self._bg = None             # cached plot background for blitting the rubber band
+        self._rubber_box = None     # pixel box the rubber band was last blitted over
         self._clean = None          # the last finished frame, without tooltip / readout
+        self._overlay_box = None    # pixel box the tooltip / readout cover on screen
         self._cids = []
         self._hover = None          # tooltip annotation, rebuilt on every render
         self._readout = None        # bottom-left time/IQ readout, rebuilt on every render
@@ -206,6 +210,7 @@ class SequenceView:
             try:
                 self._clean = self.canvas.copy_from_bbox(self.ax.figure.bbox)
                 self._draw_overlays()       # animated artists are left out of the frame
+                self._overlay_box = self._extent(self._overlays())
             except Exception:
                 self._clean = None
 
@@ -216,16 +221,43 @@ class SequenceView:
         for artist in self._overlays():
             self.ax.draw_artist(artist)
 
+    def _extent(self, artists):
+        """Pixel box around drawn artists, a text's rounded frame included; None if none."""
+        renderer = self.canvas.get_renderer()
+        boxes = []
+        for artist in artists:
+            boxes.append(artist.get_window_extent(renderer))
+            patch = getattr(artist, "get_bbox_patch", lambda: None)()
+            if patch is not None:
+                boxes.append(patch.get_window_extent(renderer))
+        return Bbox.union(boxes).padded(3) if boxes else None
+
+    def _blit_changed(self, before, after):
+        """Repaint only where an overlay was and now is. Each blit is a synchronous
+        repaint of that area, and a whole-figure one per mouse move is slow on a
+        high-DPI display."""
+        boxes = [box for box in (before, after) if box is not None]
+        if boxes:
+            self.canvas.blit(Bbox.union(boxes))
+
     def _refresh_overlays(self):
-        """Show a tooltip / readout change: paste the clean frame back and draw only the
-        overlays on it (about a millisecond), rather than re-rasterising the whole plot."""
+        """Show a tooltip / readout change: paste the clean frame back where the overlays
+        were, draw them again and repaint only that area (about a millisecond), rather than
+        re-rasterising the whole plot."""
         if self._clean is None:
             self.canvas.draw_idle()         # no current frame to blit onto yet
             return
         try:
-            self.canvas.restore_region(self._clean)
+            before = self._overlay_box
+            if before is not None:          # outside it the buffer already is the clean frame
+                height = self.ax.figure.bbox.height
+                self.canvas.restore_region(
+                    self._clean, xy=(0, 0),
+                    bbox=(math.floor(before.x0), math.floor(height - before.y1),
+                          math.ceil(before.x1), math.ceil(height - before.y0)))
             self._draw_overlays()
-            self.canvas.blit(self.ax.figure.bbox)
+            self._overlay_box = self._extent(self._overlays())
+            self._blit_changed(before, self._overlay_box)
         except Exception:
             self._clean = None
             self.canvas.draw_idle()
@@ -272,6 +304,7 @@ class SequenceView:
             ("scroll_event", self._on_scroll),
             ("key_press_event", self._on_key),
             ("draw_event", self._on_draw),
+            ("resize_event", self._on_resize),
         ]:
             self._cids.append(self.canvas.mpl_connect(event, handler))
 
@@ -322,6 +355,11 @@ class SequenceView:
         return (now - was < self.DOUBLE_CLICK_SECONDS
                 and abs(event.x - x) <= self.DOUBLE_CLICK_PIXELS
                 and abs(event.y - y) <= self.DOUBLE_CLICK_PIXELS)
+
+    def _on_resize(self, _event):
+        """The figure keeps its margin fractions through a resize, which clips the lane
+        labels on a narrower canvas; re-render, which refits them for the new size."""
+        self._request_render()
 
     def _on_motion(self, event):
         if event.xdata is not None:
@@ -419,7 +457,8 @@ class SequenceView:
             try:
                 self.canvas.restore_region(self._bg)
                 self.ax.draw_artist(self._rubber)
-                self.canvas.blit(self.ax.bbox)
+                before, self._rubber_box = self._rubber_box, self._extent([self._rubber])
+                self._blit_changed(before, self._rubber_box)
                 return
             except Exception:
                 self._bg = None
@@ -429,6 +468,7 @@ class SequenceView:
         if self._rubber is not None:
             self._rubber.set_visible(False)
         self._bg = None
+        self._rubber_box = None
 
     # ---------------- hover tooltip ----------------
 
