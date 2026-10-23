@@ -14,6 +14,8 @@ import re
 
 import numpy as np
 
+from .tracing import _same_conditional
+
 COPY_SUFFIX = re.compile(r"_copy\d*$")
 
 # Fixed categorical order. Hues are assigned to pulse names in first-appearance
@@ -183,14 +185,20 @@ def branch_regions(trace):
             continue
         iteration = getattr(block, "iteration", 0)
         # adjacency is by block index, not time -- consecutive blocks in one body are
-        # separated by the inter-block gap
-        if (regions and previous == block.index - 1 and regions[-1][2] == context
+        # separated by the inter-block gap. Compares by _same_conditional, not `==`:
+        # a context dict carries the raw condition Operation/Register object (see
+        # SequenceTrace._same_context), and that overloads `==` to build ANOTHER
+        # symbolic Operation rather than a bool.
+        if (regions and previous == block.index - 1
+                and _same_conditional(regions[-1][2], context)
                 and regions[-1][3]["iteration"] == iteration):
             regions[-1][1] = block.stop
         else:
             regions.append([block.start, block.stop, context,
                             {"iteration": iteration,
                              "assumed": block.index in trace.assumed_paths,
+                             "mutually_exclusive": block.index in getattr(
+                                 trace, "mutually_exclusive_paths", ()),
                              "unsupported": block.index in getattr(
                                  trace, "unsupported_paths", ()),
                              # an unrolled cache-pointer stream: gate count is resolved,
@@ -206,16 +214,39 @@ def branch_regions(trace):
     return [(a, b, c, d) for a, b, c, d in regions]
 
 
+REGISTER_TOKEN = re.compile(r"\b(?:REG|DSP)\d+\b")
+
+
+def alias_registers(trace, text):
+    """Rewrite ``REGn``/``DSPn`` in a rendered condition to the runtime's own variable
+    names -- ``REG4 & 524288 != 0`` -> ``flag & 524288 != 0``.
+
+    Applied at DISPLAY time only. The stored ``condition`` text stays canonical because
+    the mutually-exclusive-pair logic keys on it (see
+    ``SequenceTrace.execution_plan``), and two registers could in principle carry the
+    same alias. Keeping the substitution here also means the caption and the Registers
+    panel name the same register the same way, which is the point.
+    """
+    names = getattr(trace, "register_names", None)
+    if not names:
+        return text
+    return REGISTER_TOKEN.sub(lambda m: names.get(m.group(0), m.group(0)), text)
+
+
 def branch_caption(trace, context, info):
     """Label for a control-flow region, honest about what is known.
 
     A ``loop`` has a deterministic count, so the region says which pass it is. A
     ``repeat_until`` does not -- its count depends on a measurement, so one pass is drawn
     and the label says so rather than implying the drawn timeline is complete. A ``test``
-    says whether the shown arm was decided from the cache or merely assumed.
+    says whether the shown arm was decided from the cache, is one arbitrary side of a
+    mutually-exclusive pair (two ``test()`` blocks on a live-measurement register, e.g.
+    ``REGn != 0`` / ``REGn == 0`` -- see ``SequenceTrace.execution_plan``), or is a bare
+    assumption with no known complement.
     """
     inner = context[-1]
-    kind, condition = inner["kind"], inner["condition"]
+    # named as in the Registers panel, so a caption and its control read alike
+    kind, condition = inner["kind"], alias_registers(trace, inner["condition"])
 
     if kind == "loop":
         count = inner.get("count")
@@ -226,24 +257,28 @@ def branch_caption(trace, context, info):
         # per-point cache -- so say how many gates, not that the count is unknown.
         count = info.get("stream_count")
         if count is not None:
-            return (f"repeat_until({condition}) — {count} gates from cache "
-                    f"(this sweep point)")
+            return f"repeat_until({condition}) — {count} gates"
         # A counter loop whose target register resolved: draw and label the real count.
         count = info.get("repeat_count")
         if count is not None:
             return (f"repeat_until({condition}) — pass {info['iteration'] + 1} "
-                    f"of {count} (this sweep point)")
-        return (f"repeat_until({condition}) — 1 pass shown; "
-                f"real count is data-dependent")
+                    f"of {count}")
+        return f"repeat_until({condition}) — 1 of ? passes"
     if kind == "test":
         if info.get("unsupported"):
             # KI_004: body is out of line, so the drawn positions are not trustworthy
             return (f"test({condition}), speculation=False — TIMING NOT MODELLED "
                     f"(see KI_004)")
-        decided = "assumed taken" if info.get("assumed") else "condition true"
-        speculation = inner.get("speculation")
-        suffix = "" if speculation is None else f", speculation={speculation}"
-        return f"test({condition}) — {decided}{suffix}"
+        # A resolved condition gets no annotation at all: the box is already drawn, so
+        # saying "condition true" only restates it. Only a branch we could NOT work out
+        # is marked, and one short word carries that -- whether it is one arm of a
+        # mutually-exclusive pair or a lone assumption is a distinction for
+        # trace.mutually_exclusive_paths, not for a label repeated down the whole plot.
+        guess = " — guessed" if info.get("assumed") else ""
+        # speculation is True on essentially every runtime (it is the default), so
+        # printing it every time is noise; False is the case worth flagging, and it
+        # already comes with the KI_004 message above.
+        return f"test({condition}){guess}"
     return f"{kind}({condition})"
 
 
@@ -428,7 +463,13 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                if c.stop * ns >= t0 and c.start * ns <= t1]
     detailed = len(visible) <= DETAIL_BUDGET
 
-    ax.clear()
+    # Rebuilding ticks, spines and grid (what ax.clear() forces) was most of a frame, and
+    # they only change with the lanes or the theme: drop the marks, keep the chrome. Keyed on
+    # the tick locator too, which a manual ax.clear() replaces, so that still rebuilds.
+    chrome = (tuple(channels), tuple(lane_label(trace, ch) for ch in channels),
+              tuple(sorted((k, str(v)) for k, v in th.items())), id(ax.yaxis.get_major_locator()))
+    for artist in (*ax.patches, *ax.lines, *ax.texts, *ax.collections, *ax.artists):
+        artist.remove()
     used_pulses = set()
     drew_capture = drew_padding = drew_symbolic = drew_gap = drew_branch = False
     drew_dwell = False
@@ -445,7 +486,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         if r1 < t0 or r0 > t1:
             continue
         drew_branch = True
-        ax.add_patch(Rectangle(
+        ax.add_artist(Rectangle(
             (r0, -0.62), max(r1 - r0, gap * ns), len(channels) - 0.05,
             facecolor="none", edgecolor=BRANCH_INK, linestyle=(0, (4, 3)),
             linewidth=1.6, zorder=1.5))
@@ -482,6 +523,8 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
 
         by_channel = {}
         for c in blk.commands:
+            if c.symbolic and c.static_length is not None:
+                continue        # acadia's barrier-padding arithmetic, not a register length
             by_channel.setdefault(c.channel, []).append(c)
 
         for ch, cmds in by_channel.items():
@@ -549,7 +592,7 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                 if pulse and hatch is None:   # plain pulse fill -> batch it
                     pulse_rects.append(rect)
                 else:                          # capture/padding/symbolic/dwell
-                    ax.add_patch(rect)
+                    ax.add_artist(rect)
 
                 if show_envelopes and detailed and pulse and not head.symbolic:
                     bar_px = (x1 - x0) * ns / span * axes_px
@@ -646,23 +689,27 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
             env_iq_imag, colors=INK_PRIMARY, linewidths=ENVELOPE_LINEWIDTH * 0.75,
             alpha=0.45, zorder=3))
 
-    ax.set_yticks(range(len(channels)))
-    ax.set_yticklabels([lane_label(trace, ch) for ch in reversed(channels)],
-                       fontsize=9, color=INK_PRIMARY)
+    if getattr(ax, "_seqviz_chrome", None) != chrome:
+        ax.set_yticks(range(len(channels)))
+        ax.set_yticklabels([lane_label(trace, ch) for ch in reversed(channels)],
+                           fontsize=9, color=INK_PRIMARY)
+        ax.grid(axis="x", color=INK_MUTED, alpha=0.18, linewidth=0.6)
+        ax.set_axisbelow(True)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color(INK_MUTED)
+        ax.tick_params(colors=INK_SECONDARY, labelsize=8)
+        ax.set_facecolor(th["axes_bg"])
+        ax.figure.set_facecolor(th["figure_bg"])
+        ax._seqviz_chrome = (*chrome[:3], id(ax.yaxis.get_major_locator()))
     ax.set_ylim(-0.7, len(channels) - 0.3)
     ax.set_xlim(t0, t1)
     ax.set_xlabel(f"time [{unit}]", fontsize=9, color=INK_SECONDARY)
-    ax.grid(axis="x", color=INK_MUTED, alpha=0.18, linewidth=0.6)
-    ax.set_axisbelow(True)
-    for side in ("top", "right", "left"):
-        ax.spines[side].set_visible(False)
-    ax.spines["bottom"].set_color(INK_MUTED)
-    ax.tick_params(colors=INK_SECONDARY, labelsize=8)
-    ax.set_facecolor(th["axes_bg"])
-    ax.figure.set_facecolor(th["figure_bg"])
 
     _hide_overflowing_labels(label_marks, ax)
 
+    if ax.get_legend() is not None:
+        ax.get_legend().remove()
     if legend:
         labels = _legend_labels(trace, styles, color_by, group_copies)
         handles = [Patch(facecolor=styles[k]["color"], label=labels[k],
@@ -694,9 +741,9 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                       bbox_to_anchor=(1.005, 1.0), frameon=False, fontsize=8,
                       labelcolor=INK_PRIMARY)
 
-    if title is not False:
-        ax.set_title(title or f"{trace.runtime_class} - sweep point {trace.point}",
-                     fontsize=10, color=INK_PRIMARY, loc="left")
+    ax.set_title("" if title is False else
+                 title or f"{trace.runtime_class} - sweep point {trace.point}",
+                 fontsize=10, color=INK_PRIMARY, loc="left")
     return t0, t1
 
 

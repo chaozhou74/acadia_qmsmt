@@ -20,6 +20,8 @@ currently in view, and marks outside it are culled.
 """
 import time
 
+from matplotlib.backend_bases import TimerBase
+
 from .plotting import draw, fit_layout
 
 
@@ -42,12 +44,13 @@ class SequenceView:
     # coalesce, so a fast scroll does one render at the end instead of dozens.
     RENDER_INTERVAL_S = 0.03
 
-    def __init__(self, trace, ax, on_viewport=None, **draw_kwargs):
+    def __init__(self, trace, ax, on_viewport=None, on_lanes=None, **draw_kwargs):
         self.trace = trace
         self.ax = ax
         self.canvas = ax.figure.canvas
         self.draw_kwargs = draw_kwargs
-        self.on_viewport = on_viewport
+        self.on_viewport = on_viewport      # called with the time window after each render
+        self.on_lanes = on_lanes            # ... and with the lane range (a scrollbar each)
 
         self.full_xlim = (0.0, max(trace.length_ns, 1.0))
         self.xlim_ns = self.full_xlim
@@ -58,6 +61,7 @@ class SequenceView:
         self._last_click = None
         self._rubber = None
         self._bg = None             # cached plot background for blitting the rubber band
+        self._clean = None          # the last finished frame, without tooltip / readout
         self._cids = []
         self._hover = None          # tooltip annotation, rebuilt on every render
         self._readout = None        # bottom-left time/IQ readout, rebuilt on every render
@@ -71,7 +75,11 @@ class SequenceView:
         self._timer = None          # coalesces throttled renders
         self._timer_running = False
         self._pending = False
-        self._last_render = 0.0
+        self._last_render = 0.0     # when the last frame reached the screen
+        self._frame_start = None    # set while a frame is in flight (render -> draw_event)
+        self._frame_s = self.RENDER_INTERVAL_S   # measured frame time, paces the throttle
+        self._drawn_xlim = self.xlim_ns          # the window the axes currently show
+        self._press_px = None
         self.render()
         self._connect()
 
@@ -79,12 +87,21 @@ class SequenceView:
 
     @property
     def divisor(self):
-        """Plotted-unit divisor for the current window (1 for ns, 1000 for µs)."""
+        """Plotted-unit divisor of the DRAWN window (1 for ns, 1000 for µs) -- event xdata is
+        in its units, even while a newer window waits for its frame."""
         from .plotting import _time_scale
-        return _time_scale(self.xlim_ns[1] - self.xlim_ns[0])[0]
+        return _time_scale(self._drawn_xlim[1] - self._drawn_xlim[0])[0]
+
+    def _x_to_ns(self, x_px):
+        """A canvas pixel column as a time in the pending window."""
+        box, (lo, hi) = self.ax.bbox, self.xlim_ns
+        return lo + (x_px - box.x0) / max(box.width, 1.0) * (hi - lo)
 
     def render(self):
+        self._frame_start = time.monotonic()
+        self._clean = None          # the snapshot is of the old frame until this one is drawn
         draw(self.ax, self.trace, xlim_ns=self.xlim_ns, **self.draw_kwargs)
+        self._drawn_xlim = self.xlim_ns
         self._install_hover()       # draw() cleared the axes, so rebuild the tooltip
         if self.ylim is not None:
             self.ax.set_ylim(*self.ylim)
@@ -92,6 +109,21 @@ class SequenceView:
         self.canvas.draw_idle()
         if self.on_viewport:
             self.on_viewport(self.xlim_ns)
+        if self.on_lanes:
+            self.on_lanes(self.ylim or self.full_ylim)
+
+    @property
+    def full_ylim(self):
+        """The whole lane stack, as draw() lays it out."""
+        return (-0.7, len(self.trace.channels) - 0.3)
+
+    @staticmethod
+    def _slide(lo, hi, full):
+        """``(lo, hi)`` moved back inside ``full`` keeping its width (all of ``full`` if wider)."""
+        if hi - lo >= full[1] - full[0]:
+            return full
+        shift = max(full[0] - lo, 0.0) - max(hi - full[1], 0.0)
+        return lo + shift, hi + shift
 
     def _fit_layout(self):
         """Reserve room for the outside legend and lane labels.
@@ -113,47 +145,95 @@ class SequenceView:
         else:
             fig.subplots_adjust(**self._layout_pars)
 
-    def set_window(self, t0_ns, t1_ns, ylim=None):
-        """Show ``[t0_ns, t1_ns]``, clamped to the sequence and a sane minimum."""
-        self._apply_window(t0_ns, t1_ns, ylim)
+    def set_window(self, t0_ns, t1_ns, ylim=None, throttle=False):
+        """Show ``[t0_ns, t1_ns]``, clamped to the sequence and a sane minimum. ``throttle``
+        paces renders to the measured frame time, for a caller that sends many (a scrollbar)."""
+        self._apply_window(t0_ns, t1_ns, ylim, throttle=throttle)
 
     def _apply_window(self, t0_ns, t1_ns, ylim=None, throttle=False):
         lo, hi = sorted((float(t0_ns), float(t1_ns)))
         if hi - lo < self.MIN_SPAN_NS:
             mid = 0.5 * (lo + hi)
             lo, hi = mid - self.MIN_SPAN_NS / 2, mid + self.MIN_SPAN_NS / 2
-        self.xlim_ns = (lo, hi)
+        self.xlim_ns = self._slide(lo, hi, self.full_xlim)
         if ylim is not None:
-            self.ylim = ylim
+            self.ylim = self._slide(*sorted(ylim), self.full_ylim)
+        if throttle:
+            self._request_render()
+        else:
+            self.render()
+
+    def set_lanes(self, y0, y1, throttle=False):
+        """Show lanes ``[y0, y1]`` (lane coordinates: channel i of trace.channels sits at
+        len(channels) - 1 - i), kept inside the stack."""
+        self.ylim = self._slide(*sorted((float(y0), float(y1))), self.full_ylim)
         if throttle:
             self._request_render()
         else:
             self.render()
 
     def _request_render(self):
-        """Render now if idle, else coalesce into one trailing render -- a burst
-        of scroll/pan events collapses to ~RENDER_INTERVAL_S rather than dozens
-        of full re-renders."""
-        now = time.monotonic()
-        if not self._timer_running and now - self._last_render >= self.RENDER_INTERVAL_S:
-            self._last_render = now
+        """Render now if no frame is in flight and the last one is a frame time old, else
+        coalesce into one trailing render: a burst of scroll/pan events then costs one
+        frame per frame time, and the view lands on the latest window."""
+        interval = min(max(self._frame_s, self.RENDER_INTERVAL_S), 0.5)
+        idle = self._frame_start is None and not self._timer_running
+        if idle and time.monotonic() - self._last_render >= interval:
             self.render()
             return
         self._pending = True
         if not self._timer_running:
             if self._timer is None:
-                self._timer = self.canvas.new_timer(
-                    interval=max(int(self.RENDER_INTERVAL_S * 1000), 1))
+                self._timer = self.canvas.new_timer()
                 self._timer.single_shot = True
                 self._timer.add_callback(self._flush_render)
+            if type(self._timer) is TimerBase:     # no event loop (Agg): it never fires
+                self._pending = False
+                self.render()
+                return
+            self._timer.interval = max(int(interval * 1000), 1)
             self._timer_running = True
             self._timer.start()
+
+    def _on_draw(self, _event):
+        """A frame reached the screen: time it (render() to here, where the raster is), and
+        keep it as the clean background the tooltip and readout are blitted onto."""
+        if self._frame_start is not None:
+            self._frame_s = 0.5 * self._frame_s + 0.5 * (time.monotonic() - self._frame_start)
+            self._frame_start = None
+        self._last_render = time.monotonic()
+        if getattr(self.canvas, "supports_blit", False):
+            try:
+                self._clean = self.canvas.copy_from_bbox(self.ax.figure.bbox)
+                self._draw_overlays()       # animated artists are left out of the frame
+            except Exception:
+                self._clean = None
+
+    def _overlays(self):
+        return [a for a in (self._hover, self._readout) if a is not None and a.get_visible()]
+
+    def _draw_overlays(self):
+        for artist in self._overlays():
+            self.ax.draw_artist(artist)
+
+    def _refresh_overlays(self):
+        """Show a tooltip / readout change: paste the clean frame back and draw only the
+        overlays on it (about a millisecond), rather than re-rasterising the whole plot."""
+        if self._clean is None:
+            self.canvas.draw_idle()         # no current frame to blit onto yet
+            return
+        try:
+            self.canvas.restore_region(self._clean)
+            self._draw_overlays()
+            self.canvas.blit(self.ax.figure.bbox)
+        except Exception:
+            self._clean = None
+            self.canvas.draw_idle()
 
     def _flush_render(self):
         self._timer_running = False
         if self._pending:
             self._pending = False
-            self._last_render = time.monotonic()
             self.render()
 
     def reset(self):
@@ -164,8 +244,11 @@ class SequenceView:
     def set_point(self, index):
         """Show another captured sweep point. No re-tracing -- the schedule is
         shared and only the pulse data and register lengths change."""
+        zoomed = self.xlim_ns != self.full_xlim
         self.trace.select_point(index)
         self.full_xlim = (0.0, max(self.trace.length_ns, 1.0))
+        if not zoomed:              # the whole sequence stays in view as its length changes
+            self.xlim_ns = self.full_xlim
         self.render()
 
     def relayout(self):
@@ -188,6 +271,7 @@ class SequenceView:
             ("button_release_event", self._on_release),
             ("scroll_event", self._on_scroll),
             ("key_press_event", self._on_key),
+            ("draw_event", self._on_draw),
         ]:
             self._cids.append(self.canvas.mpl_connect(event, handler))
 
@@ -224,6 +308,7 @@ class SequenceView:
         self._last_xy = None        # never fall back to a previous drag's end
         self._press = (event.xdata, event.ydata,
                        bool(event.key and "shift" in event.key))
+        self._press_px = event.x
         self._hide_hover()          # get the tooltip out of the way while dragging
 
     def _is_double_click(self, event):
@@ -251,9 +336,11 @@ class SequenceView:
             return
         x0, y0, panning = self._press
         if panning:
-            shift = (x0 - event.xdata) * self.divisor
+            # in pixels: event.xdata is in the drawn frame, which lags the pending window
             lo, hi = self.xlim_ns
-            self.xlim_ns = (lo + shift, hi + shift)
+            shift = -(event.x - self._press_px) / max(self.ax.bbox.width, 1.0) * (hi - lo)
+            self._press_px = event.x
+            self.xlim_ns = self._slide(lo + shift, hi + shift, self.full_xlim)
             self._request_render()          # throttled -- pan fires per pixel
             self._press = (event.xdata, event.ydata, True)
             return
@@ -292,7 +379,7 @@ class SequenceView:
         if event.inaxes is not self.ax or event.xdata is None:
             return
         factor = 0.8 if event.button == "up" else 1.25
-        centre = event.xdata * self.divisor
+        centre = self._x_to_ns(event.x)
         lo, hi = self.xlim_ns
         self._apply_window(centre - (centre - lo) * factor,
                            centre + (hi - centre) * factor, throttle=True)
@@ -417,7 +504,7 @@ class SequenceView:
             "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
             ha="left", va="bottom", fontsize=8, color="#1a1a19", zorder=20,
             bbox=dict(boxstyle="round,pad=0.35", fc="#fbfbe6", ec="#8c8b83",
-                      lw=0.6))
+                      lw=0.6), animated=True)
         self._hover.set_visible(False)
 
         # Readout below the time axis: the cursor time, plus the pulse amplitude / IQ when
@@ -436,7 +523,8 @@ class SequenceView:
             fontsize=8, family="monospace", zorder=21,
             color=th.get("ink_primary", "#1a1a19"),
             bbox=dict(boxstyle="round,pad=0.3", fc=th.get("surface", "#ffffff"),
-                      ec=th.get("ink_muted", "#8c8b83"), lw=0.6, alpha=0.95))
+                      ec=th.get("ink_muted", "#8c8b83"), lw=0.6, alpha=0.95),
+            animated=True)
         self._readout.set_visible(False)
 
     def _hit_pulse(self, event):
@@ -481,7 +569,7 @@ class SequenceView:
         tip_changed = self._compute_tooltip(event)
         readout_changed = self._compute_readout(event)
         if tip_changed or readout_changed:
-            self.canvas.draw_idle()
+            self._refresh_overlays()
 
     def _compute_tooltip(self, event):
         """Point the near-cursor tooltip at whatever is under the cursor (no redraw).
@@ -575,7 +663,7 @@ class SequenceView:
             self._readout_text = None
             dirty = True
         if dirty:
-            self.canvas.draw_idle()
+            self._refresh_overlays()
 
 
 def interactive_view(trace, figsize=None, **draw_kwargs):

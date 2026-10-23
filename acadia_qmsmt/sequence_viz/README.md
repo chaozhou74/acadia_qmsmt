@@ -23,9 +23,9 @@ fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 | `notebooks/` | `explore_sequence.ipynb` (interactive), `visualize_sequence.ipynb` (static) |
 | `validation/selftest.py` | hardware-free regression: traces archived folders, checks each against its own `compiled.log`, exercises every render option |
 | `docs/MAINTENANCE.md` | the workflow to update the visualizer when acadia/acadia_qmsmt change (symptom → coupling point → fix → re-validate) |
-| `docs/EMPIRICAL_CONSTANTS.md` | the only two numbers that are measured rather than derived, and the brief for tracking them down in acadia |
+| `docs/TIMING_MODEL.md` | how the tracer times DMA commands, and where each number comes from in the gateware |
 | `validation/` | the regression net for acadia/acadia_qmsmt drift: loopback test runtime, deploy/measure/compare scripts, measured results — run these when those packages change (`validation/README.md`) |
-| `docs/DEVELOPER_NOTES.md` | maintainer notes: known issues (KI_001–004), gotchas, open items |
+| `docs/DEVELOPER_NOTES.md` | maintainer notes: known issues, gotchas, open items |
 
 `tracing`/`folder`/`compiled_log` are pure data — no matplotlib. Nothing in this package
 imports PyQt5; the Qt wrapper lives in acadia_gui (see *In acadia_gui* below).
@@ -151,7 +151,60 @@ records which was used, and `summary()` reports it per register:
 | the cache | automatic, per sweep point |
 | `resolve_indeterminate` | blanket fallback for anything left, e.g. a DSP-driven length |
 
-`register_names={"REG0": "t_echo"}` sets a display alias.
+### Arithmetic on a register resolves too
+
+A register is often not loaded from the cache directly but computed from one:
+
+```python
+flag.load(rounds_reg & (1 << (k - 1)))     # rounds_reg = cache[0]
+with a.sequencer().test(flag != 0):        # ... run round k
+```
+
+`describe_registers` cannot see this — it reads the compiled program, where the only
+thing attributable to a register is a direct `BUS_DATA -> REGn` bus read, and `flag` is
+reloaded with a *different* mask before each round's test. So the dry run records what
+each register was loaded **with** (the un-evaluated expression, via the register class's
+own `load`), and each `test`/`loop` context snapshots that map as it is entered — which
+is what ties a test to the value its register held *there*, straight out of Python
+execution order. `evaluate_condition` then resolves a condition recursively down to
+cache-fed or pinned leaves.
+
+The practical effect: those round-enable tests follow the sweep point. In a runtime that
+sweeps the round count this way (`rounds_reg` = 0, 1, 3, 7, 15, 31), stepping `point` grows
+the drawn timeline round by round instead of drawing one fixed picture.
+
+### Pinning a measurement-fed register
+
+A register fed by live hardware — `qubit_e = measurement & QUADRANT_2` — has no value
+off-hardware, so the branch it gates can only be guessed. Pin it and the branch is decided
+outright:
+
+```python
+trace.register_overrides["REG0"] = 0        # or the bit the runtime masks for
+trace.relayout()
+```
+
+`trace.register_summary()` lists what is worth pinning, under the runtime's own variable
+name; in the GUI these are the Registers panel's spin boxes, where the minimum reads
+`auto` (no override) so a deliberate pin to 0 is distinguishable from an unset box. With
+two such registers gating a feedforward, pinning both selects each of the four paths
+exactly, with nothing left assumed. Note the units differ by kind: a
+length override is in cycles, a condition register's is the raw register word.
+
+`register_names={"REG0": "t_echo"}` sets a display alias — though usually there is
+nothing to set: every `Register()`/`DSP()` is named after the runtime's own variable
+(`t_echo = a.sequencer().Register()` is enough on its own), read straight off that
+call site's source line. `register_names` only overrides one, or fills in a name for
+a call site that isn't a plain assignment (a tuple-unpack, an attribute target).
+
+A symbolic length that turns out to be pure arithmetic over already-known numbers —
+acadia's own barrier-padding `max(a, b) - c`, most commonly — is not a register at
+all, and does not appear in `register_summary()` or the GUI's register panel; only
+genuine register/DSP-driven quantities do. It stays symbolic on the timeline itself
+(cross-hatched, at a placeholder width) rather than being laid out at that resolved
+length: the schedule this is read from can carry such a padding entry without acadia
+ever emitting a matching DMA instruction for it, so trusting the folded number for
+*layout* invents commands `compare_with_compiled_log` then can't find in the archive.
 
 ## Inter-block dead time
 
@@ -189,16 +242,17 @@ test_false                  4      [95.0, 80.0]     0.10 ns     body skipped, ga
 
 Run `timing_validation.py --revalidate` for the full table.
 
-The boundary-gap model (`edge_gap()`, applied by the execution-model layout) has four
-contributions per blocking boundary:
+A blocking boundary is a poll on `dma_running`, which the sequencer runs as a PC hold.
+The dead time after a block follows from the gateware (`docs/TIMING_MODEL.md`):
 
 | term | where it comes from |
 |---|---|
-| `detect` | `Acadia._bus_latency("dma_running")` — the poll reads a value that stale, so the deassertion is seen that many cycles late. **3 cycles** on CONFIG_200 |
-| `issue` | counted **exactly out of the compiled program**: instructions from the poll through the next `Trigger DMAs`. Varies per boundary — 6 for one pulse, 15 when datamover configuration sits in between |
-| `propagate` | `dma_trigger_dataport` pipelining + the cycle the DMA takes to latch the FIFO output (see the `calculate_trigger_delay` docstring). **2 cycles**; counted once, as it applies to both blocks |
-| `branch_penalty` | **3 cycles, measured not derived**, and only on an edge crossed by a *taken* branch — a loop back-edge or a skipped `test` body. Fitted on `loop_2`/`loop_3`/`loop_2_double` (backward edges), then it predicted the forward `test_false` skip gap at 95 ns with no retuning. See `docs/EMPIRICAL_CONSTANTS.md` |
-| `measured_offset` | **1 cycle, measured not derived.** The three terms above come out exactly one cycle short at every boundary, independent of push count, while intra-block layout is exact. Which term owns it is not separable by timing alone — `detect` one low, `propagate` one low, or an unmodelled DAC start latency — so it is kept as its own named term rather than silently folded in |
+| `issue` | counted **exactly out of the compiled program**: instructions from the poll through the next `Trigger DMAs`, along the path that executes (`edge_gap()`). Varies per boundary — 6 for a block with one pulse, 15 when datamover configuration sits in between |
+| `branch_penalty` | 3 cycles per *taken* branch on that path — a loop back-edge or a skipped `test` body; consecutive skipped `test` bodies (each guard jumps only past its own body) are followed as a chain |
+| fixed part | 6 cycles: the poll reads `dma_running` low 1 cycle after the playout ends, the instruction after a hold that waited runs 3 cycles later, and a trigger reaches the output 4 cycles after it executes, less the 2 instructions already in `issue`. The pipeline settings come from the firmware configuration (`tracing.gateware_timing`) |
+
+A poll that is already satisfied when it first executes falls through in one cycle, so a
+block that ends within a cycle of starting (a one-cycle `dwell`) costs 2 cycles less.
 
 At 200 MHz (5 ns/cycle) that lands at **55–100 ns per blocking boundary** on the
 runtimes checked. Real cost varies with the sequence:
@@ -214,11 +268,9 @@ T2E        5 blocks   285 ns dead  ( 9.1%)
 back-to-back. That is precisely why batching with `block=False` avoids this cost,
 and the plot shows the difference directly.
 
-`detect` and `propagate` are read from firmware constants and the documented
-hardware behaviour; `issue` is counted, not modelled; the last two are measured. With
-all four terms the boundary is good to **a small fraction of a cycle** on every case
-tested — but two of the terms are empirical, so a firmware or gateware change can
-invalidate them silently. `--revalidate` is the check.
+Nothing in this is fitted. The boundary is good to **a small fraction of a cycle** on
+every loopback case; a gateware change that moves any of these numbers shows up as
+whole-cycle errors in `--revalidate`.
 Per-block numbers are on `block.gap_after` / `block.gap_breakdown`, the
 total on `trace.dead_time_ns`, and the band is drawn in the plot (`show_gaps=False`
 to hide).
@@ -284,7 +336,7 @@ source falls back to the config when a pulse was never loaded.
 | white outlined bar | ADC capture window |
 | cross-hatched | register/DSP-driven length, symbolic at compile time (`resolve_indeterminate=` to give it a value in cycles) |
 | dotted vertical | barrier inside a synchronizer block |
-| dashed violet box | conditional region — one pass shown, real count is data-dependent |
+| dashed violet box | conditional region; captioned with its condition, plus `— guessed` when the branch could not be decided |
 | pink band | inter-block dead time — see above |
 
 Above ~400 bars in view, per-bar labels and envelopes are dropped — they are
@@ -306,14 +358,12 @@ and they come back.
   builds a fresh runtime each call, so this only bites when reusing a live object.
 - **Register-driven lengths are symbolic** at compile time. Pass
   `resolve_indeterminate` (in cycles) to render a concrete instance.
-- **Two terms in the inter-block gap are empirical** — the +1 cycle boundary offset
-  and the 3-cycle taken-branch penalty. They hold across 29 measured cases, but they
-  are not derived from anything, so a gateware change could invalidate them without
-  any error being raised. `docs/EMPIRICAL_CONSTANTS.md`; re-check with
-  `timing_validation.py --revalidate`.
+- **The inter-block gap is read off the gateware**, not measured at run time, so a
+  gateware change would not raise any error. `docs/TIMING_MODEL.md` lists what it
+  relies on; re-check with `timing_validation.py --revalidate`.
 - **`repeat_until` shows one pass.** Its trip count depends on a live measurement,
   so there is nothing to unroll. The region is drawn once, outlined, and captioned
-  `repeat_until(REG0 == 0) — 1 pass shown; real count is data-dependent`. With
+  `repeat_until(REG0 == 0) — 1 of ? passes`. With
   active reset the real duration is longer by (extra passes) × the body.
   `loop(N)` does *not* have this limit — it is unrolled exactly (validated to
   ≤0.09 ns) and each pass is captioned `pass k of N`.
@@ -323,10 +373,23 @@ and they come back.
   *hangs the sequencer*. Such a region lands in `trace.unsupported_paths` and is
   captioned `TIMING NOT MODELLED (see KI_004)` rather than drawn as if trusted.
   The default `speculation=True` is validated on both arms (0.04 / 0.10 ns).
-- **An undecidable `test` is assumed taken.** If the condition cannot be resolved
-  from the cache, the body is drawn and the block is listed in
-  `trace.assumed_paths`, with the caption saying `assumed taken`. Force the other
-  arm without re-tracing:
+- **An undecidable `test` is assumed taken — except a mutually-exclusive pair only
+  draws one side.** If the condition cannot be resolved from the cache, the body is
+  drawn and the block is listed in `trace.assumed_paths`, with the caption saying
+  `assumed taken`. A runtime often keeps a data-dependent branch's timing symmetric by
+  compiling it as TWO
+  `test()` blocks whose conditions are exact negations of one another on the same
+  live-measurement-fed register (`test(REGn != 0)` / `test(REGn == 0)`) — real
+  hardware takes exactly one, but each is independently unresolvable off-hardware.
+  Defaulting each independently used to draw BOTH as if they ran;
+  now every `test` whose condition has a counterpart that is its exact textual
+  negation anywhere in the trace (`trace.mutually_exclusive_paths`) picks one side
+  once and every later occurrence of that same physical condition — or its negation,
+  including a register reused across separate `test()` pairs, as in a feedforward
+  repeated over rounds — mirrors it, so exactly one is
+  ever drawn. Nested `test`s are gated correctly too: a block only executes if EVERY
+  enclosing `test`/`loop`/`repeat_until` is taken, not just its innermost one. Force
+  either arm without re-tracing:
   `trace.path_choices[block_index] = False; trace.relayout()` (same for
   `trace.loop_counts[block_index] = n`).
 - **Readout kernel `.npy` files are not archived** with the folder. If one has
