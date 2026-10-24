@@ -80,6 +80,7 @@ Claude, and assumes only the checks already in `validation/`.
 | trace succeeds but `--revalidate` drifts by whole cycles on every boundary | gateware timing change | re-measure (`--all`); update `MEASURED_BOUNDARY_OFFSET` / `MEASURED_BRANCH_PENALTY` in `tracing.py` per `EMPIRICAL_CONSTANTS.md` |
 | condition/loop/test mis-read | `Sequencer.{test,loop,repeat_until}` or `Operation` repr changed | `dryrun.branch_recorder`, `tracing.evaluate_condition`/`execution_plan` |
 | envelopes wrong or missing | `io.compute_pulse` / pulse-cache shape changed | `tracing._compute_config_envelopes`, `_snapshot`, `_pulse_address_map` |
+| a filled pulse bar has no envelope at some points | the memory may contain zeros, and repeated shots may keep the same identity sequence | inspect `trace.envelope` and select a later point with `trace.select_point`; each `acadia.run()` is a point |
 
 ## What each check can and cannot see
 

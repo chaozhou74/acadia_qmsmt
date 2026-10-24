@@ -61,6 +61,12 @@ Two bugs the sweep found, now fixed:
 
 ## Gotchas
 
+- **A trace point is one `acadia.run()` call.** Repeated shots remain separate points. Do not
+  infer distinct experimental settings from waveform equality or silently collapse the points.
+- **Check the point before diagnosing a missing envelope.** In the q3 AllXY archive
+  `261023/113114`, point 41 is still I·I; point 50 begins X180·X180 because each pair fires
+  50 shots. Memory capture and the compiled schedule were correct. The proposed hollow
+  zero-waveform style was reverted at the user's request; pulse backgrounds remain solid.
 - **A runtime object can only be traced once** (`Processor data is non-empty`). `trace_folder`
   builds a fresh one each call; `already_traced()` gives the explanatory error.
 - **Tracing must not mutate the runtime.** `duplicate_pulse` appends to `io._config["pulses"]`,

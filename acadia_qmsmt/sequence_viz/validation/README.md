@@ -60,6 +60,16 @@ Paths below are relative to the `sequence_viz/` package root.
 | `python validation/render_validation.py` | packages only | a DRAWING that disagrees with the trace — the second half of the chain (see below) |
 
 
+## AllXY point navigation — 2026-10-23
+
+For the q3 AllXY archive `261023/113114`, all 21 pairs matched independently rendered raw
+samples at the first/last shot of each pair with both saved and installed qmsmt; `compiled.log`
+also matched. Point 41 is intentionally I·I: the first pair occupies points 0–49 because it
+fires 50 shots. Point 50 begins X180·X180. Shot indexing and the timing model are unchanged.
+The proposed hollow rendering of zero memories was reverted at the user's request,
+including its dedicated validation script. The original solid pulse backgrounds remain;
+the relevant action for this archive is to select point 50. No hardware was deployed.
+
 ## The board
 
 The loopback board is a ZCU216 with an **XM650 16T16R N79-band card** (10.66.3.229): every DAC

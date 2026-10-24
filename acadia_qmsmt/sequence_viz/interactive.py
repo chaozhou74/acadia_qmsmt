@@ -29,6 +29,7 @@ a nine-lane sequence -- so a gesture is not one render per event:
 * the full frame is drawn once the gesture stops.
 * hovering repaints only the tooltip, over a snapshot of the plot.
 """
+import numpy as np
 import math
 import time
 
@@ -877,8 +878,10 @@ class SequenceView:
                     index.append((lane[ch], x0 * ns, x1 * ns, head.pulse,
                                   length_ns, "toggle"))
                     if head.io_name:
+                        # channel, cycles and the stretch group: the readout samples exactly what
+                        # draw() draws (the played prefix of the memory, or the stretched layout)
                         self._pulse_iq.append(
-                            (lane[ch], x0 * ns, x1 * ns, head.io_name, head.pulse))
+                            (lane[ch], x0 * ns, x1 * ns, head.io_name, head.pulse, ch, x1 - x0, group))
                 elif head.kind == "CONST_CONT" and ch.startswith("ADC"):
                     index.append((lane[ch], x0 * ns, x1 * ns, "capture",
                                   length_ns, "toggle"))
@@ -1060,12 +1063,28 @@ class SequenceView:
         """Complex envelope value (DAC full scale) at the hovered pulse and time, or None
         when the cursor is not on a pulse. The envelope is sampled evenly across the bar,
         matching how draw() lays it down."""
+        from .plotting import _played_samples, _stretched_time, _stretched_values
         x, y = event.xdata, event.ydata
         if y is None:
             return None
-        for lane_y, x0, x1, io_name, pulse in self._pulse_iq:
+        source = self.draw_kwargs.get("envelope_source", "memory")
+        for lane_y, x0, x1, io_name, pulse, channel, cycles, group in self._pulse_iq:
             if x0 <= x <= x1 and abs(y - lane_y) <= self.HOVER_HALF_HEIGHT:
-                samples = self.trace.envelope(io_name, pulse)
+                if group:
+                    # stretched pulse: first half over the head command, the held middle sample over
+                    # the CONST_CONT, the second half over the tail (as draw() lays it down)
+                    samples = self.trace.envelope(io_name, pulse, source)
+                    if samples is None or not len(samples):
+                        return None
+                    times, half = _stretched_time(group, len(samples))
+                    values = _stretched_values(np.asarray(samples), half)
+                    x_cycles = group[0].start + (x - x0) * cycles / (x1 - x0) if x1 > x0 else group[0].start
+                    idx = int(np.argmin(np.abs(times - x_cycles)))
+                    return complex(values[idx])
+                # only the samples the command PLAYS: a DMA word cut shorter than its memory (a trimmed
+                # CD window, a train prefix) plays the memory's first cycles x samples_per_cycle samples;
+                # mapping the bar onto the whole memory read the zeros past the end (|A| = 0)
+                samples = _played_samples(self.trace, io_name, pulse, source, channel, cycles)
                 if samples is None or not len(samples):
                     return None
                 frac = (x - x0) / (x1 - x0) if x1 > x0 else 0.0

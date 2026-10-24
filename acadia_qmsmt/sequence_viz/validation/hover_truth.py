@@ -38,6 +38,8 @@ value zoomed in as zoomed out.
 Run: ``python validation/hover_truth.py [folders]`` (offline, no Qt, no board).
 """
 import sys
+
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -174,10 +176,29 @@ def readout_truth(view, trace, name, samples=8):
     """
     problems, readings = [], 0
     view.reset()
+    from acadia_qmsmt.sequence_viz.plotting import _played_samples
     entries = [e for e in view._pulse_iq if trace.envelope(e[3], e[4]) is not None]
     picked = entries[:: max(len(entries) // samples, 1)][:samples]
-    for lane_y, x0, x1, io_name, pulse in picked:
-        wave = trace.envelope(io_name, pulse)
+    for lane_y, x0, x1, io_name, pulse, channel, cycles, group in picked:
+        if group:
+            # a stretched pulse: rise over the head command, the held middle sample over the hold,
+            # the fall over the tail (draw()'s layout) -- check the three parts
+            memory = np.asarray(trace.envelope(io_name, pulse))
+            half = len(memory) // 2
+            head, hold, tail = group
+            per_cycle = (x1 - x0) / max(cycles, 1e-12)
+            for at, want in (((head.start + 0.01) , memory[:2]), ((hold.start + hold.stop) / 2, memory[half:half + 1]),
+                             ((tail.stop - 0.01), memory[-2:])):
+                value = view._iq_at(motion(view.ax, x0 + (at - head.start) * per_cycle, lane_y))
+                readings += 1
+                if value is None or not any(abs(value - complex(w)) <= 1e-9 for w in want):
+                    problems.append(f"{name}: stretched {pulse!r} reads {value} where its envelope "
+                                    f"holds {[complex(w) for w in want]}")
+                    break
+            continue
+        # the samples the command PLAYS: a DMA word shorter than its memory plays only the first
+        # cycles x samples_per_cycle samples (a trimmed CD window, a train prefix); the bar is those
+        wave = _played_samples(trace, io_name, pulse, "memory", channel, cycles)
         if wave is None or len(wave) < 2 or x1 <= x0:
             continue
         view.reset()

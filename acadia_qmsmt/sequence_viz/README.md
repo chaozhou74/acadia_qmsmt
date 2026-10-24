@@ -225,6 +225,12 @@ Two things make this practical:
 `summary()` say when it was hit. `capture_points=False` reverts to stopping at a
 single point, which is quicker for one look at a huge sweep.
 
+A point is an **`acadia.run()` call**, not necessarily a new parameter setting. A runtime
+that fires 50 shots after loading each sequence therefore has 50 consecutive points with
+the same waveform. For example, an AllXY run starting with I·I shows zero samples for
+points 0–49; its next pair starts at point 50. Repeated points are preserved: equal waveform
+arrays alone do not prove that two shots had identical experimental settings.
+
 ### Register-driven lengths resolve themselves
 
 A dwell driven by a `Register` has no length at compile time (`REG0` in T1). But
@@ -431,6 +437,10 @@ amplitude fidelity for shape legibility.
 
 `trace.envelope(io_name, pulse, source)` gives the samples directly; the memory
 source falls back to the config when a pulse was never loaded.
+
+A solid background marks the scheduled memory duration, including memories containing
+only zeros. Such a memory has no nonzero envelope to draw. If repeated shots keep showing
+an identity pair, select a later trace point as explained above.
 
 ### Marks
 
