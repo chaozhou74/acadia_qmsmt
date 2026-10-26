@@ -179,7 +179,8 @@ def machine_layout(trace):
         self._pointer_extra = self.plan_pointers[step] if step < len(self.plan_pointers) else {}
         placement = Placement(index=index, iteration=iteration,
                               trigger=block.trigger, blocking=block.blocking,
-                              conditional=block.conditional)
+                              conditional=block.conditional,
+                              path=self.plan_paths[step] if step < len(self.plan_paths) else ())
         channels = {c.channel for c in block.commands}
 
         # Per-channel start: each channel plays its own FIFO from the trigger, so it

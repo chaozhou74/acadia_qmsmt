@@ -46,13 +46,14 @@ class SequenceView:
     # coalesce, so a fast scroll does one render at the end instead of dozens.
     RENDER_INTERVAL_S = 0.03
 
-    def __init__(self, trace, ax, on_viewport=None, on_lanes=None, **draw_kwargs):
+    def __init__(self, trace, ax, on_viewport=None, on_lanes=None, on_tab=None, **draw_kwargs):
         self.trace = trace
         self.ax = ax
         self.canvas = ax.figure.canvas
         self.draw_kwargs = draw_kwargs
         self.on_viewport = on_viewport      # called with the time window after each render
         self.on_lanes = on_lanes            # ... and with the lane range (a scrollbar each)
+        self.on_tab = on_tab                # called with (construct key, event) on a tab click
 
         self.full_xlim = (0.0, max(trace.length_ns, 1.0))
         self.xlim_ns = self.full_xlim
@@ -138,8 +139,9 @@ class SequenceView:
         margins on subsequent renders.
         """
         fig = self.ax.figure
-        key = (self.canvas.get_width_height()
-               if hasattr(self.canvas, "get_width_height") else None)
+        key = ((self.canvas.get_width_height()
+                if hasattr(self.canvas, "get_width_height") else None),
+               getattr(self.ax, "_seqviz_tab_levels", 0))       # the tab rows take height
         if self._layout_pars is None or key != self._layout_key:
             fit_layout(fig, self.ax)
             sp = fig.subplotpars
@@ -325,7 +327,14 @@ class SequenceView:
         return bool(getattr(toolbar, "mode", "") or "")
 
     def _on_press(self, event):
-        if event.inaxes is not self.ax or self._toolbar_busy():
+        if self._toolbar_busy():
+            return
+        tab = self._hit_tab(event)
+        if tab is not None:                 # above the axes, so never a zoom drag
+            if event.button == 1 and self.on_tab is not None:
+                self.on_tab(tab["key"], event)
+            return
+        if event.inaxes is not self.ax:
             return
         if event.button != 1 and not event.dblclick:
             return
@@ -369,6 +378,7 @@ class SequenceView:
             self._last_xy = (event.xdata, event.ydata)
         if self._press is None:
             self._update_hover(event)       # not dragging: show the pulse tooltip
+            self._tab_cursor(self.on_tab is not None and self._hit_tab(event) is not None)
             return
         if event.xdata is None:
             return
@@ -485,7 +495,7 @@ class SequenceView:
         # entry: (lane_y | None for full-height, x0, x1, name, length_ns, kind)
         # kind: "toggle" (pulse/capture: length<->name), "time" (dwell/gap: its
         # duration), "text" (control-flow: the caption)
-        from .plotting import _stretch_groups, branch_regions, branch_caption
+        from .plotting import _stretch_groups, branch_box, branch_regions, branch_caption
         cyc_ns = self.trace.ns_per_cycle
         by_channel = {}
         for c in self.trace.commands:
@@ -524,20 +534,23 @@ class SequenceView:
                     index.append((lane[ch], x0 * ns, x1 * ns, "dwell",
                                   length_ns, "time"))
         # inter-block dead time spans the full height -- always its time
-        for p in (self.trace.placements or self.trace.blocks):
+        for p in self.trace.drawn_blocks:
             if getattr(p, "gap_after", 0):
                 index.append((None, p.stop * ns, (p.stop + p.gap_after) * ns,
                               "dead time", p.gap_after * cyc_ns, "time"))
         self._hover_index = index
         # control-flow regions are hovered near their dashed stroke (not the blank
-        # interior) -- kept separate so the box's box geometry is available. The box
-        # spans y in [-0.62, len(channels) - 0.67] (see plotting.draw).
+        # interior) -- kept separate so the box's box geometry is available; each
+        # nesting level is inset from its parent (see plotting.branch_box). Innermost
+        # first, so where strokes meet the hover names the nested construct.
         self._branch_regions = []
         if self.draw_kwargs.get("show_branches", True):
-            yb, yt = -0.62, len(channels) - 0.67
-            for start, stop, context, info in branch_regions(self.trace):
+            regions = branch_regions(self.trace)
+            levels = max((info["level"] for *_, info in regions), default=1)
+            for start, stop, context, info in sorted(regions, key=lambda r: -r[3]["level"]):
+                yb, height = branch_box(info["level"], len(channels), levels)
                 self._branch_regions.append(
-                    (start * ns, stop * ns, yb, yt,
+                    (start * ns, stop * ns, yb, yb + height,
                      branch_caption(self.trace, context, info)))
         self._hover_key = None
         self._hover = self.ax.annotate(
@@ -582,6 +595,32 @@ class SequenceView:
                 return entry                   # a lane bar wins over the band
         return gap_hit
 
+    def _tab_cursor(self, on_tab):
+        """A pointing hand over a clickable tab, the normal arrow elsewhere."""
+        if on_tab == getattr(self, "_on_tab_cursor", False):
+            return
+        self._on_tab_cursor = on_tab
+        try:
+            from matplotlib.backend_tools import Cursors
+            self.canvas.set_cursor(Cursors.HAND if on_tab else Cursors.POINTER)
+        except Exception:
+            pass                            # a backend without cursors
+
+    def _hit_tab(self, event):
+        """The control-flow tab under the cursor (see plotting.draw), or None."""
+        from .plotting import tab_row, tab_transform
+        tabs = getattr(self.ax, "_seqviz_tabs", None)
+        if not tabs or event.x is None:
+            return None
+        to_px = tab_transform(self.ax).transform
+        levels = self.ax._seqviz_tab_levels
+        for tab in tabs:
+            bottom, height = tab_row(tab["level"], levels)
+            (x0, y0), (x1, y1) = to_px([(tab["x0"], bottom), (tab["x1"], bottom + height)])
+            if min(x0, x1) - 1 <= event.x <= max(x0, x1, x0 + 2) + 1 and y0 <= event.y <= y1:
+                return tab
+        return None
+
     def _hit_branch(self, event):
         """A control-flow region, but only when the cursor is near its dashed
         stroke (any of the four edges) -- not the blank interior."""
@@ -618,8 +657,15 @@ class SequenceView:
         when lengths); a dwell or dead-time band shows its duration; a control-flow box
         shows its caption when hovered near the stroke. Returns True if anything changed.
         """
-        hit = self._hit_pulse(event)
-        if hit is not None:
+        tab = self._hit_tab(event)
+        hit = None if tab is not None else self._hit_pulse(event)
+        if tab is not None:
+            key = ("tab", tab["x0"], tab["level"])
+            # inside the axes, a little below the tab rows, so the tip does not cover them
+            top = self.ax.transData.inverted().transform((0, self.ax.bbox.y1 - 40))[1]
+            anchor = (max(tab["x0"], self.ax.get_xlim()[0]), top)
+            text = tab["tip"] + ("\nclick to change" if self.on_tab is not None else "")
+        elif hit is not None:
             lane_y, x0, x1, name, length_ns, kind = hit
             key = (name, x0, x1, lane_y)
             lo, hi = self.ax.get_ylim()

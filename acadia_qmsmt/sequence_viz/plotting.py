@@ -14,7 +14,7 @@ import re
 
 import numpy as np
 
-from .tracing import _same_conditional
+from .tracing import _same_conditional, _same_context
 
 COPY_SUFFIX = re.compile(r"_copy\d*$")
 
@@ -31,6 +31,9 @@ SURFACE = "#ffffff"
 NEUTRAL_FILL = "#c9c8c0"
 GAP_FILL = "#f2c94c"        # inter-block gap -- a light yellow band
 BRANCH_INK = "#4a3aa7"      # control flow is a caveat, not a series
+BRANCH_DASH = (0, (2.5, 1.5))   # control-flow box outline: short, dense dashes
+TAB_ROW_PT = 12.0           # one row of control-flow tabs above the lanes, per nesting level
+TAB_FONT_PT = 7.0
 
 LANE_HEIGHT = 0.62
 SEPARATOR_PIXELS = 1.5      # visual gap between fills that butt up against each other
@@ -51,6 +54,7 @@ LIGHT_THEME = {
     "ink_primary": INK_PRIMARY, "ink_secondary": INK_SECONDARY, "ink_muted": INK_MUTED,
     "surface": SURFACE, "neutral_fill": NEUTRAL_FILL,
     "gap_fill": GAP_FILL, "branch_ink": BRANCH_INK,
+    "branch_inks": (BRANCH_INK, "#7b68d9", "#a493ea"),     # per nesting level
     "figure_bg": "#ffffff", "axes_bg": "#ffffff",
     "fill_alpha": PULSE_FILL_ALPHA,
 }
@@ -59,6 +63,7 @@ DARK_THEME = {
     "ink_primary": "#f2f2ec", "ink_secondary": "#b6b5ae", "ink_muted": "#7f7e77",
     "surface": "#3a3a42", "neutral_fill": "#4c4c54",
     "gap_fill": "#d9c24e", "branch_ink": "#9d90ff",
+    "branch_inks": ("#9d90ff", "#c9c0ff", "#7a68e8"),
     "figure_bg": "#26262b", "axes_bg": "#26262b",
     "fill_alpha": 0.82,
 }
@@ -168,50 +173,112 @@ def fit_layout(fig, ax):
 
 
 def branch_regions(trace):
-    """Contiguous spans of blocks sharing one control-flow context.
+    """One span per pass of every control-flow construct, at every nesting level.
 
-    One region per *pass*: an unrolled loop's iterations do not merge, because each
-    iteration is a separate placement of the same block index rather than a run of
-    consecutive indices.
+    A construct's span covers everything drawn in that pass, the constructs nested inside it
+    included, so an outer loop's box encloses its inner ones. Separate passes do not merge:
+    a loop body is placed once per pass, and the passes differ in their ``path``.
 
-    :return: ``[(start_cycles, stop_cycles, context, info), ...]`` where ``info`` carries
-        the iteration number so the caption can say which pass this is.
+    :return: ``[(start_cycles, stop_cycles, context, info), ...]``, outermost level first.
+        ``context`` is the ``conditional`` prefix down to this construct (its last entry is
+        the construct), ``info["level"]`` its nesting level (1 = outermost) and
+        ``info["iteration"]`` which pass this is.
     """
-    regions, previous = [], None
-    for block in (trace.placements or trace.blocks):
-        context = getattr(block, "conditional", ())
-        if not context:
-            previous = None
-            continue
-        iteration = getattr(block, "iteration", 0)
-        # adjacency is by block index, not time -- consecutive blocks in one body are
-        # separated by the inter-block gap. Compares by _same_conditional, not `==`:
-        # a context dict carries the raw condition Operation/Register object (see
-        # SequenceTrace._same_context), and that overloads `==` to build ANOTHER
-        # symbolic Operation rather than a bool.
-        if (regions and previous == block.index - 1
-                and _same_conditional(regions[-1][2], context)
-                and regions[-1][3]["iteration"] == iteration):
-            regions[-1][1] = block.stop
-        else:
-            regions.append([block.start, block.stop, context,
-                            {"iteration": iteration,
-                             "assumed": block.index in trace.assumed_paths,
-                             "mutually_exclusive": block.index in getattr(
-                                 trace, "mutually_exclusive_paths", ()),
-                             "unsupported": block.index in getattr(
-                                 trace, "unsupported_paths", ()),
-                             # an unrolled cache-pointer stream: gate count is resolved,
-                             # so the caption states it instead of "count data-dependent"
-                             "stream_count": (len(block.commands)
-                                              if getattr(block, "stream", False)
-                                              else None),
-                             # a repeat_until whose count was resolved from its condition
-                             # register (see repeat_until_count) -- caption states it too
-                             "repeat_count": getattr(
-                                 trace, "repeat_counts", {}).get(block.index)}])
-        previous = block.index
-    return [(a, b, c, d) for a, b, c, d in regions]
+    blocks = list(trace.drawn_blocks)
+
+    def pass_path(block):
+        # a block that was not laid out carries no path: only its innermost pass is known
+        depth = len(getattr(block, "conditional", ()))
+        path = tuple(getattr(block, "path", ()) or ())
+        return path if len(path) == depth else (0,) * (depth - 1) + (getattr(block, "iteration", 0),)
+
+    firsts = {}
+
+    def first_index(block, level):
+        # the block that starts this construct's body, which keys what the trace knows of it
+        key = (block.index, level)
+        if key not in firsts:
+            context = block.conditional[level - 1]
+            firsts[key] = next((b.index for b in trace.blocks if len(b.conditional) >= level
+                                and _same_context(b.conditional[level - 1], context)), None)
+        return firsts[key]
+
+    regions = []
+    max_level = max((len(getattr(b, "conditional", ())) for b in blocks), default=0)
+    for level in range(1, max_level + 1):
+        run = None
+        for block in blocks:
+            conditional = getattr(block, "conditional", ())
+            if len(conditional) < level:
+                run = None
+                continue
+            context, path = conditional[:level], pass_path(block)[:level]
+            # adjacency is in execution order, not time -- consecutive blocks in one body
+            # are separated by the inter-block gap. Compared by _same_conditional, not
+            # `==`: a context dict carries the raw condition Operation/Register object
+            # (see SequenceTrace._same_context), and that overloads `==` to build ANOTHER
+            # symbolic Operation rather than a bool.
+            if run is not None and run[4] == path and _same_conditional(run[2], context):
+                run[1] = block.stop
+                continue
+            first = first_index(block, level)
+            run = [block.start, block.stop, context,
+                   {"level": level,
+                    "key": (first, level - 1),        # as in SequenceTrace.control_flow_summary
+                    "iteration": path[-1],
+                    "assumed": first in trace.assumed_paths,
+                    "mutually_exclusive": first in getattr(trace, "mutually_exclusive_paths", ()),
+                    "unsupported": first in getattr(trace, "unsupported_paths", ()),
+                    # an unrolled cache-pointer stream: gate count is resolved,
+                    # so the caption states it instead of "count data-dependent"
+                    "stream_count": (len(block.commands)
+                                     if getattr(block, "stream", False) and len(conditional) == level
+                                     else None),
+                    # a repeat_until whose count was resolved from its condition
+                    # register (see repeat_until_count) -- caption states it too
+                    "repeat_count": getattr(trace, "repeat_counts", {}).get(first)},
+                   path]
+            regions.append(run)
+    return [(a, b, c, d) for a, b, c, d, _path in regions]
+
+
+def branch_box(level, n_channels, levels):
+    """``(y_bottom, height)`` of a control-flow box at nesting ``level`` (1 = outermost) when
+    ``levels`` levels are drawn: each level is inset from the one around it, so a nested box
+    shows inside its parent rather than on top of it."""
+    bottom, top = -0.62, n_channels - 0.67
+    inset = min(0.15, (top - bottom) / (4 * max(levels, 1))) * (level - 1)
+    return bottom + inset, top - bottom - 2 * inset
+
+
+def tab_transform(ax):
+    """x in data units, y in points above the top of the axes. Built from lazy transforms,
+    so the tabs stay on the axes' top edge when the layout moves it."""
+    from matplotlib.transforms import Affine2D, ScaledTranslation, blended_transform_factory
+    above = (Affine2D().scale(1.0 / 72.0) + ax.figure.dpi_scale_trans
+             + ScaledTranslation(0, 1, ax.transAxes))
+    return blended_transform_factory(ax.transData, above)
+
+
+def tab_row(level, levels):
+    """``(bottom, height)`` in points above the axes of the tab row for a nesting ``level``:
+    the outermost level is the top row, the deepest sits right above the lanes."""
+    return (levels - level) * TAB_ROW_PT + 1.0, TAB_ROW_PT - 2.0
+
+
+def tab_text(tag, caption, short, width_px, char_px):
+    """The longest of the caption, a short form and the bare tag that fits a tab
+    ``width_px`` wide ("" if not even the tag does): a tab never spills onto its neighbour."""
+    for text in (f"{tag} {caption}", f"{tag} {short}" if short else "", tag):
+        if text and len(text) * char_px + 6 <= width_px:
+            return text
+    return ""
+
+
+def branch_ink(theme, level):
+    """The box color for a nesting level: a different shade of purple per level."""
+    inks = theme.get("branch_inks") or (theme["branch_ink"],)
+    return inks[(level - 1) % len(inks)]
 
 
 REGISTER_TOKEN = re.compile(r"\b(?:REG|DSP)\d+\b")
@@ -419,6 +486,8 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
         ``label_pulses=False`` to drop pulse labels entirely.
     """
     from matplotlib.collections import LineCollection
+    from matplotlib.collections import PatchCollection
+    from matplotlib.colors import to_rgba
     from matplotlib.patches import Patch, Rectangle
 
     # Theme colors, bound as locals so the body below reads the same in either mode.
@@ -481,29 +550,57 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
 
     # one outline per control-flow region, not per block: a repeat_until wraps
     # every block in its body, and per-block captions collide
-    for start, stop, context, info in (branch_regions(trace) if show_branches else []):
+    regions = branch_regions(trace) if show_branches else []
+    levels = max((info["level"] for *_, info in regions), default=1)
+    drew_levels = set()
+    # one row of tabs per nesting level above the lanes: each tab spans exactly its box, so
+    # tabs at one level never overlap (passes run one after another) and nested ones are in
+    # other rows; the text is shortened to fit, the full caption is the tab's tooltip
+    ax._seqviz_tabs, ax._seqviz_tab_levels = [], (levels if regions else 0)
+    tags = {e["key"]: e for e in trace.control_flow_summary()} if regions else {}
+    tab_tr = tab_transform(ax)
+    px = span / axes_px                          # one pixel, in plotted units
+    char_px = TAB_FONT_PT * 0.6 * ax.figure.dpi / 72.0
+    tab_rects, box_rects = [], []       # one collection each: a patch per box is slow
+    for start, stop, context, info in regions:
+        r0, r1 = start * ns, stop * ns
+        if r1 < t0 or r0 > t1:
+            continue
+        ink = branch_ink(th, info["level"])
+        entry = tags.get(info["key"], {})
+        tag = entry.get("tag", "")
+        caption = branch_caption(trace, context, info)
+        short = (f"{info['iteration'] + 1}/{entry['count']}"
+                 if entry.get("kind") in ("loop", "repeat_until") and entry.get("count") else "")
+        x0, x1 = max(r0, t0) + px, min(r1, t1) - px
+        bottom, height = tab_row(info["level"], levels)
+        tab_rects.append(Rectangle((x0, bottom), max(x1 - x0, px), height,
+                                   facecolor=to_rgba(ink, 0.22), edgecolor=ink, linewidth=0.9))
+        text = tab_text(tag, caption, short, (x1 - x0) / px, char_px)
+        if text:
+            ax.text(x0 + 3 * px, bottom + height / 2, text, transform=tab_tr, ha="left",
+                    va="center", fontsize=TAB_FONT_PT, color=INK_PRIMARY, clip_on=False,
+                    zorder=7)
+        ax._seqviz_tabs.append({"x0": x0, "x1": x1, "level": info["level"], "key": info["key"],
+                                "tip": f"{tag} {caption}".strip()})
+    for start, stop, context, info in regions:
         r0, r1 = start * ns, stop * ns
         if r1 < t0 or r0 > t1:
             continue
         drew_branch = True
-        ax.add_artist(Rectangle(
-            (r0, -0.62), max(r1 - r0, gap * ns), len(channels) - 0.05,
-            facecolor="none", edgecolor=BRANCH_INK, linestyle=(0, (4, 3)),
-            linewidth=1.6, zorder=1.5))
-        if detailed:
-            caption = branch_caption(trace, context, info)
-            vis0, vis1 = max(r0, t0), min(r1, t1)      # visible part of the region
-            char_px = 7 * 0.6 * ax.figure.dpi / 72.0
-            # label the box only where the *visible* part is wide enough to hold the
-            # caption (it reads on hover otherwise); anchor to the visible left edge
-            # so it stays on screen when zoomed/panned inside the region, just above
-            # the top stroke (top is len(channels) - 0.67)
-            if (vis1 - vis0) / span * axes_px >= len(caption) * char_px:
-                ax.text(vis0 + 0.004 * span, len(channels) - 0.65, caption,
-                        ha="left", va="bottom", fontsize=7, color=BRANCH_INK,
-                        zorder=6, clip_on=True)
+        drew_levels.add(info["level"])
+        ink = branch_ink(th, info["level"])
+        box_y, box_h = branch_box(info["level"], len(channels), levels)
+        box_rects.append(Rectangle(
+            (r0, box_y), max(r1 - r0, gap * ns), box_h,
+            facecolor="none", edgecolor=ink, linestyle=BRANCH_DASH, linewidth=1.6))
+    if tab_rects:
+        ax.add_collection(PatchCollection(tab_rects, match_original=True, transform=tab_tr,
+                                          clip_on=False, zorder=6))
+    if box_rects:
+        ax.add_collection(PatchCollection(box_rects, match_original=True, zorder=1.5))
 
-    for blk in (trace.placements or trace.blocks):
+    for blk in trace.drawn_blocks:
         if blk.stop * ns < t0 or blk.start * ns > t1:
             continue
 
@@ -733,17 +830,20 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
             handles.append(Patch(facecolor=GAP_FILL, alpha=0.22,
                                  label="inter-block gap"))
         if drew_branch:
-            handles.append(Patch(facecolor="none", edgecolor=BRANCH_INK,
-                                 linestyle=(0, (4, 3)),
-                                 label="control flow (see label)"))
+            for level in sorted(drew_levels):
+                handles.append(Patch(facecolor="none", edgecolor=branch_ink(th, level),
+                                     linestyle=BRANCH_DASH,
+                                     label="control flow (see label)" if len(drew_levels) == 1
+                                     else f"control flow, level {level}"))
         if len(handles) >= 2:
             ax.legend(handles=handles, loc="upper left",
                       bbox_to_anchor=(1.005, 1.0), frameon=False, fontsize=8,
                       labelcolor=INK_PRIMARY)
 
     ax.set_title("" if title is False else
-                 title or f"{trace.runtime_class} - sweep point {trace.point}",
-                 fontsize=10, color=INK_PRIMARY, loc="left")
+                 title or f"{trace.runtime_class} - step {trace.point}",
+                 fontsize=10, color=INK_PRIMARY, loc="left",
+                 pad=6.0 + ax._seqviz_tab_levels * TAB_ROW_PT)   # above the tab rows
     return t0, t1
 
 

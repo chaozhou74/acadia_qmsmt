@@ -413,6 +413,7 @@ class Placement:
     gap_after: int = 0
     gap_breakdown: dict = field(default_factory=dict)
     stream: bool = False        # this placement is an unrolled cache-pointer pulse stream
+    path: tuple = ()            # pass index at each nesting level of ``conditional`` (0 for a test)
 
     @property
     def stop(self):
@@ -439,9 +440,13 @@ class SequenceTrace:
     snapshots: list = field(default_factory=list)   # one per acadia.run()
     placements: list = field(default_factory=list)   # what executes, loops unrolled
     control_flow: dict = field(default_factory=dict)
-    loop_counts: dict = field(default_factory=dict)  # block index -> iterations to draw
+    loop_counts: dict = field(default_factory=dict)  # block index (or (block, depth)) -> iterations to draw
     repeat_counts: dict = field(default_factory=dict)  # block index -> resolved repeat_until count
-    path_choices: dict = field(default_factory=dict)  # block index -> take test body?
+    path_choices: dict = field(default_factory=dict)  # block index (or (block, depth)) -> take test body?
+    # (first block, depth) -> what the last execution_plan drew for that loop / test and why
+    # (see _resolve_context); read by control_flow_summary
+    flow_state: dict = field(default_factory=dict)
+    laid_out: bool = False           # relayout has run: an empty `placements` then means nothing runs
     assumed_paths: set = field(default_factory=set)   # tests we could not decide
     # of those, the ones that are one side of a complementary `test() `/`test()` pair
     # (see execution_plan) -- drawn taken, but arbitrarily so, not "probably taken"
@@ -470,6 +475,7 @@ class SequenceTrace:
     # per execution_plan entry, the steps each pointer DSP has taken beyond the compile
     # order: {"DSP0": (its load count, extra steps or None if unknown)}; see _dsp_steps
     plan_pointers: list = field(default_factory=list)
+    plan_paths: list = field(default_factory=list)     # Placement.path of each plan entry
     # Phase 2 execution-model layout (sequence_viz/machine.py), run in parallel behind a
     # `drain_blocks` maps a block=False batch's trigger index (nth) to the issue span of its
     # repeat_until(fifo_empty) drain -- the execution-model layout (machine.py) advances the
@@ -522,6 +528,7 @@ class SequenceTrace:
         shared here.
         """
         from .machine import machine_layout
+        self.laid_out = True
         return machine_layout(self)
 
     def _is_stream_command(self, command):
@@ -574,9 +581,13 @@ class SequenceTrace:
     def commands(self):
         """Commands as executed (loops unrolled). Falls back to the compiled structure
         before the first layout."""
-        if self.placements:
-            return [c for p in self.placements for c in p.commands]
-        return [c for b in self.blocks for c in b.commands]
+        return [c for b in self.drawn_blocks for c in b.commands]
+
+    @property
+    def drawn_blocks(self):
+        """What executes: the placements once laid out -- empty when nothing runs, e.g. both
+        sides of a test pair pinned off -- else, before the first layout, the compiled blocks."""
+        return self.placements if self.laid_out else self.blocks
 
     @property
     def static_commands(self):
@@ -796,7 +807,8 @@ class SequenceTrace:
         A ``repeat_until`` repeats the count :meth:`repeat_until_count` resolves from
         its condition register/literal (recorded in :attr:`repeat_counts`); when that
         can't be resolved the count is data-dependent, so one pass is drawn. A user
-        ``loop_counts[first block]`` overrides either.
+        ``loop_counts[first block]`` overrides either; ``loop_counts[(first block, depth)]``
+        pins one construct only, where a loop nested in another starts at the same block.
 
         A ``test`` whose condition can't be decided from the cache falls back to
         :attr:`path_choices`, then to an arbitrary default -- except this codebase's
@@ -818,13 +830,32 @@ class SequenceTrace:
         self.assumed_paths = set()
         self.unsupported_paths = set()
         self.mutually_exclusive_paths = set()
+        self.flow_state = {}
         self._condition_decisions = {}
+        self._pinned_conditions = self._find_pinned_conditions()
         self._paired_conditions = self._find_paired_conditions()
         self._pointer_extra = {}
         self.plan_pointers = []
+        self.plan_paths, self._path = [], []
         plan = self._plan_level(list(range(len(self.blocks))), 0, 0)
         self._pointer_extra = {}
         return plan
+
+    def _find_pinned_conditions(self):
+        """``{condition text: taken}`` for the tests pinned by a ``(block, depth)`` key of
+        :attr:`path_choices`. A test whose exact complement is pinned follows that pin, ahead of
+        its own cache value: of a complementary pair exactly one side runs, so pinning one side
+        decides both."""
+        pinned = {}
+        for key, taken in self.path_choices.items():
+            if not (isinstance(key, tuple) and len(key) == 2 and taken is not None):
+                continue
+            index, depth = key
+            if 0 <= index < len(self.blocks) and depth < len(self.blocks[index].conditional):
+                context = self.blocks[index].conditional[depth]
+                if context.get("kind") == "test" and context.get("condition") is not None:
+                    pinned[context["condition"]] = bool(taken)
+        return pinned
 
     def _find_paired_conditions(self):
         """Rendered ``test`` condition texts that have their exact negation
@@ -867,9 +898,32 @@ class SequenceTrace:
                     plan.append((index, iteration))
                     # entries are made in execution order, so this lines up with the plan
                     self.plan_pointers.append(dict(self._pointer_extra))
+                    self.plan_paths.append(tuple(self._path))
             else:
+                self._path.append(0)              # a loop's passes set it in _passes
                 plan.extend(self._resolve_context(body, context, depth, iteration))
+                self._path.pop()
         return plan
+
+    @staticmethod
+    def _flow_override(overrides, first_index, depth):
+        """A user pin from ``loop_counts`` / ``path_choices`` for the construct whose body starts at
+        ``first_index`` at nesting ``depth``: keyed ``(block, depth)``, else by the block alone."""
+        key = (first_index, depth)
+        return overrides[key] if key in overrides else overrides.get(first_index)
+
+    def _record_flow(self, first_index, depth, **state):
+        """Note what was drawn for a construct. A construct inside a loop is resolved once per
+        pass: the first pass gives the source (later passes of an undecided test only mirror
+        it), and a test outcome or pass count that differs between passes is recorded as None."""
+        key = (first_index, depth)
+        old = self.flow_state.get(key)
+        if old is not None:
+            state["source"] = old["source"]
+            for name in ("taken", "count"):
+                if name in state and old.get(name) != state[name]:
+                    state[name] = None
+        self.flow_state[key] = state
 
     def _resolve_context(self, body, context, depth, iteration):
         first_index = body[0]
@@ -883,26 +937,36 @@ class SequenceTrace:
             # rather than assert a timeline we know is wrong.
             self.assumed_paths.add(first_index)
             self.unsupported_paths.add(first_index)
+            self._record_flow(first_index, depth, taken=True, source="unsupported")
             return self._plan_level(body, depth + 1, iteration)
 
         if kind == "test":
             condition_text = context.get("condition")
             # explicit choice wins; otherwise try to decide it from this point's cache
-            taken = self.path_choices.get(first_index)
+            taken = self._flow_override(self.path_choices, first_index, depth)
+            source = "pinned"
+            if taken is None:
+                # the other side of a pinned complementary pair runs exactly when the pinned
+                # side does not, whatever this point's cache says
+                complement = _complement_text(condition_text)
+                if complement is not None and complement in self._pinned_conditions:
+                    taken, source = not self._pinned_conditions[complement], "follows"
             if taken is None:
                 taken = self.evaluate_condition(context.get("condition_obj"),
                                                 context.get("register_exprs"))
+                source = "cache"
             if taken is None:
                 # neither -- fall back to the mutually-exclusive-pair default (or a bare
                 # arbitrary default if this condition has no known complement)
+                source = "follows"
                 if condition_text in self._condition_decisions:
                     taken = self._condition_decisions[condition_text]
                 else:
                     complement = _complement_text(condition_text)
-                    taken = (not self._condition_decisions[complement]
-                              if complement is not None
-                              and complement in self._condition_decisions
-                              else True)
+                    if complement is not None and complement in self._condition_decisions:
+                        taken = not self._condition_decisions[complement]
+                    else:
+                        taken, source = True, "assumed"
                 self.assumed_paths.add(first_index)
                 if condition_text in self._paired_conditions:
                     self.mutually_exclusive_paths.add(first_index)
@@ -911,6 +975,7 @@ class SequenceTrace:
             # condition, or its exact complement, stays consistent with it
             if condition_text is not None:
                 self._condition_decisions[condition_text] = taken
+            self._record_flow(first_index, depth, taken=bool(taken), source=source)
             if not taken:
                 self._shift_pointers(context, -1)    # its steps were compiled, never run
                 return []
@@ -919,15 +984,20 @@ class SequenceTrace:
         if kind == "repeat_until":
             # count from the loop's condition register/literal when resolvable
             # (recorded so the caption can state it); else data-dependent -> one pass.
-            count = self.loop_counts.get(first_index)
+            count = self._flow_override(self.loop_counts, first_index, depth)
+            source = "pinned"
             # a cache-pointer stream unrolls its whole train inside one pass (_expand_stream)
             streamed = any(self._is_stream_command(c) for i in body for c in self.blocks[i].commands)
             if count is None and not streamed:
+                source = "cache"
                 count = self._pointer_loop_count(context)
                 if count is None:
                     count = self.repeat_until_count(context)
                 if count is not None:
                     self.repeat_counts[first_index] = int(count)
+            if count is None:
+                source = "stream" if streamed else "assumed"
+            self._record_flow(first_index, depth, count=1 if count is None else int(count), source=source)
             known = count is not None
             plan = self._passes(body, context, depth, 1 if count is None else int(count))
             if not known:
@@ -935,7 +1005,11 @@ class SequenceTrace:
             return plan
 
         # loop: deterministic count, unrolled.
-        count = self.loop_counts.get(first_index, context.get("count") or 1)
+        count = self._flow_override(self.loop_counts, first_index, depth)
+        source = "pinned"
+        if count is None:
+            count, source = context.get("count") or 1, "compiled"
+        self._record_flow(first_index, depth, count=max(int(count), 1), source=source)
         return self._passes(body, context, depth, max(int(count), 1))
 
     def _passes(self, body, context, depth, count):
@@ -945,6 +1019,7 @@ class SequenceTrace:
         for n in range(max(count, 0)):
             if n:
                 self._shift_pointers(context, 1)
+            self._path[-1] = n
             plan.extend(self._plan_level(body, depth + 1, n))
         if count <= 0:
             self._shift_pointers(context, -1)
@@ -952,8 +1027,7 @@ class SequenceTrace:
 
     @property
     def length_cycles(self):
-        source = self.placements or self.blocks
-        return max((b.stop for b in source), default=0)
+        return max((b.stop for b in self.drawn_blocks), default=0)
 
     @property
     def length_ns(self):
@@ -995,6 +1069,74 @@ class SequenceTrace:
                         leaf, context.get("register_exprs")) is not None
                     found[leaf] = found.get(leaf, True) and resolved
         return found
+
+    def control_flow_summary(self):
+        """Every ``loop`` / ``repeat_until`` / ``test`` of the sequence, for a UI that pins them.
+
+        One entry per construct in program order, outermost first, grouped exactly as
+        :meth:`execution_plan` groups them::
+
+            {key, tag, kind, depth, label, condition, compiled_count, count, taken, source,
+             reached, settable, paired}
+
+        ``key`` is ``(first block, depth)``: write it into :attr:`loop_counts` (a loop's passes)
+        or :attr:`path_choices` (whether a test's body runs), then :meth:`relayout`. ``count`` /
+        ``taken`` / ``source`` are what the last layout drew and why -- ``pinned``, ``compiled``
+        (a loop's own count), ``cache`` (decided from this point's registers), ``follows`` (a
+        test mirroring an earlier test of the same register, see :meth:`execution_plan`),
+        ``assumed`` (undecidable; a default was drawn), ``stream`` (a cache-pointer stream, one
+        pass holding the whole train), ``unsupported`` (``speculation=False``). ``reached`` is
+        False inside a branch that is not drawn. ``settable`` is False where a pin is ignored:
+        a streamed loop and a ``speculation=False`` test. ``tag`` is a short name for the
+        construct, ``@<first block>``, with ``.<level>`` added where two constructs begin at the
+        same block -- the name its tab on the drawing carries.
+        """
+        paired = getattr(self, "_paired_conditions", set())
+        entries = []
+
+        def walk(indices, depth):
+            i = 0
+            while i < len(indices):
+                context = (self.blocks[indices[i]].conditional[depth]
+                           if depth < len(self.blocks[indices[i]].conditional) else None)
+                j = i + 1
+                if context is not None:
+                    while (j < len(indices)
+                           and depth < len(self.blocks[indices[j]].conditional)
+                           and _same_context(self.blocks[indices[j]].conditional[depth], context)):
+                        j += 1
+                    body = indices[i:j]
+                    entries.append(flow_entry(body, depth, context))
+                    walk(body, depth + 1)
+                i = j
+
+        def flow_entry(body, depth, context):
+            kind, condition = context.get("kind"), context.get("condition")
+            state = self.flow_state.get((body[0], depth))
+            if kind == "test":
+                label = f"test {condition or ''}".strip()
+                settable = context.get("speculation") is not False
+            elif kind == "repeat_until":
+                label = f"repeat until {condition or ''}".strip()
+                settable = not any(self._is_stream_command(c) for i in body
+                                   for c in self.blocks[i].commands)
+            else:
+                label = f"loop x{context.get('count') or 1}"
+                settable = True
+            return {"key": (body[0], depth), "kind": kind, "depth": depth, "label": label,
+                    "condition": condition, "compiled_count": context.get("count"),
+                    "count": (state or {}).get("count"), "taken": (state or {}).get("taken"),
+                    "source": (state or {}).get("source"), "reached": state is not None,
+                    "settable": settable, "paired": kind == "test" and condition in paired}
+
+        walk(list(range(len(self.blocks))), 0)
+        starts = {}
+        for entry in entries:
+            starts[entry["key"][0]] = starts.get(entry["key"][0], 0) + 1
+        for entry in entries:
+            block, depth = entry["key"]
+            entry["tag"] = f"@{block}" if starts[block] == 1 else f"@{block}.{depth + 1}"
+        return entries
 
     def register_summary(self):
         """Describe every register / length-symbol for a per-register UI control.
@@ -1105,7 +1247,7 @@ class SequenceTrace:
     @property
     def dead_time_ns(self):
         """Total inter-block dead time -- the boundary gaps from :func:`edge_gap`."""
-        return sum(b.gap_after for b in (self.placements or self.blocks)) * self.ns_per_cycle
+        return sum(b.gap_after for b in self.drawn_blocks) * self.ns_per_cycle
 
     def summary(self):
         of_n = f" of {self.n_points}" if self.n_points > 1 else ""
