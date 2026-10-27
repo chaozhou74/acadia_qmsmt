@@ -18,7 +18,11 @@ Re-rendering on every viewport change is what makes zooming useful: label
 density, the ns/µs unit and the envelope overlay are all chosen for the window
 currently in view, and marks outside it are culled.
 """
+import math
 import time
+
+from matplotlib.backend_bases import TimerBase
+from matplotlib.transforms import Bbox
 
 from .plotting import draw, fit_layout
 
@@ -42,12 +46,14 @@ class SequenceView:
     # coalesce, so a fast scroll does one render at the end instead of dozens.
     RENDER_INTERVAL_S = 0.03
 
-    def __init__(self, trace, ax, on_viewport=None, **draw_kwargs):
+    def __init__(self, trace, ax, on_viewport=None, on_lanes=None, on_tab=None, **draw_kwargs):
         self.trace = trace
         self.ax = ax
         self.canvas = ax.figure.canvas
         self.draw_kwargs = draw_kwargs
-        self.on_viewport = on_viewport
+        self.on_viewport = on_viewport      # called with the time window after each render
+        self.on_lanes = on_lanes            # ... and with the lane range (a scrollbar each)
+        self.on_tab = on_tab                # called with (construct key, event) on a tab click
 
         self.full_xlim = (0.0, max(trace.length_ns, 1.0))
         self.xlim_ns = self.full_xlim
@@ -58,6 +64,9 @@ class SequenceView:
         self._last_click = None
         self._rubber = None
         self._bg = None             # cached plot background for blitting the rubber band
+        self._rubber_box = None     # pixel box the rubber band was last blitted over
+        self._clean = None          # the last finished frame, without tooltip / readout
+        self._overlay_box = None    # pixel box the tooltip / readout cover on screen
         self._cids = []
         self._hover = None          # tooltip annotation, rebuilt on every render
         self._readout = None        # bottom-left time/IQ readout, rebuilt on every render
@@ -71,7 +80,11 @@ class SequenceView:
         self._timer = None          # coalesces throttled renders
         self._timer_running = False
         self._pending = False
-        self._last_render = 0.0
+        self._last_render = 0.0     # when the last frame reached the screen
+        self._frame_start = None    # set while a frame is in flight (render -> draw_event)
+        self._frame_s = self.RENDER_INTERVAL_S   # measured frame time, paces the throttle
+        self._drawn_xlim = self.xlim_ns          # the window the axes currently show
+        self._press_px = None
         self.render()
         self._connect()
 
@@ -79,12 +92,21 @@ class SequenceView:
 
     @property
     def divisor(self):
-        """Plotted-unit divisor for the current window (1 for ns, 1000 for µs)."""
+        """Plotted-unit divisor of the DRAWN window (1 for ns, 1000 for µs) -- event xdata is
+        in its units, even while a newer window waits for its frame."""
         from .plotting import _time_scale
-        return _time_scale(self.xlim_ns[1] - self.xlim_ns[0])[0]
+        return _time_scale(self._drawn_xlim[1] - self._drawn_xlim[0])[0]
+
+    def _x_to_ns(self, x_px):
+        """A canvas pixel column as a time in the pending window."""
+        box, (lo, hi) = self.ax.bbox, self.xlim_ns
+        return lo + (x_px - box.x0) / max(box.width, 1.0) * (hi - lo)
 
     def render(self):
+        self._frame_start = time.monotonic()
+        self._clean = None          # the snapshot is of the old frame until this one is drawn
         draw(self.ax, self.trace, xlim_ns=self.xlim_ns, **self.draw_kwargs)
+        self._drawn_xlim = self.xlim_ns
         self._install_hover()       # draw() cleared the axes, so rebuild the tooltip
         if self.ylim is not None:
             self.ax.set_ylim(*self.ylim)
@@ -92,6 +114,21 @@ class SequenceView:
         self.canvas.draw_idle()
         if self.on_viewport:
             self.on_viewport(self.xlim_ns)
+        if self.on_lanes:
+            self.on_lanes(self.ylim or self.full_ylim)
+
+    @property
+    def full_ylim(self):
+        """The whole lane stack, as draw() lays it out."""
+        return (-0.7, len(self.trace.channels) - 0.3)
+
+    @staticmethod
+    def _slide(lo, hi, full):
+        """``(lo, hi)`` moved back inside ``full`` keeping its width (all of ``full`` if wider)."""
+        if hi - lo >= full[1] - full[0]:
+            return full
+        shift = max(full[0] - lo, 0.0) - max(hi - full[1], 0.0)
+        return lo + shift, hi + shift
 
     def _fit_layout(self):
         """Reserve room for the outside legend and lane labels.
@@ -102,8 +139,9 @@ class SequenceView:
         margins on subsequent renders.
         """
         fig = self.ax.figure
-        key = (self.canvas.get_width_height()
-               if hasattr(self.canvas, "get_width_height") else None)
+        key = ((self.canvas.get_width_height()
+                if hasattr(self.canvas, "get_width_height") else None),
+               getattr(self.ax, "_seqviz_tab_levels", 0))       # the tab rows take height
         if self._layout_pars is None or key != self._layout_key:
             fit_layout(fig, self.ax)
             sp = fig.subplotpars
@@ -113,47 +151,123 @@ class SequenceView:
         else:
             fig.subplots_adjust(**self._layout_pars)
 
-    def set_window(self, t0_ns, t1_ns, ylim=None):
-        """Show ``[t0_ns, t1_ns]``, clamped to the sequence and a sane minimum."""
-        self._apply_window(t0_ns, t1_ns, ylim)
+    def set_window(self, t0_ns, t1_ns, ylim=None, throttle=False):
+        """Show ``[t0_ns, t1_ns]``, clamped to the sequence and a sane minimum. ``throttle``
+        paces renders to the measured frame time, for a caller that sends many (a scrollbar)."""
+        self._apply_window(t0_ns, t1_ns, ylim, throttle=throttle)
 
     def _apply_window(self, t0_ns, t1_ns, ylim=None, throttle=False):
         lo, hi = sorted((float(t0_ns), float(t1_ns)))
         if hi - lo < self.MIN_SPAN_NS:
             mid = 0.5 * (lo + hi)
             lo, hi = mid - self.MIN_SPAN_NS / 2, mid + self.MIN_SPAN_NS / 2
-        self.xlim_ns = (lo, hi)
+        self.xlim_ns = self._slide(lo, hi, self.full_xlim)
         if ylim is not None:
-            self.ylim = ylim
+            self.ylim = self._slide(*sorted(ylim), self.full_ylim)
+        if throttle:
+            self._request_render()
+        else:
+            self.render()
+
+    def set_lanes(self, y0, y1, throttle=False):
+        """Show lanes ``[y0, y1]`` (lane coordinates: channel i of trace.channels sits at
+        len(channels) - 1 - i), kept inside the stack."""
+        self.ylim = self._slide(*sorted((float(y0), float(y1))), self.full_ylim)
         if throttle:
             self._request_render()
         else:
             self.render()
 
     def _request_render(self):
-        """Render now if idle, else coalesce into one trailing render -- a burst
-        of scroll/pan events collapses to ~RENDER_INTERVAL_S rather than dozens
-        of full re-renders."""
-        now = time.monotonic()
-        if not self._timer_running and now - self._last_render >= self.RENDER_INTERVAL_S:
-            self._last_render = now
+        """Render now if no frame is in flight and the last one is a frame time old, else
+        coalesce into one trailing render: a burst of scroll/pan events then costs one
+        frame per frame time, and the view lands on the latest window."""
+        interval = min(max(self._frame_s, self.RENDER_INTERVAL_S), 0.5)
+        idle = self._frame_start is None and not self._timer_running
+        if idle and time.monotonic() - self._last_render >= interval:
             self.render()
             return
         self._pending = True
         if not self._timer_running:
             if self._timer is None:
-                self._timer = self.canvas.new_timer(
-                    interval=max(int(self.RENDER_INTERVAL_S * 1000), 1))
+                self._timer = self.canvas.new_timer()
                 self._timer.single_shot = True
                 self._timer.add_callback(self._flush_render)
+            if type(self._timer) is TimerBase:     # no event loop (Agg): it never fires
+                self._pending = False
+                self.render()
+                return
+            self._timer.interval = max(int(interval * 1000), 1)
             self._timer_running = True
             self._timer.start()
+
+    def _on_draw(self, _event):
+        """A frame reached the screen: time it (render() to here, where the raster is), and
+        keep it as the clean background the tooltip and readout are blitted onto."""
+        if self._frame_start is not None:
+            self._frame_s = 0.5 * self._frame_s + 0.5 * (time.monotonic() - self._frame_start)
+            self._frame_start = None
+        self._last_render = time.monotonic()
+        if getattr(self.canvas, "supports_blit", False):
+            try:
+                self._clean = self.canvas.copy_from_bbox(self.ax.figure.bbox)
+                self._draw_overlays()       # animated artists are left out of the frame
+                self._overlay_box = self._extent(self._overlays())
+            except Exception:
+                self._clean = None
+
+    def _overlays(self):
+        return [a for a in (self._hover, self._readout) if a is not None and a.get_visible()]
+
+    def _draw_overlays(self):
+        for artist in self._overlays():
+            self.ax.draw_artist(artist)
+
+    def _extent(self, artists):
+        """Pixel box around drawn artists, a text's rounded frame included; None if none."""
+        renderer = self.canvas.get_renderer()
+        boxes = []
+        for artist in artists:
+            boxes.append(artist.get_window_extent(renderer))
+            patch = getattr(artist, "get_bbox_patch", lambda: None)()
+            if patch is not None:
+                boxes.append(patch.get_window_extent(renderer))
+        return Bbox.union(boxes).padded(3) if boxes else None
+
+    def _blit_changed(self, before, after):
+        """Repaint only where an overlay was and now is. Each blit is a synchronous
+        repaint of that area, and a whole-figure one per mouse move is slow on a
+        high-DPI display."""
+        boxes = [box for box in (before, after) if box is not None]
+        if boxes:
+            self.canvas.blit(Bbox.union(boxes))
+
+    def _refresh_overlays(self):
+        """Show a tooltip / readout change: paste the clean frame back where the overlays
+        were, draw them again and repaint only that area (about a millisecond), rather than
+        re-rasterising the whole plot."""
+        if self._clean is None:
+            self.canvas.draw_idle()         # no current frame to blit onto yet
+            return
+        try:
+            before = self._overlay_box
+            if before is not None:          # outside it the buffer already is the clean frame
+                height = self.ax.figure.bbox.height
+                self.canvas.restore_region(
+                    self._clean, xy=(0, 0),
+                    bbox=(math.floor(before.x0), math.floor(height - before.y1),
+                          math.ceil(before.x1), math.ceil(height - before.y0)))
+            self._draw_overlays()
+            self._overlay_box = self._extent(self._overlays())
+            self._blit_changed(before, self._overlay_box)
+        except Exception:
+            self._clean = None
+            self.canvas.draw_idle()
 
     def _flush_render(self):
         self._timer_running = False
         if self._pending:
             self._pending = False
-            self._last_render = time.monotonic()
             self.render()
 
     def reset(self):
@@ -164,8 +278,11 @@ class SequenceView:
     def set_point(self, index):
         """Show another captured sweep point. No re-tracing -- the schedule is
         shared and only the pulse data and register lengths change."""
+        zoomed = self.xlim_ns != self.full_xlim
         self.trace.select_point(index)
         self.full_xlim = (0.0, max(self.trace.length_ns, 1.0))
+        if not zoomed:              # the whole sequence stays in view as its length changes
+            self.xlim_ns = self.full_xlim
         self.render()
 
     def relayout(self):
@@ -188,6 +305,8 @@ class SequenceView:
             ("button_release_event", self._on_release),
             ("scroll_event", self._on_scroll),
             ("key_press_event", self._on_key),
+            ("draw_event", self._on_draw),
+            ("resize_event", self._on_resize),
         ]:
             self._cids.append(self.canvas.mpl_connect(event, handler))
 
@@ -208,7 +327,14 @@ class SequenceView:
         return bool(getattr(toolbar, "mode", "") or "")
 
     def _on_press(self, event):
-        if event.inaxes is not self.ax or self._toolbar_busy():
+        if self._toolbar_busy():
+            return
+        tab = self._hit_tab(event)
+        if tab is not None:                 # above the axes, so never a zoom drag
+            if event.button == 1 and self.on_tab is not None:
+                self.on_tab(tab["key"], event)
+            return
+        if event.inaxes is not self.ax:
             return
         if event.button != 1 and not event.dblclick:
             return
@@ -224,6 +350,7 @@ class SequenceView:
         self._last_xy = None        # never fall back to a previous drag's end
         self._press = (event.xdata, event.ydata,
                        bool(event.key and "shift" in event.key))
+        self._press_px = event.x
         self._hide_hover()          # get the tooltip out of the way while dragging
 
     def _is_double_click(self, event):
@@ -238,6 +365,11 @@ class SequenceView:
                 and abs(event.x - x) <= self.DOUBLE_CLICK_PIXELS
                 and abs(event.y - y) <= self.DOUBLE_CLICK_PIXELS)
 
+    def _on_resize(self, _event):
+        """The figure keeps its margin fractions through a resize, which clips the lane
+        labels on a narrower canvas; re-render, which refits them for the new size."""
+        self._request_render()
+
     def _on_motion(self, event):
         if event.xdata is not None:
             # remembered so a drag released outside the axes still zooms --
@@ -246,14 +378,17 @@ class SequenceView:
             self._last_xy = (event.xdata, event.ydata)
         if self._press is None:
             self._update_hover(event)       # not dragging: show the pulse tooltip
+            self._tab_cursor(self.on_tab is not None and self._hit_tab(event) is not None)
             return
         if event.xdata is None:
             return
         x0, y0, panning = self._press
         if panning:
-            shift = (x0 - event.xdata) * self.divisor
+            # in pixels: event.xdata is in the drawn frame, which lags the pending window
             lo, hi = self.xlim_ns
-            self.xlim_ns = (lo + shift, hi + shift)
+            shift = -(event.x - self._press_px) / max(self.ax.bbox.width, 1.0) * (hi - lo)
+            self._press_px = event.x
+            self.xlim_ns = self._slide(lo + shift, hi + shift, self.full_xlim)
             self._request_render()          # throttled -- pan fires per pixel
             self._press = (event.xdata, event.ydata, True)
             return
@@ -292,7 +427,7 @@ class SequenceView:
         if event.inaxes is not self.ax or event.xdata is None:
             return
         factor = 0.8 if event.button == "up" else 1.25
-        centre = event.xdata * self.divisor
+        centre = self._x_to_ns(event.x)
         lo, hi = self.xlim_ns
         self._apply_window(centre - (centre - lo) * factor,
                            centre + (hi - centre) * factor, throttle=True)
@@ -332,7 +467,8 @@ class SequenceView:
             try:
                 self.canvas.restore_region(self._bg)
                 self.ax.draw_artist(self._rubber)
-                self.canvas.blit(self.ax.bbox)
+                before, self._rubber_box = self._rubber_box, self._extent([self._rubber])
+                self._blit_changed(before, self._rubber_box)
                 return
             except Exception:
                 self._bg = None
@@ -342,6 +478,7 @@ class SequenceView:
         if self._rubber is not None:
             self._rubber.set_visible(False)
         self._bg = None
+        self._rubber_box = None
 
     # ---------------- hover tooltip ----------------
 
@@ -358,7 +495,7 @@ class SequenceView:
         # entry: (lane_y | None for full-height, x0, x1, name, length_ns, kind)
         # kind: "toggle" (pulse/capture: length<->name), "time" (dwell/gap: its
         # duration), "text" (control-flow: the caption)
-        from .plotting import _stretch_groups, branch_regions, branch_caption
+        from .plotting import _stretch_groups, branch_box, branch_regions, branch_caption
         cyc_ns = self.trace.ns_per_cycle
         by_channel = {}
         for c in self.trace.commands:
@@ -397,27 +534,30 @@ class SequenceView:
                     index.append((lane[ch], x0 * ns, x1 * ns, "dwell",
                                   length_ns, "time"))
         # inter-block dead time spans the full height -- always its time
-        for p in (self.trace.placements or self.trace.blocks):
+        for p in self.trace.drawn_blocks:
             if getattr(p, "gap_after", 0):
                 index.append((None, p.stop * ns, (p.stop + p.gap_after) * ns,
                               "dead time", p.gap_after * cyc_ns, "time"))
         self._hover_index = index
         # control-flow regions are hovered near their dashed stroke (not the blank
-        # interior) -- kept separate so the box's box geometry is available. The box
-        # spans y in [-0.62, len(channels) - 0.67] (see plotting.draw).
+        # interior) -- kept separate so the box's box geometry is available; each
+        # nesting level is inset from its parent (see plotting.branch_box). Innermost
+        # first, so where strokes meet the hover names the nested construct.
         self._branch_regions = []
         if self.draw_kwargs.get("show_branches", True):
-            yb, yt = -0.62, len(channels) - 0.67
-            for start, stop, context, info in branch_regions(self.trace):
+            regions = branch_regions(self.trace)
+            levels = max((info["level"] for *_, info in regions), default=1)
+            for start, stop, context, info in sorted(regions, key=lambda r: -r[3]["level"]):
+                yb, height = branch_box(info["level"], len(channels), levels)
                 self._branch_regions.append(
-                    (start * ns, stop * ns, yb, yt,
+                    (start * ns, stop * ns, yb, yb + height,
                      branch_caption(self.trace, context, info)))
         self._hover_key = None
         self._hover = self.ax.annotate(
             "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
             ha="left", va="bottom", fontsize=8, color="#1a1a19", zorder=20,
             bbox=dict(boxstyle="round,pad=0.35", fc="#fbfbe6", ec="#8c8b83",
-                      lw=0.6))
+                      lw=0.6), animated=True)
         self._hover.set_visible(False)
 
         # Readout below the time axis: the cursor time, plus the pulse amplitude / IQ when
@@ -436,7 +576,8 @@ class SequenceView:
             fontsize=8, family="monospace", zorder=21,
             color=th.get("ink_primary", "#1a1a19"),
             bbox=dict(boxstyle="round,pad=0.3", fc=th.get("surface", "#ffffff"),
-                      ec=th.get("ink_muted", "#8c8b83"), lw=0.6, alpha=0.95))
+                      ec=th.get("ink_muted", "#8c8b83"), lw=0.6, alpha=0.95),
+            animated=True)
         self._readout.set_visible(False)
 
     def _hit_pulse(self, event):
@@ -453,6 +594,32 @@ class SequenceView:
             elif abs(y - lane_y) <= self.HOVER_HALF_HEIGHT:
                 return entry                   # a lane bar wins over the band
         return gap_hit
+
+    def _tab_cursor(self, on_tab):
+        """A pointing hand over a clickable tab, the normal arrow elsewhere."""
+        if on_tab == getattr(self, "_on_tab_cursor", False):
+            return
+        self._on_tab_cursor = on_tab
+        try:
+            from matplotlib.backend_tools import Cursors
+            self.canvas.set_cursor(Cursors.HAND if on_tab else Cursors.POINTER)
+        except Exception:
+            pass                            # a backend without cursors
+
+    def _hit_tab(self, event):
+        """The control-flow tab under the cursor (see plotting.draw), or None."""
+        from .plotting import tab_row, tab_transform
+        tabs = getattr(self.ax, "_seqviz_tabs", None)
+        if not tabs or event.x is None:
+            return None
+        to_px = tab_transform(self.ax).transform
+        levels = self.ax._seqviz_tab_levels
+        for tab in tabs:
+            bottom, height = tab_row(tab["level"], levels)
+            (x0, y0), (x1, y1) = to_px([(tab["x0"], bottom), (tab["x1"], bottom + height)])
+            if min(x0, x1) - 1 <= event.x <= max(x0, x1, x0 + 2) + 1 and y0 <= event.y <= y1:
+                return tab
+        return None
 
     def _hit_branch(self, event):
         """A control-flow region, but only when the cursor is near its dashed
@@ -481,7 +648,7 @@ class SequenceView:
         tip_changed = self._compute_tooltip(event)
         readout_changed = self._compute_readout(event)
         if tip_changed or readout_changed:
-            self.canvas.draw_idle()
+            self._refresh_overlays()
 
     def _compute_tooltip(self, event):
         """Point the near-cursor tooltip at whatever is under the cursor (no redraw).
@@ -490,8 +657,15 @@ class SequenceView:
         when lengths); a dwell or dead-time band shows its duration; a control-flow box
         shows its caption when hovered near the stroke. Returns True if anything changed.
         """
-        hit = self._hit_pulse(event)
-        if hit is not None:
+        tab = self._hit_tab(event)
+        hit = None if tab is not None else self._hit_pulse(event)
+        if tab is not None:
+            key = ("tab", tab["x0"], tab["level"])
+            # inside the axes, a little below the tab rows, so the tip does not cover them
+            top = self.ax.transData.inverted().transform((0, self.ax.bbox.y1 - 40))[1]
+            anchor = (max(tab["x0"], self.ax.get_xlim()[0]), top)
+            text = tab["tip"] + ("\nclick to change" if self.on_tab is not None else "")
+        elif hit is not None:
             lane_y, x0, x1, name, length_ns, kind = hit
             key = (name, x0, x1, lane_y)
             lo, hi = self.ax.get_ylim()
@@ -575,7 +749,7 @@ class SequenceView:
             self._readout_text = None
             dirty = True
         if dirty:
-            self.canvas.draw_idle()
+            self._refresh_overlays()
 
 
 def interactive_view(trace, figsize=None, **draw_kwargs):

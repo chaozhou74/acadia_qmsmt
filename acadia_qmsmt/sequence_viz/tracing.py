@@ -13,17 +13,21 @@ extends the subschedule lists in place, so reading its ``schedules`` argument
 back after the call yields the subschedule structure *including* the alignment
 dwells acadia inserted -- which is what makes barriers and padding visible.
 """
+import linecache
 import re
+import sys
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
 import numpy as np
 
+from acadia.compiler import ManagedResource, Operation
 from acadia.system import DMASynchronizer
 from acadia.sequencer import STP, Destination
 
-from .dryrun import (StopDryRun, already_traced, branch_recorder,
-                     hardware_stubbed, preserved_runtime_state)
+from .dryrun import (BUS_ADDRESS_ATTR, BUS_STATE_ATTR, StopDryRun, already_traced, branch_recorder,
+                     describe_operation, hardware_stubbed,
+                     preserved_runtime_state)
 
 KIND = {
     DMASynchronizer.ARBITRARY_CONTINUED: "ARB_CONT",
@@ -36,35 +40,303 @@ KIND = {
 # The compiled program is read through structured STP fields (see `decode_program` and the
 # `_is_*` predicates below), not by matching `instruction.pprint()` text.
 
-# Measured, not derived. The three terms below (detect + issue + propagate) come out one
-# cycle short of hardware at every blocking block boundary. Established on the 4-channel
-# DAC->ADC loopback (validation/timing_validation.py, 2026-07-27): the error is
-# +1.000 cycle for one boundary and +2.00 for two, and does not change with the number of
-# DMA pushes (1 / 2 / 4 channels all give +1), while intra-block layout -- back-to-back
-# pulses, dwell(), and block=False FIFO batching -- is exact to 0.01 cycle. So the shortfall
-# is a fixed per-boundary constant, not a counting error. Which term owns it is not
-# separable by timing alone: candidates are Acadia._bus_latency("dma_running") being one
-# low, the trigger->DMA-load propagation being one low, or a DAC start latency that is not
-# modelled at all. Kept as its own named term rather than silently folded into one of them.
-MEASURED_BOUNDARY_OFFSET = 1
+# Sequencer and DMA timing, read off the gateware (acadia_sequencer.vhd, acadia_dma.vhd and the
+# bus modules pyacadia generates), in sequencer cycles. The firmware-dependent parts are in
+# `gateware_timing`.
+#
+# A taken branch costs this many cycles on top of its own: the PC register, the instruction
+# memory's one-cycle read and the instruction register refill before the target executes.
+TAKEN_BRANCH_CYCLES = 3
+# A PC hold re-executes until its condition reads clear. If it held at least once, the next
+# instruction executes this many cycles after that read (the fetch restarts, as after a branch,
+# but the PC is already pointing past the hold). A hold whose condition is already clear the
+# first time it executes falls through in one cycle like any other instruction.
+HOLD_EXIT_CYCLES = 3
+# A DMA loads a descriptor on one clock edge and registers its output on the next, so the first
+# sample leaves this many cycles after the descriptor is pulled from the FIFO.
+DMA_START = 2
 
-# Also measured. A boundary crossed by a TAKEN branch (a loop back-edge) costs three more
-# cycles than the straight-line instruction count, on top of MEASURED_BOUNDARY_OFFSET --
-# consistent with a pipeline flush on the redirected fetch. Established on the loopback with
-# two different loop bodies (timing_validation.py cases loop_2 / loop_3 / loop_2_double,
-# 2026-07-27): a 4-push body measured 20 cycles against 11 counted instructions, an 8-push
-# body 21 against 12. The counting tracks the body exactly; only this constant is extra.
-MEASURED_BRANCH_PENALTY = 3
-
-# `test` condition strings come from dryrun's branch_recorder (a rendering of the Python
-# condition object), NOT from the compiled program -- so this stays a small text match.
-CONDITION_RE = re.compile(r"^(REG\d+)\s*(==|!=|<=|>=|<|>)\s*(\S+)$")
 # A counter-driven `repeat_until(counter == target)`: two operands (register/DSP names or
 # literals) around a comparison. Used to resolve how many times such a loop runs.
 COUNTER_RE = re.compile(r"^(\w+)\s*(==|!=|<=|>=|<|>)\s*(\w+)$")
 # The incrementing counter in that idiom is a DSP (loaded 0, +1 per pass); the other operand
 # is the target. `REG <op> literal` waits are NOT this -- their register is the varying side.
 COUNTER_NAME_RE = re.compile(r"DSP\d+")
+
+# A rendered condition split into its two operands and comparison -- deliberately loose on
+# the operand side (each may itself be a compound expression like "REG3 & 524288") since the
+# only thing this is used for is recognizing the complementary-pair idiom below.
+GENERAL_CONDITION_RE = re.compile(r"^(.*?)\s*(==|!=|<=|>=|<|>)\s*(.+)$")
+COMPLEMENT_OP = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
+
+
+def _complement_text(condition_text):
+    """The textual negation of a rendered condition (``"X != 0"`` -> ``"X == 0"``),
+    or ``None`` if it doesn't parse as ``operand op operand``.
+
+    Used to recognize the "two mutually-exclusive `test()` blocks" idiom this codebase
+    uses to keep timing symmetric across a data-dependent branch (see
+    ``SequenceTrace.execution_plan``) -- both conditions are usually indeterminate
+    off-hardware (they gate on a live measurement), so the two look, textually, like
+    exact negations of one another: ``"REG3 & 524288 != 0"`` / ``"REG3 & 524288 == 0"``.
+    """
+    match = GENERAL_CONDITION_RE.match((condition_text or "").strip())
+    if not match:
+        return None
+    lhs, op, rhs = match.group(1).strip(), match.group(2), match.group(3).strip()
+    return f"{lhs} {COMPLEMENT_OP[op]} {rhs}"
+
+
+def _same_context(a, b):
+    """Whether two block-level control-flow contexts are the SAME ``test``/``loop``/
+    ``repeat_until`` occurrence, for grouping in :meth:`SequenceTrace._plan_level`.
+
+    Every field compares by plain ``==`` except ``condition_obj`` and
+    ``register_exprs``, which compare by identity. Two reasons: (1) an
+    ``Operation``/``Register`` overloads comparison operators to build ANOTHER symbolic
+    ``Operation`` rather than a bool (see :func:`_operation_value`), so ``==`` on one --
+    or on a dict holding one -- raises when actually evaluated as a truth value;
+    (2) identity is the semantically right test anyway -- every block compiled inside
+    one ``with test(...):`` shares the exact same objects
+    (``trace_runtime.spy_merge`` copies the context dict per block via ``dict(b)``,
+    but a shallow copy keeps every value, including these, as the same object),
+    while two genuinely different ``test()`` calls that happen to render identical
+    text -- the same register reloaded and re-tested each pass of a Python loop, most
+    commonly -- get fresh ones each time and so are correctly kept apart even though
+    ``a["condition"] == b["condition"]``.
+    """
+    if a.keys() != b.keys():
+        return False
+    for key, value in a.items():
+        if key in ("condition_obj", "register_exprs"):
+            if value is not b[key]:
+                return False
+        elif value != b[key]:
+            return False
+    return True
+
+
+# A sequencer register/DSP as the rest of this module names one. Used to pick the
+# register leaves out of a condition tree (anything else in there is a literal, a bus
+# read or some other operand that is not a thing a user could pin).
+REGISTER_NAME_RE = re.compile(r"^(?:REG|DSP)\d+$")
+
+
+def _operation_leaves(node, out):
+    """Collect the non-numeric leaf names of an ``Operation`` tree into ``out``."""
+    if isinstance(node, Operation):
+        for arg in node._args:
+            _operation_leaves(arg, out)
+    elif not isinstance(node, (int, np.integer, float, np.floating, bool)):
+        out.add(str(node))
+
+
+def _same_conditional(a, b):
+    """Whether two blocks' full ``conditional`` tuples (outermost context first) are
+    the same nesting path -- element-wise :func:`_same_context`, since tuple ``==``
+    would otherwise hit the same non-bool-comparison problem one level down."""
+    return len(a) == len(b) and all(_same_context(x, y) for x, y in zip(a, b))
+
+
+def _operation_value(node, register_value=lambda name: None, bus_value=lambda address: None):
+    """Evaluate a compiled condition/length expression to a concrete number, or
+    ``None`` if some part of it isn't known.
+
+    ``node`` is whatever the sequencer recorded for a ``test``/``repeat_until``
+    condition or a command length: a plain number, an ``acadia.compiler.Operation``
+    tree (built by applying Python operators to register/DSP handles -- see
+    ``acadia.compiler.Operable``), or a bare Register/DSP handle. A leaf that isn't
+    already numeric is looked up by its rendered name (``"REG0"``, ``"DSP2"``) via
+    ``register_value``; the default never resolves one, so a tree of pure literals
+    (acadia's own barrier-padding ``max()``/subtraction arithmetic, most commonly)
+    folds to a concrete number while anything touching a real register does not.
+
+    A ``BUS_DATA`` leaf tagged with its address by ``dryrun.branch_recorder`` (a cache
+    read) goes to ``bus_value(node)`` instead.
+
+    This calls the SAME operator object (``node._op``, e.g. ``operator.ne``) that
+    produced the compiled instruction, rather than re-implementing comparison
+    semantics -- consistent with the rest of this package hooking acadia's own
+    machinery instead of re-modelling it.
+    """
+    if isinstance(node, Operation):
+        args = [_operation_value(a, register_value, bus_value) for a in node._args]
+        if any(a is None for a in args):
+            return None
+        try:
+            return node._op(*args)
+        except Exception:
+            return None
+    if isinstance(node, (int, np.integer, float, np.floating, bool)):
+        return node
+    if getattr(node, BUS_ADDRESS_ATTR, None) is not None:
+        return bus_value(node)
+    return register_value(str(node))
+
+
+# Every ``Register()``/``DSP()`` call site in this codebase is a plain assignment --
+# ``rounds_reg = a.sequencer().Register()``, never a tuple-unpack or an attribute target --
+# so the variable a register is bound to can be read straight off its own source line.
+# See ``_variable_name_spy`` below.
+REGISTER_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\S")
+
+
+def _runtime_source_file(runtime):
+    """The file the runtime's own ``main()`` is written in, or None.
+
+    This is where ``sequence()`` -- and so every register the EXPERIMENTER declared --
+    lives, for a live runtime, an installed one, or one rebuilt from a data folder's
+    saved ``runtime.py`` alike. Used by :func:`_variable_name_spy` to tell those apart
+    from registers the libraries allocate for themselves.
+    """
+    try:
+        return type(runtime).main.__code__.co_filename
+    except Exception:
+        return None
+
+
+def _register_spy(names_out, exprs_out, source_file):
+    """A stand-in for ``ManagedResource.__call__`` that records two things about every
+    ``Register``/``DSP`` the dry run creates, keyed the way :func:`describe_registers`
+    names them (``"REG0"``, ``"DSP2"``).
+
+    **The Python variable it is assigned to** (into ``names_out``) -- see below.
+
+    **The expression it was last loaded with** (into ``exprs_out``), by wrapping the
+    register class's own ``load``. This is what makes a register loaded by *arithmetic*
+    resolvable at all: ``describe_registers`` reads the compiled program and so only
+    recognises a direct ``BUS_DATA -> REGn`` bus read, but
+
+        flag.load(rounds_reg & (1 << (k - 1)))      # a cache-driven round count
+        qubit_e.load(readout.get_measurement("quadrant") & a.CMACC_QUADRANT_2)
+
+    land in a register through a DSP, so neither ``flag`` nor ``qubit_e`` appears
+    there at all -- and every ``test`` gating on one was drawn as merely assumed.
+    ``load`` is handed the un-evaluated ``Operation`` tree, so recording it keeps the
+    whole chain down to its cache-fed or device-fed leaves (see
+    :meth:`SequenceTrace._resolve_leaf`).
+
+    ``exprs_out`` is LIVE and mutates as the sequence compiles -- a scratch register is
+    reloaded with a different expression before each use (``flag`` carries a different
+    round's mask at every pass). :func:`~.dryrun.branch_recorder` therefore snapshots it
+    into each control-flow context as that context is entered, which is what ties a
+    ``test`` to the expression its register actually held *there*. That is also why
+    this is recorded here rather than recovered from the compiled program afterwards:
+    the compiled program has lost which write precedes which test.
+
+    Read off the *source line* of the call site (via the caller's frame and
+    ``linecache``) rather than, say, walking the runtime's ``__dict__`` for an
+    attribute holding this object -- a register is overwhelmingly a local, not
+    `self.foo`, and the source line is unambiguous where a reverse-attribute-scan
+    would have to guess among aliases.
+
+    Only call sites in ``source_file`` -- the runtime's own ``main()``, see
+    :func:`_runtime_source_file` -- are named. Registers and DSPs are also allocated
+    INSIDE the libraries, and their local variable names are meaningless to an
+    experimenter reading the plot: acadia grabs a scratch DSP to evaluate any register
+    expression (``current_dsp = self.DSP()``, sequencer.py) and acadia_qmsmt's
+    measurement helpers allocate their own (``reg = a.sequencer().Register()``,
+    qmsmt.py), so naming by call site alone labelled unrelated registers
+    ``current_dsp`` / ``reg``. Those keep their bare ``REGn``/``DSPn`` name.
+
+    Declines silently for anything that isn't a simple assignment -- a tuple unpack,
+    an attribute target, an inline expression -- rather than risk a misleading name,
+    and never lets its own bookkeeping break a dry run.
+
+    **A DSP walking the cache** (``configure(mode="P+1")``, then ``pulse_cep()``) has its
+    steps counted in compile order, ``exprs_out[("ceps", name)]``, and each load records
+    ``("loads", name)`` and the count at the load, ``("cep_at_load", name)``. The body of a
+    loop compiles once, so these counters say where the pointer is on the FIRST pass; the
+    execution plan adds what later passes step and removes what skipped bodies would have
+    (see :meth:`SequenceTrace._dsp_steps`).
+    """
+    # ManagedResource's own type_name ("Register") is not the abbreviation the rest of
+    # this module names registers with ("REG0", from Register.__str__ in acadia's
+    # sequencer.py -- see describe_registers) -- map the two kinds this package cares
+    # about to that abbreviation; anything else this metaclass also drives
+    # (Instruction, ZDMA, the per-sequencer Sequence pool, ...) is left alone.
+    ABBREVIATION = {"Register": "REG", "DSP": "DSP"}
+    orig_call = ManagedResource.__call__
+    patched_loads = {}      # register/DSP class -> {attribute: original}, for restoring
+    modes = {}              # "DSP0" -> its last configured mode
+
+    def patch_load(klass):
+        """Wrap this register class's ``load`` to record what it is loaded with.
+
+        ``load`` lives on the class ``Sequencer.__init__`` builds per sequencer (see
+        ``reg_dct`` there), so there is no module-level class to patch ahead of time --
+        it is wrapped the first time an instance of it is created, and restored by
+        :func:`restore`.
+        """
+        original = klass.__dict__.get("load")
+        if original is None or klass in patched_loads:
+            return
+        patched_loads[klass] = {"load": original}
+
+        def load(reg_self, value, *a, **k):
+            try:
+                name = str(reg_self)
+                exprs_out[name] = value
+                exprs_out[("loads", name)] = exprs_out.get(("loads", name), 0) + 1
+                exprs_out[("cep_at_load", name)] = exprs_out.get(("ceps", name), 0)
+            except Exception:      # never let bookkeeping break a dry run
+                pass
+            return original(reg_self, value, *a, **k)
+
+        klass.load = load
+
+        original_configure = klass.__dict__.get("configure")
+        original_cep = klass.__dict__.get("pulse_cep")
+        if original_configure is None or original_cep is None:
+            return
+        patched_loads[klass].update(configure=original_configure, pulse_cep=original_cep)
+
+        def configure(dsp_self, *a, **k):
+            try:
+                if "mode" in k:
+                    modes[str(dsp_self)] = str(getattr(k["mode"], "name", k["mode"]))
+            except Exception:
+                pass
+            return original_configure(dsp_self, *a, **k)
+
+        def pulse_cep(dsp_self, *a, **k):
+            try:
+                name = str(dsp_self)
+                if modes.get(name) == "P+1":
+                    exprs_out[("ceps", name)] = exprs_out.get(("ceps", name), 0) + 1
+            except Exception:
+                pass
+            return original_cep(dsp_self, *a, **k)
+
+        klass.configure = configure
+        klass.pulse_cep = pulse_cep
+
+    def spy(type_self, *args, **kwargs):
+        instance = orig_call(type_self, *args, **kwargs)
+        try:
+            prefix = ABBREVIATION.get(getattr(type_self, "__name__", ""))
+            if prefix is None:
+                return instance
+            patch_load(type_self)
+            if source_file is None:
+                return instance
+            frame = sys._getframe(1)
+            if frame.f_code.co_filename == source_file:
+                line = linecache.getline(source_file, frame.f_lineno)
+                match = REGISTER_ASSIGN_RE.match(line)
+                if match:
+                    names_out[f"{prefix}{instance._resource_id}"] = match.group(1)
+        except Exception:      # never let naming break a dry run
+            pass
+        return instance
+
+    def restore():
+        for klass, originals in patched_loads.items():
+            for attribute, original in originals.items():
+                setattr(klass, attribute, original)
+        patched_loads.clear()
+
+    return orig_call, spy, restore
 
 
 @dataclass
@@ -80,6 +352,20 @@ class Command:
     pulse: Optional[str] = None
     io_name: Optional[str] = None
     address: Optional[int] = None
+    # A symbolic length that happens to be pure literal arithmetic (acadia's own
+    # barrier-padding max()/subtraction over already-known pulse lengths, typically)
+    # folds to a concrete number here -- but ONLY for decluttering the register panel
+    # (see SequenceTrace.register_summary). It is deliberately NEVER promoted to
+    # `length`/a non-symbolic command: the schedule this is read from can carry a
+    # padding entry that acadia's compiler elides rather than emitting as its own DMA
+    # instruction, so trusting this value for layout invents commands that do not
+    # exist in the archived compiled.log (confirmed against archived runs -- see
+    # docs/DEVELOPER_NOTES.md).
+    static_length: Optional[int] = None
+    # a schedule_direct command: the whole DMA word comes from `symbolic` (a register)
+    direct: bool = False
+    # a register length issued as length - 1 (acadia's length_is_minus_one): it plays one more
+    length_offset: int = 0
 
     @property
     def stop(self):
@@ -100,6 +386,7 @@ class Block:
     conditional: tuple = ()     # control-flow blocks this sits inside, outermost first
     gap_after: int = 0          # dead cycles before the next block's first sample
     gap_breakdown: dict = field(default_factory=dict)
+    register_exprs: dict = field(default_factory=dict)  # register loads as of this block
 
     @property
     def stop(self):
@@ -126,6 +413,7 @@ class Placement:
     gap_after: int = 0
     gap_breakdown: dict = field(default_factory=dict)
     stream: bool = False        # this placement is an unrolled cache-pointer pulse stream
+    path: tuple = ()            # pass index at each nesting level of ``conditional`` (0 for a test)
 
     @property
     def stop(self):
@@ -140,6 +428,7 @@ class SequenceTrace:
     channel_ios: dict = field(default_factory=dict)
     envelopes: dict = field(default_factory=dict)         # from the pulse config
     loaded_envelopes: dict = field(default_factory=dict)  # from DAC memory
+    written_pulses: set = field(default_factory=set)      # (io, pulse) load_pulse wrote
     samples_per_cycle: dict = field(default_factory=dict)
     ns_per_cycle: float = 1.0
     runtime_class: str = ""
@@ -151,12 +440,19 @@ class SequenceTrace:
     snapshots: list = field(default_factory=list)   # one per acadia.run()
     placements: list = field(default_factory=list)   # what executes, loops unrolled
     control_flow: dict = field(default_factory=dict)
-    loop_counts: dict = field(default_factory=dict)  # block index -> iterations to draw
+    loop_counts: dict = field(default_factory=dict)  # block index (or (block, depth)) -> iterations to draw
     repeat_counts: dict = field(default_factory=dict)  # block index -> resolved repeat_until count
-    path_choices: dict = field(default_factory=dict)  # block index -> take test body?
+    path_choices: dict = field(default_factory=dict)  # block index (or (block, depth)) -> take test body?
+    # (first block, depth) -> what the last execution_plan drew for that loop / test and why
+    # (see _resolve_context); read by control_flow_summary
+    flow_state: dict = field(default_factory=dict)
+    laid_out: bool = False           # relayout has run: an empty `placements` then means nothing runs
     assumed_paths: set = field(default_factory=set)   # tests we could not decide
+    # of those, the ones that are one side of a complementary `test() `/`test()` pair
+    # (see execution_plan) -- drawn taken, but arbitrarily so, not "probably taken"
+    mutually_exclusive_paths: set = field(default_factory=set)
     unsupported_paths: set = field(default_factory=set)  # KI_004: speculation=False
-    gap_terms: dict = field(default_factory=dict)   # detect/propagate, from firmware
+    dma_timing: dict = field(default_factory=dict)  # see gateware_timing
     registers: dict = field(default_factory=dict)         # "REG0" -> {source, cache_word}
     register_sources: dict = field(default_factory=dict)  # "REG0" -> cache word
     register_cycles: dict = field(default_factory=dict)   # resolved for this point
@@ -174,6 +470,12 @@ class SequenceTrace:
     stream: Optional[dict] = None
     addr_names: dict = field(default_factory=dict)   # (channel num, word addr) -> (io, pulse)
     point_cache: dict = field(default_factory=dict)  # this point's full cache, word -> value
+    cache_base: Optional[int] = None                 # bus address of cache word 0
+    channel_nums: dict = field(default_factory=dict)  # "DAC2" -> 2, for addr_names
+    # per execution_plan entry, the steps each pointer DSP has taken beyond the compile
+    # order: {"DSP0": (its load count, extra steps or None if unknown)}; see _dsp_steps
+    plan_pointers: list = field(default_factory=list)
+    plan_paths: list = field(default_factory=list)     # Placement.path of each plan entry
     # Phase 2 execution-model layout (sequence_viz/machine.py), run in parallel behind a
     # `drain_blocks` maps a block=False batch's trigger index (nth) to the issue span of its
     # repeat_until(fifo_empty) drain -- the execution-model layout (machine.py) advances the
@@ -200,6 +502,7 @@ class SequenceTrace:
                 key: (array[:, 0].astype(np.float64)
                       + 1j * array[:, 1].astype(np.float64)) / INT16_FULL_SCALE
                 for key, array in snapshot["memories"].items()}
+            self.written_pulses = set(snapshot.get("written") or ())
             self.register_cycles = {
                 name: snapshot["cache"][word]
                 for name, word in self.register_sources.items()
@@ -225,6 +528,7 @@ class SequenceTrace:
         shared here.
         """
         from .machine import machine_layout
+        self.laid_out = True
         return machine_layout(self)
 
     def _is_stream_command(self, command):
@@ -277,9 +581,13 @@ class SequenceTrace:
     def commands(self):
         """Commands as executed (loops unrolled). Falls back to the compiled structure
         before the first layout."""
-        if self.placements:
-            return [c for p in self.placements for c in p.commands]
-        return [c for b in self.blocks for c in b.commands]
+        return [c for b in self.drawn_blocks for c in b.commands]
+
+    @property
+    def drawn_blocks(self):
+        """What executes: the placements once laid out -- empty when nothing runs, e.g. both
+        sides of a test pair pinned off -- else, before the first layout, the compiled blocks."""
+        return self.placements if self.laid_out else self.blocks
 
     @property
     def static_commands(self):
@@ -287,29 +595,164 @@ class SequenceTrace:
         contains, so cross-checks must use it rather than the unrolled view."""
         return [c for b in self.blocks for c in b.commands]
 
-    def evaluate_condition(self, condition):
+    def register_value(self, name):
+        """This point's value for register/DSP ``name``, or None if not known.
+
+        An explicit :attr:`register_overrides` entry wins over the per-point cache,
+        so pinning a register is the one lever that works for a value the hardware
+        only produces at run time (a measurement result) -- which is what makes a
+        branch on it previewable: see :meth:`evaluate_condition`.
+        """
+        if name in self.register_overrides:
+            return int(self.register_overrides[name])
+        value = self.register_cycles.get(name)
+        return int(value) if value is not None else None
+
+    def _resolve_leaf(self, name, exprs, seen=frozenset()):
+        """A register/DSP leaf's value, following what it was loaded WITH if needed.
+
+        The expression the register was last loaded with before the ``test`` being
+        evaluated (``exprs``, snapshotted per control-flow context by
+        ``dryrun.branch_recorder``) is tried FIRST, resolved recursively down to ITS
+        leaves. That is what carries a cache value through arithmetic:
+        ``flag = rounds_reg & mask`` resolves because ``rounds_reg`` is cache-fed, so
+        the round-enable tests of a runtime whose round count comes from the cache
+        follow the sweep point instead of being assumed.
+
+        Only when that fails does :meth:`register_value` apply -- an explicit override,
+        else this point's cache. The order matters because a scratch register gets
+        REUSED for unrelated things: ``flag`` may carry ``rounds_reg & mask`` at a
+        round-enable test and ``a_g & b_g`` (two measurement results) at a feedback test a
+        few lines later. Resolving the
+        expression first means a pin on ``flag`` decides the branch that genuinely
+        cannot be known, while the rounds keep resolving from the cache -- where letting
+        the override win everywhere would force every round to the pinned value too.
+
+        ``seen`` breaks a cycle (a register loaded from itself, e.g. an accumulator),
+        which would otherwise recurse forever.
+        """
+        if name in seen:
+            return None
+        expression = (exprs or {}).get(name)
+        if expression is not None:
+            value = _operation_value(
+                expression,
+                lambda leaf: self._resolve_leaf(leaf, exprs, seen | {name}),
+                lambda node: self._bus_value(node, exprs, seen | {name}))
+            if value is not None:
+                steps = self._dsp_steps(name, exprs)
+                return None if steps is None else value + steps
+        return self.register_value(name)
+
+    def _bus_value(self, node, exprs, seen=frozenset()):
+        """This point's cache word at a bus read -- its address a literal, or a DSP pointer
+        resolved as it stood AT the read -- or None outside the cache / when unknown."""
+        exprs = {**(exprs or {}), **(getattr(node, BUS_STATE_ATTR, None) or {})}
+        value = _operation_value(getattr(node, BUS_ADDRESS_ATTR),
+                                 lambda leaf: self._resolve_leaf(leaf, exprs, seen),
+                                 lambda inner: self._bus_value(inner, exprs, seen))
+        if value is None or self.cache_base is None:
+            return None
+        return (self.point_cache or {}).get(int(value) - self.cache_base)
+
+    def _dsp_steps(self, name, exprs):
+        """``pulse_cep`` steps DSP ``name`` has taken since its load, as of the moment
+        ``exprs`` was snapshotted: the compile-order count plus what the execution plan has
+        added (later loop passes) or removed (skipped bodies). None when a loop that steps
+        it ran an unknown number of passes."""
+        exprs = exprs or {}
+        compiled = exprs.get(("ceps", name), 0) - exprs.get(("cep_at_load", name), 0)
+        load, extra = getattr(self, "_pointer_extra", {}).get(name, (None, 0))
+        if load != exprs.get(("loads", name)):
+            extra = 0                    # reloaded since that extra was counted
+        return None if extra is None else compiled + extra
+
+    def _body_steps(self, context):
+        """``{DSP: pulse_cep steps}`` one pass of this context's body takes (nested bodies
+        counted once each), for the DSPs it steps and does not reload."""
+        entry, exit_ = context.get("register_exprs") or {}, context.get("exit_counters") or {}
+        steps = {}
+        for key, value in exit_.items():
+            if key[0] != "ceps":
+                continue
+            name = key[1]
+            if exit_.get(("loads", name)) != entry.get(("loads", name)):
+                continue                 # reloaded inside: each pass starts afresh
+            step = value - entry.get(key, 0)
+            if step:
+                steps[name] = step
+        return steps
+
+    def _shift_pointers(self, context, passes):
+        """Add ``passes`` x one body's steps to the pointers it steps (None: unknown). A DSP
+        the body reloads (an inner loop's counter) starts every pass afresh, and after a
+        skipped body its value is not the one the compiled order implies."""
+        entry, loads = context.get("register_exprs") or {}, context.get("exit_counters") or {}
+        for key, load in loads.items():
+            if key[0] == "loads" and load != entry.get(key):
+                self._pointer_extra[key[1]] = (load, None if passes is None or passes < 0 else 0)
+        for name, step in self._body_steps(context).items():
+            load = loads.get(("loads", name))
+            held, extra = self._pointer_extra.get(name, (load, 0))
+            if held != load:
+                extra = 0
+            self._pointer_extra[name] = (
+                load, None if passes is None or extra is None else extra + passes * step)
+
+    def _pointer_loop_count(self, context):
+        """Passes of ``repeat_until(pointer == end)``: one pass steps the pointer by its
+        body's ``pulse_cep`` count, so the count is how far ``end`` is from where the pointer
+        stands at entry, in those steps -- whatever else the body reads in between (a gate
+        string: one word per pass; several modes stepped together: one word per mode per
+        pass). None when the
+        condition is not that shape or the arithmetic is not a whole count."""
+        condition = context.get("condition_obj")
+        steps = self._body_steps(context)
+        if (not isinstance(condition, Operation) or len(condition._args) != 2
+                or getattr(condition._op, "__name__", "") != "eq"):
+            return None
+        exprs = context.get("register_exprs")
+        for counter, target in (condition._args, condition._args[::-1]):
+            step = steps.get(str(counter))
+            if not step or not COUNTER_NAME_RE.fullmatch(str(counter)):
+                continue
+            now = self._resolve_leaf(str(counter), exprs)
+            end = _operation_value(target, lambda leaf: self._resolve_leaf(leaf, exprs),
+                                   lambda node: self._bus_value(node, exprs))
+            if now is None or end is None:
+                return None
+            distance = int(end) - int(now)
+            # do-while: a loop entered at its end never exits, so 0 is not a count
+            if distance <= 0 or distance % step:
+                return None
+            return distance // step
+        return None
+
+    def evaluate_condition(self, condition_obj, register_exprs=None):
         """Try to decide a ``test`` condition from the register values of this point.
 
-        Only the simple ``REGn <op> literal`` forms are handled -- which is what
-        ``reg.load(cache[k])`` followed by ``test(reg == value)`` produces, and the register
-        value is known because the cache is captured per sweep point. Anything else (a
-        measurement result, register arithmetic) returns None and the caller falls back to
-        ``path_choices`` or to assuming the body runs.
+        Walks the compiled condition's ``Operation``/``Register`` tree (see
+        :func:`_operation_value`), resolving each register/DSP leaf with
+        :meth:`_resolve_leaf`: an explicit override, else this point's cache, else the
+        expression that register was last loaded with -- recursively. So this resolves
+        any expression over those, not just a bare ``REGn <op> literal``; a masked
+        condition like ``(flag := rounds_reg & 1) != 0`` resolves from the cache word
+        behind ``rounds_reg``.
+
+        Pinning a measurement-fed register (``register_overrides["DSP0"] = 0``, or the
+        GUI's register panel) therefore decides its branch outright -- the drawn arm is
+        reported as resolved rather than assumed, and its complement in a
+        mutually-exclusive pair follows automatically. Returns ``None`` when some leaf
+        is still unknown, in which case the caller falls back to ``path_choices`` or to
+        the mutually-exclusive/assumed default (see :meth:`execution_plan`).
         """
-        match = CONDITION_RE.match((condition or "").strip())
-        if not match:
+        if condition_obj is None:
             return None
-        name, operator, literal = match.group(1), match.group(2), match.group(3)
-        value = self.register_cycles.get(name)
-        if value is None:
-            return None
-        try:
-            literal = int(literal, 0)
-        except ValueError:
-            return None
-        return {"==": value == literal, "!=": value != literal,
-                "<": value < literal, "<=": value <= literal,
-                ">": value > literal, ">=": value >= literal}.get(operator)
+        value = _operation_value(
+            condition_obj, lambda leaf: self._resolve_leaf(leaf, register_exprs))
+        if isinstance(value, (int, np.integer, float, np.floating, bool)):
+            return bool(value)
+        return None
 
     def _operand_value(self, token):
         """Resolve a condition operand to an int, or None.
@@ -321,10 +764,7 @@ class SequenceTrace:
             return int(token, 0)
         except ValueError:
             pass
-        if token in self.register_overrides:
-            return int(self.register_overrides[token])
-        value = self.register_cycles.get(token)
-        return int(value) if value is not None else None
+        return self.register_value(token)
 
     def repeat_until_count(self, context):
         """Iterations a counter-driven ``repeat_until`` runs, or None if not resolvable.
@@ -359,73 +799,235 @@ class SequenceTrace:
     def execution_plan(self):
         """``[(block index, iteration), ...]`` in the order the sequencer runs them.
 
-        Consecutive blocks sharing the same innermost ``loop``/``repeat_until`` context form
-        one body. A ``loop`` repeats its own deterministic count. A ``repeat_until`` repeats
-        the count :meth:`repeat_until_count` resolves from its condition register/literal
-        (recorded in :attr:`repeat_counts`); when that can't be resolved the count is
-        data-dependent, so one pass is drawn. A user ``loop_counts[first block]`` overrides
-        either.
+        Resolved level by level, outermost first: a block only executes if EVERY
+        context that encloses it is taken, not just the innermost one -- a ``test``
+        nested inside another ``test`` (an outer round-enable check wrapping an inner
+        feedforward branch) only
+        draws its body when both hold. A ``loop`` repeats its own deterministic count.
+        A ``repeat_until`` repeats the count :meth:`repeat_until_count` resolves from
+        its condition register/literal (recorded in :attr:`repeat_counts`); when that
+        can't be resolved the count is data-dependent, so one pass is drawn. A user
+        ``loop_counts[first block]`` overrides either; ``loop_counts[(first block, depth)]``
+        pins one construct only, where a loop nested in another starts at the same block.
+
+        A ``test`` whose condition can't be decided from the cache falls back to
+        :attr:`path_choices`, then to an arbitrary default -- except this codebase's
+        idiom for keeping a data-dependent branch's timing symmetric is to compile
+        it as TWO mutually-exclusive ``test()`` blocks (``REGn != 0`` / ``REGn == 0``
+        on the same register, so exactly one runs on hardware): defaulting each
+        independently draws both as taken, which is the "always shows the true
+        outcome twice" complaint this replaces. Instead, every ``test`` in the trace
+        whose condition has a counterpart that is its exact textual negation
+        (:func:`_complement_text`) picks a side once and every later block testing
+        that same condition -- or its negation -- mirrors it, so the pair (or a
+        register reused across several such pairs, as in a feedforward repeated over
+        rounds) reads as one consistent, single-valued outcome
+        rather than as if every arm ran. Force either side without re-tracing via
+        ``trace.path_choices[block_index] = False``; :attr:`mutually_exclusive_paths`
+        lists which blocks this applied to.
         """
         self.repeat_counts = {}
-        plan, index = [], 0
-        while index < len(self.blocks):
-            block = self.blocks[index]
-            context = block.conditional[-1] if block.conditional else None
-            if context is None:
-                plan.append((index, 0))
-                index += 1
+        self.assumed_paths = set()
+        self.unsupported_paths = set()
+        self.mutually_exclusive_paths = set()
+        self.flow_state = {}
+        self._condition_decisions = {}
+        self._pinned_conditions = self._find_pinned_conditions()
+        self._paired_conditions = self._find_paired_conditions()
+        self._pointer_extra = {}
+        self.plan_pointers = []
+        self.plan_paths, self._path = [], []
+        plan = self._plan_level(list(range(len(self.blocks))), 0, 0)
+        self._pointer_extra = {}
+        return plan
+
+    def _find_pinned_conditions(self):
+        """``{condition text: taken}`` for the tests pinned by a ``(block, depth)`` key of
+        :attr:`path_choices`. A test whose exact complement is pinned follows that pin, ahead of
+        its own cache value: of a complementary pair exactly one side runs, so pinning one side
+        decides both."""
+        pinned = {}
+        for key, taken in self.path_choices.items():
+            if not (isinstance(key, tuple) and len(key) == 2 and taken is not None):
                 continue
+            index, depth = key
+            if 0 <= index < len(self.blocks) and depth < len(self.blocks[index].conditional):
+                context = self.blocks[index].conditional[depth]
+                if context.get("kind") == "test" and context.get("condition") is not None:
+                    pinned[context["condition"]] = bool(taken)
+        return pinned
 
-            body = [index]
-            while (body[-1] + 1 < len(self.blocks)
-                   and self.blocks[body[-1] + 1].conditional
-                   and self.blocks[body[-1] + 1].conditional[-1] == context):
-                body.append(body[-1] + 1)
+    def _find_paired_conditions(self):
+        """Rendered ``test`` condition texts that have their exact negation
+        (:func:`_complement_text`) appearing SOMEWHERE else in this trace -- at any
+        nesting depth, since a register (and so its condition text) can be reused
+        across separate ``test()`` pairs (once on its own, once as the outer half of a
+        nested pair). Membership here is what :meth:`_plan_level` uses to caption a block
+        "mutually exclusive" rather than a bare "assumed taken".
+        """
+        texts = {ctx["condition"] for block in self.blocks for ctx in block.conditional
+                 if ctx["kind"] == "test"}
+        return {t for t in texts if _complement_text(t) in texts}
 
-            if context["kind"] == "test" and context.get("speculation") is False:
-                # KI_004: with speculation=False the body is placed OUT OF LINE, so address
-                # order stops being execution order and the edge costing below does not
-                # apply -- measured 25 ns out on the taken arm, and the skipped arm hangs
-                # the sequencer outright. Draw the body but flag the path as unmodelled
-                # rather than assert a timeline we know is wrong.
-                self.assumed_paths.add(index)
-                self.unsupported_paths.add(index)
-                plan.extend((member, 0) for member in body)
-            elif context["kind"] == "test":
-                # explicit choice wins; otherwise try to decide it from the cache;
-                # otherwise assume the body runs (and say so via `assumed_paths`)
-                taken = self.path_choices.get(index)
-                if taken is None:
-                    taken = self.evaluate_condition(context.get("condition"))
-                    if taken is None:
-                        taken = True
-                        self.assumed_paths.add(index)
-                if taken:
-                    plan.extend((member, 0) for member in body)
-            elif context["kind"] == "repeat_until":
-                # count from the loop's condition register/literal when resolvable
-                # (recorded so the caption can state it); else data-dependent -> one pass.
-                count = self.loop_counts.get(index)
+    def _plan_level(self, indices, depth, iteration):
+        """Resolve one nesting level and recurse into each body's children.
+
+        ``indices`` all share an identical ``conditional[:depth]`` prefix (the whole
+        list, on the initial call); grouped here by ``conditional[depth]`` -- ``None``
+        for an index whose tuple ends at this depth, i.e. it sits directly in the
+        parent body with no further nesting of its own.
+        """
+        groups, i = [], 0
+        while i < len(indices):
+            block = self.blocks[indices[i]]
+            context = block.conditional[depth] if depth < len(block.conditional) else None
+            j = i + 1
+            if context is not None:
+                while (j < len(indices)
+                       and depth < len(self.blocks[indices[j]].conditional)
+                       and _same_context(self.blocks[indices[j]].conditional[depth],
+                                         context)):
+                    j += 1
+            groups.append((context, indices[i:j]))
+            i = j
+
+        plan = []
+        for context, body in groups:
+            if context is None:
+                for index in body:
+                    plan.append((index, iteration))
+                    # entries are made in execution order, so this lines up with the plan
+                    self.plan_pointers.append(dict(self._pointer_extra))
+                    self.plan_paths.append(tuple(self._path))
+            else:
+                self._path.append(0)              # a loop's passes set it in _passes
+                plan.extend(self._resolve_context(body, context, depth, iteration))
+                self._path.pop()
+        return plan
+
+    @staticmethod
+    def _flow_override(overrides, first_index, depth):
+        """A user pin from ``loop_counts`` / ``path_choices`` for the construct whose body starts at
+        ``first_index`` at nesting ``depth``: keyed ``(block, depth)``, else by the block alone."""
+        key = (first_index, depth)
+        return overrides[key] if key in overrides else overrides.get(first_index)
+
+    def _record_flow(self, first_index, depth, **state):
+        """Note what was drawn for a construct. A construct inside a loop is resolved once per
+        pass: the first pass gives the source (later passes of an undecided test only mirror
+        it), and a test outcome or pass count that differs between passes is recorded as None."""
+        key = (first_index, depth)
+        old = self.flow_state.get(key)
+        if old is not None:
+            state["source"] = old["source"]
+            for name in ("taken", "count"):
+                if name in state and old.get(name) != state[name]:
+                    state[name] = None
+        self.flow_state[key] = state
+
+    def _resolve_context(self, body, context, depth, iteration):
+        first_index = body[0]
+        kind = context["kind"]
+
+        if kind == "test" and context.get("speculation") is False:
+            # KI_004: with speculation=False the body is placed OUT OF LINE, so address
+            # order stops being execution order and the edge costing below does not
+            # apply -- measured 25 ns out on the taken arm, and the skipped arm hangs
+            # the sequencer outright. Draw the body but flag the path as unmodelled
+            # rather than assert a timeline we know is wrong.
+            self.assumed_paths.add(first_index)
+            self.unsupported_paths.add(first_index)
+            self._record_flow(first_index, depth, taken=True, source="unsupported")
+            return self._plan_level(body, depth + 1, iteration)
+
+        if kind == "test":
+            condition_text = context.get("condition")
+            # explicit choice wins; otherwise try to decide it from this point's cache
+            taken = self._flow_override(self.path_choices, first_index, depth)
+            source = "pinned"
+            if taken is None:
+                # the other side of a pinned complementary pair runs exactly when the pinned
+                # side does not, whatever this point's cache says
+                complement = _complement_text(condition_text)
+                if complement is not None and complement in self._pinned_conditions:
+                    taken, source = not self._pinned_conditions[complement], "follows"
+            if taken is None:
+                taken = self.evaluate_condition(context.get("condition_obj"),
+                                                context.get("register_exprs"))
+                source = "cache"
+            if taken is None:
+                # neither -- fall back to the mutually-exclusive-pair default (or a bare
+                # arbitrary default if this condition has no known complement)
+                source = "follows"
+                if condition_text in self._condition_decisions:
+                    taken = self._condition_decisions[condition_text]
+                else:
+                    complement = _complement_text(condition_text)
+                    if complement is not None and complement in self._condition_decisions:
+                        taken = not self._condition_decisions[complement]
+                    else:
+                        taken, source = True, "assumed"
+                self.assumed_paths.add(first_index)
+                if condition_text in self._paired_conditions:
+                    self.mutually_exclusive_paths.add(first_index)
+            # record whichever way this was decided -- including an explicit
+            # path_choices override -- so a later occurrence of this same physical
+            # condition, or its exact complement, stays consistent with it
+            if condition_text is not None:
+                self._condition_decisions[condition_text] = taken
+            self._record_flow(first_index, depth, taken=bool(taken), source=source)
+            if not taken:
+                self._shift_pointers(context, -1)    # its steps were compiled, never run
+                return []
+            return self._plan_level(body, depth + 1, iteration)
+
+        if kind == "repeat_until":
+            # count from the loop's condition register/literal when resolvable
+            # (recorded so the caption can state it); else data-dependent -> one pass.
+            count = self._flow_override(self.loop_counts, first_index, depth)
+            source = "pinned"
+            # a cache-pointer stream unrolls its whole train inside one pass (_expand_stream)
+            streamed = any(self._is_stream_command(c) for i in body for c in self.blocks[i].commands)
+            if count is None and not streamed:
+                source = "cache"
+                count = self._pointer_loop_count(context)
                 if count is None:
                     count = self.repeat_until_count(context)
-                    if count is not None:
-                        self.repeat_counts[index] = int(count)
-                if count is None:
-                    count = 1
-                for iteration in range(max(int(count), 0)):
-                    plan.extend((member, iteration) for member in body)
-            else:
-                # loop: deterministic count, unrolled.
-                count = self.loop_counts.get(index, context.get("count") or 1)
-                for iteration in range(max(int(count), 1)):
-                    plan.extend((member, iteration) for member in body)
-            index = body[-1] + 1
+                if count is not None:
+                    self.repeat_counts[first_index] = int(count)
+            if count is None:
+                source = "stream" if streamed else "assumed"
+            self._record_flow(first_index, depth, count=1 if count is None else int(count), source=source)
+            known = count is not None
+            plan = self._passes(body, context, depth, 1 if count is None else int(count))
+            if not known:
+                self._shift_pointers(context, None)
+            return plan
+
+        # loop: deterministic count, unrolled.
+        count = self._flow_override(self.loop_counts, first_index, depth)
+        source = "pinned"
+        if count is None:
+            count, source = context.get("count") or 1, "compiled"
+        self._record_flow(first_index, depth, count=max(int(count), 1), source=source)
+        return self._passes(body, context, depth, max(int(count), 1))
+
+    def _passes(self, body, context, depth, count):
+        """``count`` passes of a loop body. The body compiled once, so every pass after the
+        first steps its pointers one body further than the compile-order counters say."""
+        plan = []
+        for n in range(max(count, 0)):
+            if n:
+                self._shift_pointers(context, 1)
+            self._path[-1] = n
+            plan.extend(self._plan_level(body, depth + 1, n))
+        if count <= 0:
+            self._shift_pointers(context, -1)
         return plan
 
     @property
     def length_cycles(self):
-        source = self.placements or self.blocks
-        return max((b.stop for b in source), default=0)
+        return max((b.stop for b in self.drawn_blocks), default=0)
 
     @property
     def length_ns(self):
@@ -437,44 +1039,179 @@ class SequenceTrace:
         source = self.registers.get(name, {}).get("source")
         return f"{alias} = {source}" if source else alias
 
+    def condition_registers(self):
+        """Register/DSP names that gate a ``test`` -- the ones worth pinning.
+
+        Taken from the condition trees themselves rather than from
+        :meth:`describe_registers`, because the register a branch actually turns on is
+        often invisible to that: a ``qubit_e`` loaded from a DSP holding
+        ``measurement & QUADRANT_2`` so the compiled program shows only the
+        scratch DSP and the bus read, never a ``BUS_DATA -> REG0`` to attribute to it.
+        The condition names it directly.
+
+        :return: ``{name: True only if it resolves at EVERY test it gates}``. Aggregated
+            that way because a scratch register is reused: a ``flag`` may resolve at a
+            round-enable test
+            (``rounds_reg & mask``) but not at the reload test (two measurement
+            results), and it is the unresolvable use that needs a control.
+        """
+        found = {}
+        for block in self.blocks:
+            for context in block.conditional:
+                if context.get("kind") != "test":
+                    continue
+                leaves = set()
+                _operation_leaves(context.get("condition_obj"), leaves)
+                for leaf in leaves:
+                    if not REGISTER_NAME_RE.match(leaf):
+                        continue
+                    resolved = self._resolve_leaf(
+                        leaf, context.get("register_exprs")) is not None
+                    found[leaf] = found.get(leaf, True) and resolved
+        return found
+
+    def control_flow_summary(self):
+        """Every ``loop`` / ``repeat_until`` / ``test`` of the sequence, for a UI that pins them.
+
+        One entry per construct in program order, outermost first, grouped exactly as
+        :meth:`execution_plan` groups them::
+
+            {key, tag, kind, depth, label, condition, compiled_count, count, taken, source,
+             reached, settable, paired}
+
+        ``key`` is ``(first block, depth)``: write it into :attr:`loop_counts` (a loop's passes)
+        or :attr:`path_choices` (whether a test's body runs), then :meth:`relayout`. ``count`` /
+        ``taken`` / ``source`` are what the last layout drew and why -- ``pinned``, ``compiled``
+        (a loop's own count), ``cache`` (decided from this point's registers), ``follows`` (a
+        test mirroring an earlier test of the same register, see :meth:`execution_plan`),
+        ``assumed`` (undecidable; a default was drawn), ``stream`` (a cache-pointer stream, one
+        pass holding the whole train), ``unsupported`` (``speculation=False``). ``reached`` is
+        False inside a branch that is not drawn. ``settable`` is False where a pin is ignored:
+        a streamed loop and a ``speculation=False`` test. ``tag`` is a short name for the
+        construct, ``@<first block>``, with ``.<level>`` added where two constructs begin at the
+        same block -- the name its tab on the drawing carries.
+        """
+        paired = getattr(self, "_paired_conditions", set())
+        entries = []
+
+        def walk(indices, depth):
+            i = 0
+            while i < len(indices):
+                context = (self.blocks[indices[i]].conditional[depth]
+                           if depth < len(self.blocks[indices[i]].conditional) else None)
+                j = i + 1
+                if context is not None:
+                    while (j < len(indices)
+                           and depth < len(self.blocks[indices[j]].conditional)
+                           and _same_context(self.blocks[indices[j]].conditional[depth], context)):
+                        j += 1
+                    body = indices[i:j]
+                    entries.append(flow_entry(body, depth, context))
+                    walk(body, depth + 1)
+                i = j
+
+        def flow_entry(body, depth, context):
+            kind, condition = context.get("kind"), context.get("condition")
+            state = self.flow_state.get((body[0], depth))
+            if kind == "test":
+                label = f"test {condition or ''}".strip()
+                settable = context.get("speculation") is not False
+            elif kind == "repeat_until":
+                label = f"repeat until {condition or ''}".strip()
+                settable = not any(self._is_stream_command(c) for i in body
+                                   for c in self.blocks[i].commands)
+            else:
+                label = f"loop x{context.get('count') or 1}"
+                settable = True
+            return {"key": (body[0], depth), "kind": kind, "depth": depth, "label": label,
+                    "condition": condition, "compiled_count": context.get("count"),
+                    "count": (state or {}).get("count"), "taken": (state or {}).get("taken"),
+                    "source": (state or {}).get("source"), "reached": state is not None,
+                    "settable": settable, "paired": kind == "test" and condition in paired}
+
+        walk(list(range(len(self.blocks))), 0)
+        starts = {}
+        for entry in entries:
+            starts[entry["key"][0]] = starts.get(entry["key"][0], 0) + 1
+        for entry in entries:
+            block, depth = entry["key"]
+            entry["tag"] = f"@{block}" if starts[block] == 1 else f"@{block}.{depth + 1}"
+        return entries
+
     def register_summary(self):
         """Describe every register / length-symbol for a per-register UI control.
 
-        Two kinds appear, distinguished by ``settable``:
+        Three kinds appear:
 
-        * cache-fed registers resolve themselves from the per-point cache, so
-          their value is shown but not settable. One may drive a command length
-          (``is_length``, shown in cycles/ns) or only a ``test``/``repeat_until``
-          condition (shown as the raw register value -- which, when it is a loop
-          target, is the count the loop is drawn for; it follows the sweep point).
-        * register/DSP-driven command *lengths* not recoverable from the cache
-          (``resolution`` "fallback"/"override") -- the only thing worth setting,
-          via :attr:`register_overrides`.
+        * **cache-fed** registers (``resolution`` "cache") resolve themselves from the
+          per-point cache, so their value is shown but not settable -- it is already
+          right, and follows the sweep point. One may drive a command length
+          (``is_length``, in cycles) or only a ``test``/``repeat_until`` condition
+          (the raw register value -- which, when it is a loop target, is the count the
+          loop is drawn for).
+        * **device-fed** registers (``resolution`` "device") come from live hardware --
+          a CMACC measurement result -- so they have no value off-hardware. Settable:
+          pinning one decides the ``test`` it gates (see :meth:`evaluate_condition`),
+          which is the only way to preview a specific arm of a feedforward branch.
+        * **register/DSP-driven command lengths** not recoverable from the cache
+          (``resolution`` "fallback"/"override"). Settable, in cycles.
 
-        :return: ``[{name, label, source, resolution, value_cycles, is_length,
+        Everything settable is set through :attr:`register_overrides`; note the units
+        differ by kind -- a length override is in cycles, while a device-fed register's
+        is the raw register word the condition compares against (0 vs the bit the
+        runtime masks for, typically), so ``value_cycles`` is only literally cycles
+        when ``is_length``.
+
+        :return: ``[{name, alias, label, source, resolution, value_cycles, is_length,
             settable}, ...]``, deduped by name, identified registers first.
         """
+        # a symbolic length that folded to a plain number (Command.static_length) is
+        # not a register at all -- just acadia's own padding arithmetic over already-
+        # known pulse lengths -- so it does not belong in a REGISTER control panel
         resolved = {c.symbolic: (c.resolution, c.length)
-                    for c in self.commands if c.symbolic}
+                    for c in self.commands if c.symbolic and c.static_length is None}
 
         def entry(name, resolution, cycles, is_length):
-            return {"name": name, "label": self.register_label(name),
+            return {"name": name,
+                    # "alias" is just the display name (the runtime's own variable
+                    # name, if one was found -- see _variable_name_spy -- else the
+                    # bare "REG0"/"DSP0"); "label" adds "= source" for a caption/
+                    # tooltip. A UI row header wants the short one.
+                    "alias": self.register_names.get(name, name),
+                    "label": self.register_label(name),
                     "source": self.registers.get(name, {}).get("source") or "",
                     "resolution": resolution, "value_cycles": cycles,
                     "is_length": is_length,
-                    "settable": resolution in ("override", "fallback")}
+                    # "cache" is the one kind that is NOT settable: it already carries
+                    # this point's real value, and overriding it would just desync the
+                    # picture from the sweep point being shown.
+                    "settable": resolution in ("override", "fallback", "device")}
+
+        gating = self.condition_registers()
 
         entries = {}
         for name, info in self.registers.items():             # cache/device registers
             if name in resolved:                              # also drives a length
                 entries[name] = entry(name, *resolved[name], True)
-            else:                                             # condition-only register
-                resolution = "cache" if info["cache_word"] is not None else "device"
-                entries[name] = entry(name, resolution,
-                                      self.register_cycles.get(name), False)
+            elif info["cache_word"] is not None:              # cache-fed
+                entries[name] = entry(name, "cache",
+                                      self.register_value(name), False)
+            elif name in gating:                              # device-fed, gates a test
+                # register_value, not register_cycles: a device register has no cache
+                # value, so its displayed value is whatever the user pinned it to
+                entries[name] = entry(name, "device",
+                                      self.register_value(name), False)
+            # a device register that neither drives a length nor gates a test is
+            # acadia's own scratch (the DSP it grabs to evaluate a register
+            # expression) -- nothing an experimenter can act on, so it is left out
         for name, (resolution, cycles) in resolved.items():   # DSP-driven lengths
             if name not in entries:
                 entries[name] = entry(name, resolution, cycles, True)
+        for name, resolves in gating.items():                 # registers gating a test
+            # one that already resolves per point needs no control (and offering to
+            # pin it would just invite desyncing the picture from the sweep point)
+            if name not in entries and not resolves:
+                entries[name] = entry(name, "device", self.register_value(name), False)
         return list(entries.values())
 
     def envelope(self, io_name, pulse, source="memory"):
@@ -486,18 +1223,31 @@ class SequenceTrace:
         recomputes from the yaml/duplicate config instead, which is the nominal
         pulse and ignores anything ``load_pulse`` overrode at runtime.
 
-        Falls back to the config when the memory was never loaded (all zeros).
+        Memory is ground truth and is never second-guessed: whatever the
+        snapshot holds is what the FPGA would play, including all zeros. A pulse
+        deliberately loaded at zero amplitude is a real thing a sequence does
+        (tomography loads its Z point at ``scale=0``; host-side arm selection
+        zeroes the pulses of the arms it is not running), and an untouched
+        memory does not contain the config envelope either -- so inferring
+        "never loaded" from the samples being zero, as this used to, drew
+        pulses at full config amplitude that the hardware never played.
+
+        The config is used only when the snapshot has no entry for the pulse at
+        all. Whether a memory was actually written is reported separately by
+        :meth:`summary` from the recorded ``load_pulse`` calls
+        (:attr:`written_pulses`), where it belongs -- a scheduled pulse that was
+        never loaded is a bug in the sequence, not something to paper over here.
         """
         if source == "memory":
             samples = self.loaded_envelopes.get((io_name, pulse))
-            if samples is not None and len(samples) and np.abs(samples).max() > 0:
+            if samples is not None and len(samples):
                 return samples
         return self.envelopes.get((io_name, pulse))
 
     @property
     def dead_time_ns(self):
         """Total inter-block dead time -- the boundary gaps from :func:`edge_gap`."""
-        return sum(b.gap_after for b in (self.placements or self.blocks)) * self.ns_per_cycle
+        return sum(b.gap_after for b in self.drawn_blocks) * self.ns_per_cycle
 
     def summary(self):
         of_n = f" of {self.n_points}" if self.n_points > 1 else ""
@@ -519,12 +1269,22 @@ class SequenceTrace:
                    "fallback": "fallback"}
             shown = {}
             for c in self.commands:
-                if c.symbolic:
+                if c.symbolic and c.static_length is None:
                     shown[self.register_label(c.symbolic)] = (
                         f"{c.length * self.ns_per_cycle:.0f} ns "
                         f"({how[c.resolution]})")
             lines.append(f"  {self.unresolved} register/DSP-driven length(s): "
                          + ", ".join(f"{n} -> {v}" for n, v in sorted(shown.items())))
+        # a scheduled pulse whose memory load_pulse never wrote plays whatever was
+        # left in that memory, not the pulse in the yaml (rule: fpga_pulse_duplication)
+        if self.written_pulses:
+            unloaded = sorted({(c.io_name, c.pulse) for c in self.commands
+                               if c.pulse and c.io_name and not c.is_padding
+                               and (c.io_name, c.pulse) not in self.written_pulses})
+            if unloaded:
+                lines.append("  SCHEDULED BUT NEVER LOADED: "
+                             + ", ".join(f"{io}.{pl}" for io, pl in unloaded)
+                             + " -- these play whatever the memory held")
         if self.truncated_points:
             lines.append("  point capture stopped at max_points")
         if self.used_saved_qmsmt is False:
@@ -555,9 +1315,8 @@ class SequenceTrace:
             if blk.gap_after:
                 g = blk.gap_breakdown
                 out.append(f"  -> {blk.gap_after * self.ns_per_cycle:.1f} ns dead "
-                           f"before the next block "
-                           f"(detect {g['detect']} + issue {g['issue']} + "
-                           f"propagate {g['propagate']} cycles)")
+                           f"before the next block ({g.get('edge', '')}, "
+                           f"issue {g.get('issue')} cycles)")
         if max_blocks is not None and len(self.blocks) > max_blocks:
             out.append(f"... {len(self.blocks) - max_blocks} more blocks")
         return "\n".join(out)
@@ -588,7 +1347,12 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
         overriding the cache. Use for a register fed by something with no static
         value -- a measurement result, say. ``trace.registers`` lists the names
         and where each is fed from.
-    :param register_names: ``{"REG0": "t_echo"}`` display aliases.
+    :param register_names: ``{"REG0": "t_echo"}`` display aliases, overriding the name
+        already auto-derived from the runtime's own source (the variable a
+        ``Register()``/``DSP()`` was assigned to, e.g. ``rounds_reg = a.sequencer()
+        .Register()`` names it ``rounds_reg`` with no need to pass this at all --
+        see ``_variable_name_spy``). Only needed to relabel one, or when the source
+        line isn't a plain assignment and nothing was auto-derived.
     :param resolve_indeterminate: fallback cycles for register/DSP-driven lengths
         that are neither overridden nor resolvable from the cache.
     :param envelopes: compute pulse waveforms as well as the schedule.
@@ -633,6 +1397,7 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                              for sub in schedules],
             "user_ids": pending_user_ids.pop() if pending_user_ids else set(),
             "conditional": tuple(dict(b) for b in branch_stack),
+            "register_exprs": dict(register_exprs),
         })
         return combined
 
@@ -646,6 +1411,56 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                 raw_blocks[-1]["blocking"] = self._dma_block
 
     pool = {}          # content hash -> array, so unchanged memories are shared
+    written_ids = set()   # id() of every waveform memory load_pulse writes
+
+    # Patch the class the runtime's OWN io objects use, not the installed one: with
+    # use_saved_qmsmt the runtime comes from the acadia_qmsmt saved in the data folder, so
+    # `acadia_qmsmt.qmsmt.InputOutput` here is a different class object and patching it would
+    # silently record nothing. Walk each io's MRO to the class that actually defines
+    # load_pulse, so subclasses are covered too.
+    def _load_pulse_owners(rt):
+        owners = {}
+        ios = list(getattr(rt, "_ios", {}).values())
+        for io in ios:
+            for base in type(io).__mro__:
+                if "load_pulse" in base.__dict__:
+                    owners.setdefault(base, base.__dict__["load_pulse"])
+                    break
+        if not owners:      # _ios not built yet -- fall back to the installed class
+            try:
+                from acadia_qmsmt.qmsmt import InputOutput
+                owners[InputOutput] = InputOutput.__dict__["load_pulse"]
+            except Exception:
+                pass
+        return owners
+
+    def _target_memory(io, memory_arg):
+        """The waveform memory a load_pulse call wrote to, if resolvable.
+
+        ``memory`` may be a pulse name, a pulse-config dict, or a
+        ``WaveformMemory`` already.
+        """
+        if memory_arg is None:
+            return None
+        if getattr(memory_arg, "__array_interface__", None) is not None \
+                or hasattr(memory_arg, "array"):
+            return memory_arg
+        name = memory_arg.get("name") if isinstance(memory_arg, dict) else memory_arg
+        if not isinstance(name, str):
+            return None
+        return (io._pulse_cache.get(name) or {}).get("memory")
+
+    def _make_spy(orig):
+        def spy_load_pulse(self, memory=None, *a, **k):
+            out = orig(self, memory, *a, **k)
+            try:
+                target = _target_memory(self, memory)
+                if target is not None:
+                    written_ids.add(id(target))
+            except Exception:      # never let bookkeeping break a dry run
+                pass
+            return out
+        return spy_load_pulse
 
     def on_run(self, *a, **k):
         if not capture_points:
@@ -653,8 +1468,9 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                 raise StopDryRun()
             state["runs"] += 1
             return
-        snapshots.append(_snapshot(runtime, pool) if envelopes
-                         else {"memories": {}, "cache": _cache_words(runtime)})
+        snapshots.append(_snapshot(runtime, pool, written_ids) if envelopes
+                         else {"memories": {}, "written": set(),
+                               "cache": _cache_words(runtime)})
         state["runs"] += 1
         if len(snapshots) >= max_points:
             raise StopDryRun()
@@ -676,10 +1492,20 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
         DMASynchronizer.create_schedules = staticmethod(spy_create)
         DMASynchronizer.merge_schedules = staticmethod(spy_merge)
         DMASynchronizer.__exit__ = spy_exit
+        load_pulse_owners = _load_pulse_owners(runtime)
+        for _cls, _orig in load_pulse_owners.items():
+            _cls.load_pulse = _make_spy(_orig)
+        source_names = {}
+        # live, mutated as the sequence compiles; branch_recorder snapshots it per
+        # control-flow context (see _register_spy)
+        register_exprs = {}
+        orig_managed_call, managed_spy, restore_loads = _register_spy(
+            source_names, register_exprs, _runtime_source_file(runtime))
+        ManagedResource.__call__ = managed_spy
         try:
             with hardware_stubbed(on_run, runtime=runtime,
                                   allow_instruments=allow_instruments), \
-                 branch_recorder(branch_stack):
+                 branch_recorder(branch_stack, register_exprs):
                 try:
                     runtime.main()
                 except StopDryRun:
@@ -688,6 +1514,10 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
             DMASynchronizer.create_schedules = staticmethod(orig_create)
             DMASynchronizer.merge_schedules = staticmethod(orig_merge)
             DMASynchronizer.__exit__ = orig_exit
+            for _cls, _orig in load_pulse_owners.items():
+                _cls.load_pulse = _orig
+            ManagedResource.__call__ = orig_managed_call
+            restore_loads()
             if restore_iterations is not _MISSING:
                 runtime.iterations = restore_iterations
 
@@ -698,7 +1528,9 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
 
         trace = _build_trace(runtime, raw_blocks, resolve_indeterminate)
         trace.register_overrides = dict(resolve_registers or {})
-        trace.register_names = dict(register_names or {})
+        # source_names are read straight off the runtime's own Register()/DSP() call
+        # sites (see _variable_name_spy); an explicit register_names entry overrides one.
+        trace.register_names = {**source_names, **dict(register_names or {})}
         trace.iterations_forced = restore_iterations is not _MISSING
         trace.truncated_points = bool(max_points) and len(snapshots) >= max_points
         if capture_points:
@@ -706,7 +1538,7 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
             selected = point
         else:
             # only the requested point was reached, so it is the only snapshot
-            trace.snapshots = [_snapshot(runtime, pool)] if envelopes else []
+            trace.snapshots = [_snapshot(runtime, pool, written_ids)] if envelopes else []
             trace.point_offset = point
             selected = 0
 
@@ -726,9 +1558,16 @@ def _cache_words(runtime):
     return words
 
 
-def _snapshot(runtime, pool):
-    """DAC memory contents and cache words as of right now."""
+def _snapshot(runtime, pool, written_ids=()):
+    """DAC memory contents and cache words as of right now.
+
+    ``written_ids`` are ``id()``s of the waveform memories ``load_pulse`` has
+    written, collected by the spy installed in :func:`trace_runtime`. They are
+    resolved to ``(io_name, pulse)`` keys here so a deliberately zero-amplitude
+    pulse can be told apart from a memory nothing ever touched.
+    """
     memories = {}
+    written = set()
     for io_name, io in runtime._ios.items():
         if not io.channel.is_dac:
             continue
@@ -739,7 +1578,10 @@ def _snapshot(runtime, pool):
             array = np.array(memory.array, copy=True)
             digest = (array.shape, array.tobytes())
             memories[(io_name, pulse)] = pool.setdefault(digest, array)
-    return {"memories": memories, "cache": _cache_words(runtime)}
+            if id(memory) in written_ids:
+                written.add((io_name, pulse))
+    return {"memories": memories, "written": written,
+            "cache": _cache_words(runtime)}
 
 
 @dataclass
@@ -824,6 +1666,11 @@ def _bus_addr(r):
     return None
 
 
+def _bus_addr_pointer(r):
+    """True when this instruction drives BUS_ADDR from a DSP pointer (``bus_read(pointer)``)."""
+    return any(dest == "BUS_ADDR" and src == "DSP_P" for dest, src in ((r.d1, r.s1), (r.d2, r.s2)))
+
+
 def _bus_data_load(r, dests):
     """If this instruction lands BUS_DATA into one of ``dests`` (a destination major), return
     ``(major, minor)`` for that slot, else None -- e.g. a cache read into ``REG``/``DSP_AB``."""
@@ -869,11 +1716,7 @@ def _build_trace(runtime, raw_blocks, resolve):
     )
     try:
         trace.control_flow = sequencer_control_flow(acadia)
-        dataport = acadia._firmware["sequencer_bus"]["dma_trigger_dataport"]
-        trace.gap_terms = {
-            "detect": acadia._bus_latency("dma_running"),
-            "propagate": (max(dataport["pipeline"])
-                          + (1 if dataport["bus_pipeline"] else 0) + 1)}
+        trace.dma_timing = gateware_timing(acadia)
     except Exception:
         pass                    # gaps are an enhancement; never fail the trace
     try:
@@ -887,6 +1730,11 @@ def _build_trace(runtime, raw_blocks, resolve):
     # A cache-pointer pulse stream (randomized benchmarking) is unrolled from the per-point
     # cache in relayout; store the decode map and the stream descriptor here.
     trace.addr_names = addr_names
+    trace.channel_nums = {str(io.channel): io.channel.num() for io in runtime._ios.values()}
+    try:
+        trace.cache_base = acadia._firmware.sequencer_bus_decoder["cache"].address().value()
+    except Exception:
+        pass
     try:
         from .machine import drain_block_issue
         trace.drain_blocks = drain_block_issue(acadia)
@@ -907,7 +1755,8 @@ def _build_trace(runtime, raw_blocks, resolve):
         block = Block(index=index, start=0, length=0,
                       trigger=raw.get("trigger", True),
                       blocking=raw.get("blocking", True),
-                      conditional=raw.get("conditional", ()))
+                      conditional=raw.get("conditional", ()),
+                      register_exprs=raw.get("register_exprs", {}))
         for sub in raw["subschedules"]:
             group = []
             for ch, cmds in sub.items():
@@ -921,12 +1770,23 @@ def _build_trace(runtime, raw_blocks, resolve):
                     # Clifford that way. Nothing about it is knowable off-hardware, so it
                     # is treated as a symbolic length like a register-driven dwell.
                     raw_len = c["length"] if "length" in c else c.get("command")
-                    symbolic = length = None
+                    symbolic = length = static_length = None
                     if isinstance(raw_len, (int, np.integer)):
                         length = int(raw_len) + (1 if c.get("length_is_minus_one")
                                                  else 0)
                     else:
-                        symbolic = str(raw_len)
+                        # A readable label either way (acadia's own barrier-padding
+                        # arithmetic -- a channel dwelling `max(other lengths) - its
+                        # own`, say -- builds an Operation tree even when every operand
+                        # is already a known literal) instead of raw repr(). When it
+                        # DOES fold to a plain number, that is kept alongside for
+                        # register_summary() to declutter with -- see
+                        # Command.static_length for why it stops there.
+                        symbolic = describe_operation(raw_len)
+                        folded = _operation_value(raw_len)
+                        if (isinstance(folded, (int, np.integer, float, np.floating))
+                                and not isinstance(folded, bool)):
+                            static_length = int(folded)
                     io_name = pulse = None
                     address = c.get("address")
                     if address is not None:
@@ -936,6 +1796,9 @@ def _build_trace(runtime, raw_blocks, resolve):
                         channel=ch_name,
                         kind=KIND.get(c["command_type"], str(c["command_type"])),
                         start=0, length=length, symbolic=symbolic,
+                        static_length=static_length,
+                        direct="length" not in c and "command" in c,
+                        length_offset=1 if symbolic and c.get("length_is_minus_one") else 0,
                         is_padding=id(c) not in raw["user_ids"],
                         pulse=pulse, io_name=io_name, address=address))
             block.subschedules.append(group)
@@ -946,6 +1809,41 @@ def _build_trace(runtime, raw_blocks, resolve):
     return trace
 
 
+#: `gateware_timing` on the standard firmware configuration, used when it cannot be read.
+DEFAULT_DMA_TIMING = {"trigger": 4, "running_seen": 1, "fifo_seen": 1, "fifo_ready": 5}
+
+
+def gateware_timing(acadia):
+    """Cycle offsets of the DMA trigger and status paths for this firmware configuration.
+
+    Times are on the DMA output timeline (the DAC's own output latency is the same for
+    every channel and left out):
+
+    * ``trigger``: from the ``Trigger DMAs`` instruction to the first sample. The sequencer
+      registers the bus write, the trigger dataport registers it again, then `DMA_START`.
+    * ``running_seen``: from the end of a playout to the first cycle a poll reads
+      ``dma_running`` low. ``running`` drops one cycle before the last sample leaves the
+      output register, then passes the running dataport and the bus decoder's read register.
+    * ``fifo_seen``: from the start of the descriptor whose pull changed ``fifo_empty`` /
+      ``fifo_almost_empty`` to the first cycle a poll reads the new value. The pull is
+      `DMA_START` cycles before that start; the FIFO flag, the DMA status register and the
+      decoder each register it once.
+    * ``fifo_ready``: from a FIFO push instruction to the first cycle the DMA can pull it.
+    """
+    firmware = acadia._firmware
+    bus = firmware["sequencer_bus"]
+    decoder = 1 if bus["decoder_pipeline_miso"] else 0
+    trigger = bus["dma_trigger_dataport"]
+    fifo_latency = max(max(firmware["rfdc"][kind]["dma_fifo_latency"]) for kind in ("dac", "adc"))
+    return {
+        "trigger": (1 + max(trigger["pipeline"]) + (1 if trigger["bus_pipeline"] else 0)
+                    + DMA_START),
+        "running_seen": max(bus["dma_running_dataport"]["pipeline"]) + decoder - 1,
+        "fifo_seen": 2 + decoder - DMA_START,
+        "fifo_ready": 1 + (1 if any(bus["dma_pipeline"]) else 0) + fifo_latency,
+    }
+
+
 def sequencer_control_flow(acadia):
     """Trigger/poll addresses and branches, for costing an executed edge.
 
@@ -954,8 +1852,12 @@ def sequencer_control_flow(acadia):
     jumps to the branch target, and runs forward from there to that block's trigger. So the
     branch and its target address are needed as well.
 
+    The first DMA FIFO push per channel ahead of each trigger is kept too: a descriptor that
+    lands while the channel is still playing continues without the trigger.
+
     :return: ``{"triggers": [addr], "polls": {nth trigger: addr}, "branches": [(addr, target)],
-                "back_branches": [(branch addr, target addr)]}``
+                "back_branches": [(branch addr, target addr)],
+                "pushes": {nth trigger: {channel: addr}}}``
     """
     prog = decode_program(acadia)
 
@@ -980,41 +1882,71 @@ def sequencer_control_flow(acadia):
             if target is not None:
                 branches.append((r.i, target))
 
+    # a FIFO push writes one of the four command words below a DMA's base; base + 4 resets it
+    decoder = acadia._firmware.sequencer_bus_decoder
+    dma_base = {}
+    for name in decoder.keys():
+        match = re.fullmatch(r"(dac|adc)(\d+)_dma", name)
+        if match:
+            dma_base[decoder[name].address().value()] = f"{match.group(1).upper()}{match.group(2)}"
+    pushes = {}
+    for nth, trigger in enumerate(triggers):
+        first = {}
+        for j in range(triggers[nth - 1] + 1 if nth else 0, trigger):
+            address = _bus_addr(prog[j])
+            if address is not None and prog[j].d2 == "BUS_DATA" and not address & 4:
+                channel = dma_base.get(address & ~3)
+                if channel is not None:
+                    first.setdefault(channel, j)
+        pushes[nth] = first
+
     return {"triggers": triggers, "polls": polls, "branches": branches,
-            "back_branches": [(b, t) for b, t in branches if t < b]}
+            "back_branches": [(b, t) for b, t in branches if t < b], "pushes": pushes}
 
 
-def edge_gap(control_flow, from_nth, to_nth):
+def edge_gap(control_flow, from_nth, to_nth, start=None):
     """Dead cycles between two executed blocks, and how it breaks down.
 
     ``from_nth``/``to_nth`` index the compiled program's trigger list. A backward edge picks
-    up the branch instructions and the taken-branch penalty.
+    up the branch instructions and the taken-branch penalty. ``start`` walks from that address
+    instead of the block's blocking poll (a drain's own poll, or past a batch's trigger).
     """
     triggers, polls = control_flow["triggers"], control_flow["polls"]
-    if from_nth not in polls:
+    if start is None and from_nth not in polls:
         return None                                  # non-blocking: no wait, no gap
     if not (0 <= to_nth < len(triggers)):
         return None
-    poll = polls[from_nth]
+    poll = polls[from_nth] if start is None else start
 
     if to_nth == from_nth + 1:
         issue = triggers[to_nth] - poll + 1
         penalty = 0
         kind = "fall-through"
     else:
-        # The executed path leaves address order: find the branch that redirects to a
-        # point from which the target block's trigger is reached by running forward.
-        # Backward for a loop back-edge, forward for a skipped `test` body.
-        candidates = [(b, target) for b, target in control_flow["branches"]
-                      if b > poll and target <= triggers[to_nth]]
-        if not candidates:
+        # The executed path leaves address order: walk it instruction by instruction from the
+        # poll to the target block's trigger, deciding each branch by where that block is. A
+        # forward branch (a `test` guard) is taken unless the target lies inside what it skips;
+        # a backward branch (a loop's back-edge) is taken when the target lies inside the loop.
+        # Chains of skipped tests, a loop exit, and a skip followed by a back-edge all follow.
+        goal, branch_at = triggers[to_nth], dict(control_flow["branches"])
+        pc, issue, kinds = poll, 0, []
+        for _ in range(4 * (max(triggers) + len(branch_at) + 2)):
+            if pc == goal:
+                break
+            issue += 1
+            target = branch_at.get(pc)
+            if target is not None and ((target > pc and not pc < goal < target)
+                                       or (target <= pc and target <= goal <= pc)):
+                kinds.append("loop back" if target <= pc else "skip")
+                pc = target
+            else:
+                pc += 1
+        else:
             return None
-        branch, target = min(candidates, key=lambda pair: pair[0])
-        # poll .. branch inclusive, then branch target .. that block's trigger inclusive
-        issue = (branch - poll + 1) + (triggers[to_nth] - target + 1)
-        penalty = MEASURED_BRANCH_PENALTY
-        kind = ("taken branch (loop back)" if target < branch
-                else "taken branch (skip)")
+        issue += 1                                   # the target trigger is fetched too
+        penalty = TAKEN_BRANCH_CYCLES * len(kinds)
+        kind = (f"taken branch ({kinds[0]})" if len(kinds) == 1
+                else f"taken branches ({', '.join(kinds)})" if kinds else "fall-through")
     return {"issue": issue, "branch_penalty": penalty, "kind": kind}
 
 
@@ -1057,17 +1989,25 @@ def describe_registers(acadia):
         loaded = _bus_data_load(r, ("REG", "DSP_AB"))   # BUS_DATA -> REGn / DSP_ABn
         if loaded is None:
             continue
-        address = None
+        address = pointer = None
         for j in range(r.i - 1, max(r.i - 12, -1), -1):
+            pointer = _bus_addr_pointer(prog[j])
+            if pointer:
+                break
             found = _bus_addr(prog[j])
             if found is not None:
                 address = found
                 break
-        if address is None:
-            continue
         # a DSP unit's output DSPn drives the command length, not DSP_ABn (its input)
         major, minor = loaded
         name = f"DSP{minor}" if major == "DSP_AB" else f"REG{minor}"
+        if pointer:
+            # bus_read(pointer): the address is a DSP walking the cache, not a literal
+            # (an earlier literal BUS_ADDR would name an unrelated device)
+            registers[name] = {"source": "cache[pointer]", "cache_word": None}
+            continue
+        if address is None:
+            continue
         if cache_base <= address < cache_base + cache_words:
             word = address - cache_base
             registers[name] = {"source": f"cache[{word}]", "cache_word": word}
@@ -1154,8 +2094,8 @@ def describe_cache_stream(acadia):
             break
 
     # floor: the per-pulse period floor = the loop body's instruction span + the taken-branch
-    # penalty (measured 22 cyc = ~110 ns, the fifo-refill floor). Use the back-edge whose span
-    # contains the direct command.
+    # cost of its back-edge (the fifo-refill floor). Use the back-edge whose span contains the
+    # direct command.
     #
     # post_span: the trailing the LAST gate pays before the block after the loop -- counted as
     # the instruction span from the gate's own trigger to that next block's trigger, NOT another
@@ -1169,7 +2109,7 @@ def describe_cache_stream(acadia):
     floor = post_span = None
     for branch, target in sequencer_control_flow(acadia)["back_branches"]:
         if target <= direct_idx <= branch:
-            floor = (branch - target + 1) + MEASURED_BRANCH_PENALTY
+            floor = (branch - target + 1) + TAKEN_BRANCH_CYCLES
             next_trigger = next((t for t in triggers if t > branch), None)
             if gate_trigger is not None and next_trigger is not None:
                 post_span = next_trigger - gate_trigger

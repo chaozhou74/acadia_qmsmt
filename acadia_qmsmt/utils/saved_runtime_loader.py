@@ -70,6 +70,22 @@ def local_modules(path: Union[str, Path],
             pass
 
 
+@contextmanager
+def _no_bytecode():
+    """Do not write ``__pycache__`` for the modules imported inside the block.
+
+    A data folder's ``runtime.py`` and the modules saved next to it are imported from the
+    data folder itself; without this, Python leaves a ``__pycache__`` folder in every data
+    folder that is opened. Compiling them instead costs ~10 ms per load.
+    """
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        yield
+    finally:
+        sys.dont_write_bytecode = previous
+
+
 def _get_classes_in_module(module_path: str):
     """
     Given a path to a Python module file, return a dictionary of class names and class objects.
@@ -90,7 +106,8 @@ def _get_classes_in_module(module_path: str):
     spec = importlib.util.spec_from_file_location(module_name, str(module_path))
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    with _no_bytecode():
+        spec.loader.exec_module(module)
 
     # Get all classes defined in this module
     classes = {
