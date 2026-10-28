@@ -88,3 +88,10 @@ Claude, and assumes only the checks already in `validation/`.
 `--revalidate` proves the *timing model* still matches previously-measured hardware. Neither can
 catch a gateware change that alters real timing — only a fresh board measurement (`--all`) can,
 which is why the loopback harness is kept rather than replaced by the offline checks alone.
+
+2026-10-24: Added compiled immediate/conditional register-store DMA decoding.
+The motivating measurement is the fixed-time zero/active idle-pi GKP reset;
+the implementation uses no pulse/channel/runtime recognition. The dedicated
+validator and 83 timing dry-run cases pass. Local archived RB/XEB samples were
+compared with the unmodified baseline. One forced XEB extra-loop pin already
+invents a gate in the baseline and remains an open independent issue.

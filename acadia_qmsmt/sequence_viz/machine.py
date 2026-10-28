@@ -30,7 +30,7 @@ import re
 from dataclasses import replace
 
 from .tracing import (Destination, Placement, decode_program, edge_gap, _executed_path,
-                      DMA_STATUS_REGISTER, pointer_register_words)
+                      DMA_STATUS_REGISTER, pointer_register_words, linear_header_words, transition_backedge)
 
 
 #: A blocking block whose ENTIRE playout is one cycle of dwell, started from idle, releases the
@@ -279,6 +279,60 @@ def _exact_pointer_gate(trace, command, words):
     if value is None:
         return None
     return _decode_register_value(trace, command, int(value))
+
+
+def _constant_register_gate(trace, command, block_index):
+    """Decode a DMA word chosen by immediate register stores before this block.
+
+    Use the latest unconditional assignment, then its following conditional
+    assignments. An unresolved measurement predicate follows the viewer's usual
+    taken-path assumption and is explicitly labelled assumed. A register override
+    of that predicate selects the other physical outcome without altering time.
+    Never infer a pulse name, channel, duration or address from an experiment.
+    """
+    if command.kind not in PACKED_COMMAND_KINDS or not command.symbolic:
+        return None
+    if command.symbolic in trace.register_overrides:
+        return None                         # The caller's explicit word override has priority.
+    address = trace.block_address(block_index)
+    writes = (trace.constant_register_writes or {}).get(command.symbolic, ())
+    before = [write for write in writes if address is not None and write["at"] < address]
+    initial = [i for i, write in enumerate(before) if write["predicate"] is None]
+    if not initial:
+        return None
+    relevant = before[initial[-1]:]
+    branches = (trace.control_flow or {}).get("branches", ())
+    if any(branch < write["at"] < target and not branch < address < target
+           for write in relevant for branch, target in branches if target > branch):
+        # A store inside the same enclosing case as this block is in force.
+        # A store from a branch that has already ended still needs the
+        # executed-path decoder; its outcome cannot be guessed here.
+        return None
+    value, assumed = None, False
+    for write in relevant:
+        if write["value"] is None or write["predicate"] == "unknown":
+            return None
+        predicate = write["predicate"]
+        take = True
+        if predicate is not None:
+            source, invert = predicate
+            source_value = trace.register_overrides.get(source)
+            if source_value is None:
+                source_value = trace._value_in_force(source, block_index)
+            if source_value is None:
+                source_value = trace.register_cycles.get(source)
+            if source_value is None:
+                assumed = True
+            else:
+                take = (not bool(source_value)) if invert else bool(source_value)
+        if take:
+            value = write["value"]
+    if value is None:
+        return None
+    gate = _decode_register_value(trace, command, int(value), judge_region=False)
+    gate["resolution"] = "assumed" if assumed else "immediate"
+    gate["advance_stream_index"] = False
+    return gate
 
 
 def _assign_regions_from_pointers(trace, names):
@@ -537,6 +591,7 @@ def machine_layout(trace):
     self.unresolved = 0
     self.placements = []
     self.assumed_paths = set()
+    self.assumed_constructs = set()
     self.length_underflows = []      # per-layout, like the two above
     self.unsupported_paths = set()
 
@@ -710,8 +765,18 @@ def machine_layout(trace):
                 # answer (not latched through a pointer, or a walk that did not complete).
                 gate = (_exact_pointer_gate(self, command, exact_words[step])
                         if exact_words is not None and step < len(exact_words) else None)
+                if gate is None and command.symbolic not in self.register_overrides:
+                    # A register may be reloaded from a different fixed cache
+                    # word before each block. Decode the load in force here,
+                    # rather than the last load in the whole program.
+                    value = self._value_in_force(command.symbolic, index)
+                    if value is not None and command.kind in PACKED_COMMAND_KINDS:
+                        gate = _decode_register_value(self, command, value, judge_region=False)
+                        gate["advance_stream_index"] = False
                 if gate is None:
                     gate = _register_gate(self, command, gate_index)
+                if gate is None:
+                    gate = _constant_register_gate(self, command, index)
                 if gate is None:
                     # The clustering could not attribute a cache region to this channel. Fall
                     # back to the pointer's own arithmetic, which needs no attribution at all.
@@ -725,10 +790,11 @@ def machine_layout(trace):
                     # -- the multi-rail XEB idiom). The word is in the captured cache, so the
                     # gate's length AND identity are known; without this it stayed symbolic and
                     # drew as an indeterminate grey box captioned with the register name.
-                    length, resolution = gate["length"], "cache"
+                    length, resolution = gate["length"], gate.get("resolution", "cache")
                     command = replace(command, pulse=gate["pulse"], io_name=gate["io_name"],
                                       address=gate["address"])
-                    gate_index[command.channel] = gate_index.get(command.channel, 0) + 1
+                    if gate.get("advance_stream_index", True):
+                        gate_index[command.channel] = gate_index.get(command.channel, 0) + 1
                 elif command.symbolic == "BUS_DATA" and (self.direct_words or {}).get(
                         command.channel) is not None and (self.point_cache or {}):
                     # A direct DMA command replayed from a FIXED cache address: the word is in
@@ -747,7 +813,9 @@ def machine_layout(trace):
                         length = command.length or 0
                 elif command.symbolic:
                     override = self.register_overrides.get(command.symbolic)
-                    resolved = self.register_cycles.get(command.symbolic)
+                    resolved = self._value_in_force(command.symbolic, index)
+                    if resolved is None:
+                        resolved = self.register_cycles.get(command.symbolic)
                     # No _pointer_length call here: a cache[pointer] register is resolved
                     # above by _pointer_gate, which consumes the read. Calling it again would
                     # advance the per-pointer counter twice for one command and hand every
@@ -850,7 +918,14 @@ def machine_layout(trace):
                 # the k-th such branch the path walk meets is the k-th arm here.
                 arms = [i in executed_indices for i in unanchored_blocks
                         if index < i < plan[ahead][0]]
-                edge = edge_gap(self.control_flow, from_nth, to_nth, executed_nths, arms)
+                backedge = transition_backedge(self, plan[step], plan[ahead])
+                before = linear_header_words(self, index, path)
+                after = linear_header_words(self, plan[ahead][0], plan[ahead][2])
+                branch_values = None
+                if before or after:
+                    branch_values = tuple({reg: self.point_cache[word] for reg, word in words.items()
+                                           if word in self.point_cache} for words in (before, after))
+                edge = edge_gap(self.control_flow, from_nth, to_nth, executed_nths, arms, backedge, branch_values)
                 drain_edge = edge
                 if edge and not placement.blocking:
                     pass          # a drain block carries no gap_after; it advances t_seq below

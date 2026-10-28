@@ -747,3 +747,17 @@ and patches were attached with `add_patch`, whose data-limit bookkeeping this dr
   reloaded) never returns from the board. `nested_cool_n` re-issues `configure()` as well as
   `load()` on re-entry and works. No qudit runtime reaches three counter levels — `cool_modes`
   uses two counters plus a `test` — so nothing shipped is affected. See `UNSAFE_TO_DEPLOY`.
+
+`conditional_register_dma.py` checks packed DMA words selected by immediate
+register stores and a measurement predicate. It covers loaded I/Q and occupied
+cycles, both outcomes and explicit overrides, including address zero and later
+unconditional assignments. It requires no hardware. For local RB/XEB archives,
+call `streaming.check_folder` on an existing folder rather than accepting a main
+campaign that found zero experiments. Fixed-circuit loopback averages are not a
+test of point-to-point random-circuit variation.
+
+`fixed_register_reloads.py` (2026-10-25) checks per-block fixed-cache reloads,
+including packed DMA identities and dwell lengths. `conditional_register_dma.py`
+also places its conditional immediate stores inside an enclosing PC branch.
+These prevent a reused register's last source or an outer case from hiding the
+actual pulse that a block plays.

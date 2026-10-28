@@ -88,3 +88,29 @@ Two bugs the sweep found, now fixed:
    count from archived data turns up, that changes.
 4. The Qt wrapper now lives in acadia_gui (`gui/sequence_view.py`); finish wiring it into the
    data browser (a toggle between the live plot view and the sequence view).
+
+## Immediate register-store selections
+
+`tracing.describe_constant_register_writes` records the source instruction address,
+immediate value (or unknown) and supported plain-register predicate of stores.
+`machine._constant_register_gate` starts from the last unconditional assignment
+before a DMA block and applies following conditional assignments. Unknown source
+writes invalidate the result. Pulse identities come only from the packed DMA
+address and the run's memory map; lengths come from the word's low bits.
+
+Do not advance a streamed cache pointer for such a selection. Forward PC-branch
+assignments are deliberately excluded, because their latest executed write must
+be resolved by the path walker. Unsupported arithmetic/masked predicates are
+not simplified into a guessed truth value. Keep `validation/conditional_register_dma.py`
+and the streamed-register checks when changing this priority.
+
+## Loop-header words end at the next register write (2026-10-27)
+
+`tracing.linear_header_words` derives the words a counted pointer loop's header
+latches. They are valid only up to the next write of that register inside the
+body. Z2HiggsSimulation (`261016/231217`) loads REG0-2 in the header for the
+loc pulses, then reloads them from another pointer for the A layer; applying the
+header words to the A block decoded raw cache words as lengths (61 M cycles) and
+stretched a 21 us sequence to ~1 s, overflowing the GUI's int32 time scrollbar.
+Registers written between the loop's first block and the current block are now
+dropped from the header result, so the executed-path walk keeps its word.

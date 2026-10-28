@@ -501,3 +501,44 @@ and they come back.
   `trace.loop_counts[block_index] = n`).
 - **Readout kernel `.npy` files are not archived** with the folder. If one has
   moved, window loading fails; this does not affect the timeline.
+
+### Conditional register-selected DMA words (2026-10-24)
+
+A program can select a pulse by loading an immediate packed DMA word, conditionally
+storing another immediate word, and issuing one `schedule_direct` instruction.
+The viewer now decodes these **compiled register stores**, including their
+length/address and loaded I/Q. This fixes the missing zero/active-reset envelope
+and timing in fixed-time GKP feedback; no experiment name is recognized.
+
+An unresolved measurement predicate is shown as assumed, following the viewer's
+existing path policy. A predicate-register override selects the outcome; an
+explicit DMA-word override has priority. Arithmetic predicates and assignments
+inside forward PC branches remain with the existing executed-path decoder.
+Constant selections do not consume words from streamed RB/XEB cache pointers.
+
+`validation/conditional_register_dma.py` tests different DACs, pulse names,
+lengths, complex envelopes, both predicates, overrides and later assignments.
+The timing dry-run matrix passed 83 cases. Four local RB/XEB archives retained
+the same sampled trains as the baseline. The muxed XEB archive's forced extra
+loop-count check reports one invented gate on **both** the baseline and this
+version; this change does not claim to fix that older pinning issue. Repeated
+trace averages in those loopback archives deliberately have identical circuits.
+
+### Registers reloaded before individual blocks (2026-10-25)
+
+A fixed cache load is local to its use: a register loaded from cache[3] before
+one block and cache[6] before the next must display those respective values.
+The machine layout now resolves the compiled load in force at each block,
+for both packed DMA words and dwell/stretch lengths. It no longer applies the
+last load in the entire program to all earlier commands. Immediate conditional
+pulse selection inside the same enclosing forward branch is also decoded;
+stores from a branch that has ended remain with the executed-path decoder.
+An assumed conditional word now has a valid summary label.
+
+`validation/fixed_register_reloads.py` covers different DMA identities/lengths
+and dwell lengths with reused registers. `conditional_register_dma.py` covers
+conditional stores inside an enclosing case, overrides and later reassignments.
+The 83-case timing dry run passes. Local RB and XEB archive samples retain their
+baseline trains; the XEB capture intentionally repeats identical circuits and
+retains the same baseline identical-train diagnostic. The current GKP loopback
+report records actual emitted complex I/Q for the new cache-driven sequences.

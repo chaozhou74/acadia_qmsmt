@@ -245,6 +245,9 @@ class SequenceTrace:
     #: counter, in program order (describe_register_writes). A register reused for two loops
     #: holds a different value at each, and the loop sees the LAST write before it starts.
     register_writes: dict = field(default_factory=dict)
+    # Immediate assignments, including constant-time conditional stores. Unlike
+    # a conditional jump, these do not create another synchronizer block.
+    constant_register_writes: dict = field(default_factory=dict)
     #: "DSP1" -> the program addresses that PULSE that counter (describe_cep_sites). How many of
     #: them sit inside a loop's back-edge is how many cache words one pass of that loop walks.
     cep_sites: dict = field(default_factory=dict)
@@ -952,12 +955,23 @@ class SequenceTrace:
                 decided = self.pointer_decisions.get(self.construct_key(first, depth + 1))
                 if decided is None:
                     decided = self.evaluate_condition(context.get("condition"), first)
+                if decided is None:
+                    match = CONDITION_RE.match((context.get("condition") or "").strip())
+                    words = linear_header_words(self, first, path)
+                    if match and match.group(1) in words:
+                        value = (self.point_cache or {}).get(words[match.group(1)])
+                        if value is not None:
+                            operator, literal = match.group(2), int(match.group(3), 0)
+                            decided = {"==": value == literal, "!=": value != literal,
+                                       "<": value < literal, "<=": value <= literal,
+                                       ">": value > literal, ">=": value >= literal}.get(operator)
                 taken = self._path_override(first, depth + 1, path)
                 if taken is None:
                     taken = decided
                     if taken is None:
                         taken = True
                         self.assumed_paths.add(first)
+                        self.assumed_constructs.add(self.construct_key(first, depth + 1))
                 if taken:
                     plan.extend(self._expand_contexts(body, depth + 1, 0, path + (0,)))
             elif context["kind"] == "repeat_until":
@@ -1158,7 +1172,7 @@ class SequenceTrace:
                 if kind == "test":
                     pinned = self._path_override(first, level)
                     source = ("pinned" if pinned is not None
-                              else "assumed" if first in self.assumed_paths else "resolved")
+                              else "assumed" if self.construct_key(first, level) in getattr(self, "assumed_constructs", set()) else "resolved")
                     # Whether the arm RAN is read off the executed plan, not inferred from
                     # assumed_paths. An assumed test is drawn TAKEN (the tracer's default when it
                     # cannot decide), so "assumed" and "skipped" are not the same thing -- reading
@@ -1288,7 +1302,7 @@ class SequenceTrace:
                          f"of the sequence)")
         if self.unresolved:
             how = {"cache": "from cache", "override": "overridden",
-                   "fallback": "fallback"}
+                   "fallback": "fallback", "assumed": "assumed"}
             shown = {}
             for c in self.commands:
                 if c.symbolic:
@@ -1823,6 +1837,7 @@ def _build_trace(runtime, raw_blocks, resolve):
         pass                    # a constant nobody could read is the old behaviour, not a failure
     try:
         trace.register_writes = describe_register_writes(acadia)
+        trace.constant_register_writes = describe_constant_register_writes(acadia)
     except Exception:
         pass                    # without it every loop reads the whole-program values, as before
     try:
@@ -1974,7 +1989,21 @@ def sequencer_control_flow(acadia):
             if target is not None:
                 branches.append((r.i, target))
 
+    # Zero/nonzero register predicates can also surround NO DMA block.
+    # Keep them so the instruction walk charges a skipped empty body correctly.
+    simple_branches, mask = {}, None
+    for r in prog:
+        if r.d1 == "MASK":
+            mask = _resolve_imm(r.imm1) if r.s1 == "IMM" else None
+        if r.d2 == "MASK":
+            mask = _resolve_imm(r.imm2) if r.s2 == "IMM" else None
+        if r.d1 == "PC" and r.d1_minor == 0 and r.conditional and r.s2 == "REG":
+            if r.op is None:
+                simple_branches[r.i] = (f"REG{r.s2_minor}", r.condition_invert, 0)
+            elif r.op == "xor" and mask is not None:
+                simple_branches[r.i] = (f"REG{r.s2_minor}", r.condition_invert, mask)
     return {"triggers": triggers, "polls": polls, "branches": branches,
+            "simple_branches": simple_branches,
             "back_branches": [(b, t) for b, t in branches if t < b]}
 
 
@@ -2006,10 +2035,12 @@ def _branch_is_taken(at, target, goal, triggers, executed, arms):
         if arms:
             return not arms.pop(0)        # a queued arm: taken exactly when it did not run
         return False                      # skips no block at all: not a body-skip branch
-    return not any(t in executed for t in skipped)
+    # If the next executed trigger is outside this body, skip it. A trigger
+    # may run in a DIFFERENT loop iteration without running on this stretch.
+    return True
 
 
-def _executed_path(control_flow, poll, goal, executed_nths, arms=()):
+def _executed_path(control_flow, poll, goal, executed_nths, arms=(), backedge=None, branch_values=None):
     """Instructions FETCHED walking from ``poll`` to ``goal``, and the branch penalty paid.
 
     Counting an address range is only right while control stays in address order, and it does
@@ -2037,13 +2068,27 @@ def _executed_path(control_flow, poll, goal, executed_nths, arms=()):
     fetched = penalty = 0
     pc = poll
     pending = list(arms)                         # consumed in program order by the walk
+    before, after = branch_values or ({}, {})
+    values = dict(before or after)
     for _ in range(limit):
-        if pc == goal:
+        if backedge is not None and pc == backedge[0]:
+            fetched += 1
+            penalty += MEASURED_BRANCH_PENALTY
+            pc = backedge[1]
+            backedge = None
+            values = dict(after)
+            continue
+        if pc == goal and backedge is None:
             return fetched + 1, penalty          # the goal instruction is fetched too
         fetched += 1
         target = branch_at.get(pc)
-        if target is not None and _branch_is_taken(pc, target, goal, triggers, executed,
-                                                   pending):
+        checkpoint = backedge[0] if backedge is not None else goal
+        taken = None
+        predicate = control_flow.get("simple_branches", {}).get(pc)
+        if predicate and predicate[0] in values:
+            taken = bool(int(values[predicate[0]]) ^ int(predicate[2])) != bool(predicate[1])
+        if target is not None and (taken if taken is not None else
+                _branch_is_taken(pc, target, checkpoint, triggers, executed, pending)):
             pc = target
             penalty += MEASURED_BRANCH_PENALTY
         else:
@@ -2051,7 +2096,7 @@ def _executed_path(control_flow, poll, goal, executed_nths, arms=()):
     return None
 
 
-def edge_gap(control_flow, from_nth, to_nth, executed_nths=(), arms=()):
+def edge_gap(control_flow, from_nth, to_nth, executed_nths=(), arms=(), backedge=None, branch_values=None):
     """Dead cycles between two executed blocks, and how it breaks down.
 
     ``from_nth``/``to_nth`` index the compiled program's trigger list. A backward edge picks
@@ -2066,6 +2111,11 @@ def edge_gap(control_flow, from_nth, to_nth, executed_nths=(), arms=()):
     if not (0 <= to_nth < len(triggers)):
         return None
     poll = polls[from_nth]
+    if backedge is not None or branch_values:
+        walked = _executed_path(control_flow, poll, triggers[to_nth], executed_nths, arms, backedge, branch_values)
+        if walked is not None:
+            issue, penalty = walked
+            return {"issue": issue, "branch_penalty": penalty, "kind": "counted loop transition"}
 
     if to_nth == from_nth + 1:
         issue = triggers[to_nth] - poll + 1
@@ -2185,6 +2235,115 @@ def describe_pointer_events(acadia):
     return events
 
 
+def linear_header_words(trace, index, path):
+    """Cache words latched by an unconditional header of a counted pointer loop.
+
+    Every term comes from the compiled pointer loads/advances and this execution's
+    loop index. Decline loops advancing their command pointer inside a test/body;
+    those still use the full program-counter replay.
+    """
+    block = trace.blocks[index]
+    for depth in reversed(range(len(block.conditional or ()))):
+        context = block.conditional[depth]
+        if context.get("kind") != "repeat_until" or len(path) <= depth:
+            continue
+        counters = re.findall(r"\bDSP(\d+)\b", context.get("condition") or "")
+        if len(counters) != 1:
+            continue
+        counter = int(counters[0])
+        addresses = [trace.block_address(j) for j, other in enumerate(trace.blocks)
+                     if len(other.conditional or ()) > depth
+                     and trace._same_context(other.conditional[depth], context)]
+        addresses = [address for address in addresses if address is not None]
+        if not addresses:
+            continue
+        spans = [(branch-target, target, branch)
+                 for branch, target in (trace.control_flow or {}).get("back_branches", ())
+                 if target <= min(addresses) and max(addresses) <= branch]
+        if not spans:
+            continue
+        _, head, end = min(spans)
+        events = getattr(trace, "pointer_events", {})
+        steps = [at for at, actions in events.items() if head <= at <= end
+                 and ("cep", counter) in actions]
+        # No guessed stride when advances can depend on a selected body.
+        if not steps or max(steps) >= min(addresses):
+            continue
+        loads = [(at, event[2]) for at, actions in events.items() if at < head
+                 for event in actions if event[:2] == ("ptr_load", counter)]
+        unknowns = [at for at, actions in events.items() if at < head
+                    and ("ptr_unknown", counter) in actions]
+        if not loads:
+            continue
+        loaded_at, base = max(loads)
+        if base is None or (unknowns and max(unknowns) > loaded_at):
+            continue
+        offset = sum(loaded_at < at < head for at, actions in events.items()
+                     if ("cep", counter) in actions)
+        bus, words = None, {}
+        for at in sorted(events):
+            if not head <= at < min(addresses):
+                continue
+            for event in events[at]:
+                if event[0] == "bus_ptr":
+                    bus = base+offset+int(path[depth])*len(steps) if event[1] == counter else None
+                elif event[0] == "bus_other":
+                    bus = None
+                elif event[0] == "reg_from_bus":
+                    if bus is None:
+                        words.pop(f"REG{event[1]}", None)
+                    else:
+                        words[f"REG{event[1]}"] = bus
+                elif event[0] == "reg_other":
+                    words.pop(f"REG{event[1]}", None)
+                elif event == ("cep", counter):
+                    offset += 1
+        # The header's words hold only until the body writes the register again.
+        # A later block in the same pass (z2_higgs: REG0-2 play the loc pulses, then
+        # are reloaded from another pointer for the A layer) must keep the walk's word.
+        here = trace.block_address(index)
+        if here is None:
+            return {}
+        for at, actions in events.items():
+            if min(addresses) <= at < here:
+                for event in actions:
+                    if event[0] in ("reg_from_bus", "reg_other"):
+                        words.pop(f"REG{event[1]}", None)
+        return words
+    return {}
+
+
+def transition_backedge(trace, previous, current):
+    """The loop back-edge crossed between these two *executions*, if any.
+
+    A later arm in the next iteration can have a larger program address than
+    the previous arm. Address order alone would execute it in the old iteration.
+    """
+    if previous is None:
+        return None
+    before, _, old_path = previous
+    after, _, new_path = current
+    old_stack, new_stack = trace.blocks[before].conditional, trace.blocks[after].conditional
+    for depth, (old, new) in enumerate(zip(old_stack or (), new_stack or ())):
+        if not trace._same_context(old, new):
+            break
+        if old.get("kind") not in ("loop", "repeat_until"):
+            continue
+        if len(old_path) <= depth or len(new_path) <= depth or old_path[depth] == new_path[depth]:
+            continue
+        addresses = [trace.block_address(j) for j, block in enumerate(trace.blocks)
+                     if len(block.conditional or ()) > depth
+                     and trace._same_context(block.conditional[depth], old)]
+        addresses = [address for address in addresses if address is not None]
+        spans = [(branch-target, branch, target)
+                 for branch, target in (trace.control_flow or {}).get("back_branches", ())
+                 if addresses and target <= min(addresses) and max(addresses) <= branch]
+        if spans:
+            _, branch, target = min(spans)
+            return branch, target
+    return None
+
+
 def pointer_register_words(trace, plan, nth_of_block, executed_nths):
     """For each step of ``plan``: ``{"REGm": cache word}`` for every register that, when that block
     is triggered, holds a word read through a cache POINTER. None if the walk cannot be made.
@@ -2256,7 +2415,9 @@ def pointer_register_words(trace, plan, nth_of_block, executed_nths):
                 pc += 1
         else:
             return None                       # the walk did not reach the block: do not guess
-        out.append(dict(words))
+        current_words = dict(words)
+        current_words.update(linear_header_words(trace, index, _path))
+        out.append(current_words)
         pc = goal + 1
     return out
 
@@ -2407,6 +2568,30 @@ def describe_register_writes(acadia):
             name = f"DSP{minor}" if dest == "DSP_AB" else f"REG{minor}"
             value = _resolve_imm(imm) if src == "IMM" else None
             writes.setdefault(name, []).append((r.i, value))
+    return writes
+
+
+def describe_constant_register_writes(acadia):
+    """Immediate register assignments with their actual instruction predicates.
+
+    A conditional store can choose a waveform word without a PC branch. Keep
+    non-immediate writes too, so a later bus load invalidates an earlier constant.
+    Only a plain REG predicate is decoded here; other predicates remain unknown.
+    """
+    writes = {}
+    for instruction in decode_program(acadia):
+        if instruction.d1 != "REG":
+            continue
+        name = f"REG{instruction.d1_minor}"
+        value = _resolve_imm(instruction.imm1) if instruction.s1 == "IMM" else None
+        predicate = None
+        if instruction.conditional:
+            if instruction.s2 == "REG" and instruction.op is None:
+                predicate = (f"REG{instruction.s2_minor}", bool(instruction.condition_invert))
+            else:
+                predicate = "unknown"
+        writes.setdefault(name, []).append({"at": instruction.i, "value": value,
+                                           "predicate": predicate})
     return writes
 
 
