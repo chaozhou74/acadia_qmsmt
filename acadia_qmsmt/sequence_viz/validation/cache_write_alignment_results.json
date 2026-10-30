@@ -1,0 +1,137 @@
+[
+  {
+    "words": 1,
+    "bytes": 4,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_1w_a0/260824_195018"
+  },
+  {
+    "words": 2,
+    "bytes": 8,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_2w_a0/260824_195024"
+  },
+  {
+    "words": 2,
+    "bytes": 8,
+    "align": 4,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_2w_a4/260824_195028"
+  },
+  {
+    "words": 3,
+    "bytes": 12,
+    "align": 0,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_3w_a0/260824_195032"
+  },
+  {
+    "words": 4,
+    "bytes": 16,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_4w_a0/260824_195036"
+  },
+  {
+    "words": 4,
+    "bytes": 16,
+    "align": 8,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_4w_a8/260824_195041"
+  },
+  {
+    "words": 5,
+    "bytes": 20,
+    "align": 0,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_5w_a0/260824_195045"
+  },
+  {
+    "words": 6,
+    "bytes": 24,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_6w_a0/260824_195049"
+  },
+  {
+    "words": 8,
+    "bytes": 32,
+    "align": 4,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_8w_a4/260824_195054"
+  },
+  {
+    "words": 10,
+    "bytes": 40,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_10w_a0/260824_195058"
+  },
+  {
+    "words": 11,
+    "bytes": 44,
+    "align": 0,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_11w_a0/260824_195103"
+  },
+  {
+    "words": 30,
+    "bytes": 120,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_30w_a0/260824_195106"
+  },
+  {
+    "words": 45,
+    "bytes": 180,
+    "align": 0,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_45w_a0/260824_195113"
+  },
+  {
+    "words": 45,
+    "bytes": 180,
+    "align": 8,
+    "survived": false,
+    "predicted": false,
+    "evidence": "no SURVIVED line and no data",
+    "folder": "/home/boson/data/test_loopback/slice_45w_a8/260824_195116"
+  },
+  {
+    "words": 48,
+    "bytes": 192,
+    "align": 0,
+    "survived": true,
+    "predicted": true,
+    "evidence": "logged SURVIVED",
+    "folder": "/home/boson/data/test_loopback/slice_48w_a0/260824_195121"
+  }
+]
