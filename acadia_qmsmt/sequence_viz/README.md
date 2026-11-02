@@ -10,6 +10,30 @@ view = sv.explore_folder("/path/to/data_folder")   # interactive, drag to zoom
 fig, ax, trace = sv.plot_folder("/path/to/data_folder")   # static figure
 ```
 
+## Default reset paths and batched shots — 2026-11-01
+
+The GKP report at `msmt_workbench/rfsoc/msmt/loopback_measurements/gkp/`
+`CADENCE_SEEQUENCE_AND_DATA_2026-11-01.md` records two display fixes:
+
+- Unknown scalar comparisons now share the default register value zero. An
+  equality and its opposite select one possible path, while both stay marked
+  assumed. This follows the compiler's complementary comparison predicates;
+  no experiment name, classifier outcome or latency constant is inferred.
+- The GUI has a default-on **one shot per loaded setting** control. It passes
+  `overrides={"shots_per_load": 1}` to the existing folder tracer; this is only
+  a visualization override. Disable it and Reload to inspect raw shot points.
+  The core tracing API's raw-shot behavior is unchanged. Capture-limit warnings
+  are now visible rather than clearing the status line.
+
+The old default took both `REG0 != 0` and `REG0 == 0` bodies, so it queued a pi
+and a zero pulse on the qubit line, and showed its CD 30 ns late. It also
+underestimated the cycle by 10 ns. The corrected default, explicit g and
+explicit e all give the independently measured 3.075 us period for the tested
+5/20 ns-gap geometry. No SDK command emission or timing coefficient changed.
+Validation checks nine complementary predicate pairs, 27 known-value pairs,
+two explicit alternatives, all 320 saved cadence settings and 615,000 recorded
+FPGA intervals. The unrelated AllXY GUI interaction gate passes too.
+
 ## THE RULE: SeeQuence never hardcodes
 
 **SeeQuence is a decompiler, not a recogniser.** Every number it draws must be *derived* from
@@ -27,8 +51,9 @@ if dac == 10:
 
 # RIGHT -- read it out of the program/cache, keyed on KIND and on what the data says
 word = _pointer_length(trace, placement, command, seen)
-if command.kind in ('CONST_CONT', 'ARB_CONT'):
-    length = int(word)                      # a bare hold length
+if command.kind in ('CONST_CONT', 'ARB_CONT', 'DWELL'):
+    # Acadia can issue either a true length or an already encoded length - 1.
+    length = int(word) + int(command.length_is_minus_one)
 else:                                       # a packed waveform_dma_command
     length = (int(word) & 0xFFFF) + 1
     pulse  = (trace.addr_names or {}).get((dac, int(word) >> 16))
@@ -48,6 +73,74 @@ than no viewer at all.
 **How to test for it:** trace at least two runs with *different* configs — different pulse names,
 ladder depth, step counts, channels — and check both. If a change only helps one of them, it is
 recognition, not decoding, and it does not belong in `sequence_viz`.
+
+## Register length convention (2026-10-30)
+
+Preserve `length_is_minus_one` when capturing a symbolic command. When true,
+a resolved register value w plays w+1 clocks, including w=0. Constant lengths
+already receive that conversion at capture; packed ARB words receive it when
+decoded. Do not add it twice. Dropping the flag shortened a GKP A/B cycle by
+two clocks in the viewer; board periods were correct. The independent
+`validation/register_minus_one.py` compares constants, fixed-cache and pointer
+loads through the existing Acadia API. No change to `qmsmt.py` is required.
+
+This is a command-format rule, not a latency fitted to GKP. Its source chain is:
+
+1. [SDK `command_dma`](../../../acadia/pyacadia/acadia/system.py) writes
+   `length` unchanged when `length_is_minus_one=True`, otherwise `length-1`.
+2. [FPGA DMA](../../../acadia/logic/src/acadia_dma.vhd) documents the field as
+   `length-1` (lines 12–24), loads `descriptor_lm1` (261/271), decrements it
+   each running clock (277), and completes at zero (218). A stored zero is
+   therefore one clock.
+3. The viewer retains the flag, resolves the register/cache value, and adds
+   one exactly once. Packed waveform words already contain the same convention.
+
+The separate branch penalty also comes from the
+[sequencer FPGA](../../../acadia/logic/src/acadia_sequencer.vhd),
+`instruction_proc` (228–295): a taken branch clears the instruction pipeline
+and refills it. With the current one-stage fetch setting, one skipped-test
+jump instruction plus three refill clocks costs four clocks. Loopback markers
+check that prediction. Reset simplification on 2026-10-31 changes runtime
+dwells only; it adds no viewer latency correction or experiment-specific rule.
+
+## Queued `test` arms inside loops (2026-10-31)
+
+A `channel_synchronizer(trigger=False)` arm inside a `test` pushes its
+commands where its test body sits, copying the registers' values at that
+moment; the next triggered block plays them. Such an arm has no trigger
+address, so three things used to go wrong inside a `repeat_until` loop (the
+GKP FPGA loop queues its qubit input this way):
+
+1. its register-chosen command was read at the previous trigger, not at the
+   push (wrong pulse drawn);
+2. the loop's pass count anchored on the arm and fell back to one pointer
+   advance per pass (x64 instead of x8);
+3. "did this arm run" was answered for the whole plan, so with mixed g/e
+   histories both arms counted as run and no skipped-test cost was charged.
+
+Now `SequenceTrace.queued_arm_bodies()` pairs such arms with the trigger-less
+forward branches in program order (the pairing edge_gap's arm accounting
+already relied on). `pointer_register_words` walks into the arm's body before
+reading its registers; `pointer_cep_per_pass` and `_loop_head` use the body as
+the loop anchor; `machine._stretch_arms` marks an arm as run only on the
+stretch where it ran, following the walk across a loop back-edge. If arms and
+branches cannot be paired, the old behaviour is kept. Checked: GKP loop
+runtimes against loopback (input pi 35 ns before every CD, board within
+0.75 ns), `timing_validation.py --dryrun all` and `--revalidate`,
+`prep_selector_timing.py`, `conditional_register_dma.py`.
+
+Also 2026-10-31: after a NON-blocking block the layout now charges the instructions to the
+next block across a loop back-edge (it charged nothing before), and a CMACC "measurement
+complete" poll on that stretch holds the sequencer until capture end +
+`MEASURED_CMACC_RESULT_LATENCY` (docs/EMPIRICAL_CONSTANTS.md section 3). CMACC polls compile
+like DMA polls; they are now excluded when finding a block's own poll or a drain. A hold
+(branch to itself) met mid-walk is passed, not taken. A pointer advanced before a loop
+(prefetch) counts toward that loop's pass count (`_straight_advances`).
+
+Known limit: a queued DWELL on a line that a LATER block triggers is drawn as
+starting at the push, not at that block's trigger (seen in a trial
+photon-counting reset, 130 ns early per click; that runtime change was
+reverted, so no current runtime relies on it).
 
 ## Layout
 
@@ -493,11 +586,14 @@ and they come back.
   *hangs the sequencer*. Such a region lands in `trace.unsupported_paths` and is
   captioned `TIMING NOT MODELLED (see KI_004)` rather than drawn as if trusted.
   The default `speculation=True` is validated on both arms (0.04 / 0.10 ns).
-- **An undecidable `test` is assumed taken.** If the condition cannot be resolved
-  from the cache, the body is drawn and the block is listed in
-  `trace.assumed_paths`, with the caption saying `assumed taken`. Force the other
-  arm without re-tracing:
-  `trace.path_choices[block_index] = False; trace.relayout()` (same for
+- **An undecidable scalar comparison uses a consistent placeholder.** For a
+  simple unknown register-versus-literal comparison, the default drawing uses
+  register value zero. Thus `r == 0` and `r != 0` cannot both run automatically.
+  Both remain labelled **assumed**, not measured. Previously both bodies were
+  assumed taken independently, drawing an impossible pi plus zero-pulse reset
+  and shifting the GKP qubit train 30 ns behind its pump. Compound predicates
+  retain the previous taken-body fallback. Explicit pins retain priority:
+  `trace.path_choices[block_index] = True/False; trace.relayout()` (same for
   `trace.loop_counts[block_index] = n`).
 - **Readout kernel `.npy` files are not archived** with the folder. If one has
   moved, window loading fails; this does not affect the timeline.

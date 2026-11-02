@@ -30,7 +30,8 @@ import re
 from dataclasses import replace
 
 from .tracing import (Destination, Placement, decode_program, edge_gap, _executed_path,
-                      DMA_STATUS_REGISTER, pointer_register_words, linear_header_words, transition_backedge)
+                      DMA_STATUS_REGISTER, pointer_register_words, linear_header_words, transition_backedge,
+                      MEASURED_CMACC_RESULT_LATENCY, cmacc_poll_addresses)
 
 
 #: A blocking block whose ENTIRE playout is one cycle of dwell, started from idle, releases the
@@ -260,6 +261,33 @@ def _decode_register_value(trace, command, word, judge_region=True):
     io_name, pulse = (named if isinstance(named, tuple) and len(named) == 2
                       else (command.io_name, named))
     return {"length": length, "pulse": pulse, "io_name": io_name, "address": address}
+
+
+def _stretch_arms(trace, plan, step, ahead, unanchored_blocks, executed_indices, from_address, to_address):
+    """Did-it-run flags for the trigger-less `test` arms on the walk from ``plan[step]``'s trigger
+    to ``plan[ahead]``'s, in the order the walk meets them.
+
+    An arm counts as run only if it executed on THIS stretch (it is among plan[step+1:ahead]),
+    not anywhere in the plan: inside a loop, a g arm and an e arm both run in some pass, but on
+    one pass exactly one does. A stretch that crosses a loop back-edge walks
+    (from, back branch] and then [loop head, to); arms are placed by their test-body address
+    (SequenceTrace.queued_arm_bodies). Arms without such an address keep the old rule.
+    """
+    bodies = trace.queued_arm_bodies()
+    index, following = plan[step][0], plan[ahead][0]
+    if not bodies or any(i not in bodies for i in unanchored_blocks):
+        return [i in executed_indices for i in unanchored_blocks if index < i < following]
+    ran = {plan[j][0] for j in range(step + 1, ahead)}
+    if from_address < to_address:
+        walk = [(x, i) for i, x in bodies.items() if from_address < x < to_address]
+    else:
+        backedge = transition_backedge(trace, plan[step], plan[ahead])
+        if backedge is None:
+            return [i in executed_indices for i in unanchored_blocks if index < i < following]
+        branch, target = backedge
+        walk = ([(x, i) for i, x in bodies.items() if from_address < x <= branch]
+                + [(x + branch + 1, i) for i, x in bodies.items() if target <= x < to_address])
+    return [i in ran for _, i in sorted(walk)]
 
 
 def _exact_pointer_gate(trace, command, words):
@@ -563,11 +591,12 @@ def drain_block_issue(acadia):
     """
     prog = decode_program(acadia)
     triggers = [r.i for r in prog if r.comment == "Trigger DMAs"]
+    cmacc_polls = cmacc_poll_addresses(acadia, prog)  # measurement waits, not drains
     drains = {}
     for nth, trigger in enumerate(triggers):
         limit = triggers[nth + 1] if nth + 1 < len(triggers) else len(prog)
         for j in range(trigger + 1, limit):
-            if _is_hold(prog[j]):
+            if _is_hold(prog[j]) and j not in cmacc_polls:
                 if prog[j].condition_invert:
                     nxt = triggers[nth + 1] if nth + 1 < len(triggers) else None
                     # the nearest preceding MASK write is the status bit this poll tests
@@ -615,6 +644,7 @@ def machine_layout(trace):
     # channel: one pass may read it once per paired mode (see _pointer_length).
     pointer_reads = {}
     cursor, t_seq = {}, 0
+    capture_end = None    # end of the latest capture window placed (see MEASURED_CMACC_RESULT_LATENCY)
     # Instruction span of the gap the sequencer is currently paying, i.e. how long BEFORE t_seq
     # the next block's descriptors start being pushed. Needed to tell a seamless continuation
     # from a real bubble (see play_start below).
@@ -842,7 +872,8 @@ def machine_layout(trace):
                     # Treating those as underflows would draw a 21-second command on every trace
                     # with an indeterminate length, which is far more misleading than the bug
                     # being guarded against.
-                    if length == 0 and resolution in ("cache", "override"):
+                    if (length == 0 and resolution in ("cache", "override")
+                            and not command.length_is_minus_one):
                         # ZERO UNDERFLOWS -- and the board does something enormous, so the picture
                         # must not quietly show nothing. `Acadia.command_dma` emits `length - 1`
                         # (system.py), so a register holding 0 becomes -1, i.e. an all-ones length
@@ -862,6 +893,16 @@ def machine_layout(trace):
                             {"channel": command.channel, "kind": command.kind,
                              "register": command.symbolic, "cycles": length})
                     self.unresolved += 1
+                # Acadia can issue a register directly as the DMA's stored
+                # length-minus-one. In that case 0 is one clock, 1 is two, etc.
+                # Hardware: acadia/logic/src/acadia_dma.vhd loads descriptor_lm1
+                # from the command and finishes when that down-counter is zero.
+                # Apply this for fixed-cache AND pointer-selected lengths.
+                # Packed ARB words were already decoded with their own +1.
+                if (command.symbolic and command.length_is_minus_one
+                        and command.kind not in PACKED_COMMAND_KINDS
+                        and resolution in ("cache", "override")):
+                    length += 1
                 start_rel = per_channel.get(command.channel, t_sub)
                 placement.commands.append(replace(
                     command, start=play_start[command.channel] + start_rel,
@@ -916,8 +957,9 @@ def machine_layout(trace):
                 # Which trigger-less `test` arms lie on THIS stretch, and which of them ran.
                 # In program order, because the compiled branches are in program order too, so
                 # the k-th such branch the path walk meets is the k-th arm here.
-                arms = [i in executed_indices for i in unanchored_blocks
-                        if index < i < plan[ahead][0]]
+                arms = _stretch_arms(self, plan, step, ahead, unanchored_blocks, executed_indices,
+                                     self.control_flow["triggers"][from_nth],
+                                     self.control_flow["triggers"][to_nth])
                 backedge = transition_backedge(self, plan[step], plan[ahead])
                 before = linear_header_words(self, index, path)
                 after = linear_header_words(self, plan[ahead][0], plan[ahead][2])
@@ -956,6 +998,14 @@ def machine_layout(trace):
                         "one_cycle_join": -ONE_CYCLE_JOIN_EARLY if one_cycle_join else 0,
                         "edge": edge["kind"]}
 
+        # The capture a later CMACC poll waits for: the windows of the most recent block that
+        # HAS capture windows (this block included). Not the latest end in the whole shot -- a
+        # long raw trace capture armed once at the start would otherwise swallow every wait.
+        ends = [command.start + command.length for command in placement.commands
+                if str(command.channel).startswith("ADC") and command.kind != "DWELL"
+                and not command.is_padding and command.length is not None]
+        if ends:
+            capture_end = max(ends)
         # advance the sequencer clock to the next block
         nth = nth_of_block.get(index)
         if nth in drains and not stream_here:
@@ -1035,15 +1085,31 @@ def machine_layout(trace):
                 if to_nth is not None:
                     break
                 ahead += 1
-            if from_nth is not None and to_nth is not None and to_nth > from_nth:
+            # A loop that comes back to its head is a BACKWARD edge; walk it over the back-edge
+            # (as the blocking path does) instead of charging nothing.
+            backedge = None
+            if from_nth is not None and to_nth is not None and to_nth <= from_nth:
+                backedge = transition_backedge(self, plan[step], plan[ahead])
+            if from_nth is not None and to_nth is not None and (to_nth > from_nth or backedge):
                 triggers = self.control_flow["triggers"]
-                arms = [i in executed_indices for i in unanchored_blocks
-                        if index < i < plan[ahead][0]]
+                arms = _stretch_arms(self, plan, step, ahead, unanchored_blocks, executed_indices,
+                                     triggers[from_nth], triggers[to_nth])
+                # A CMACC poll on the way (get_measurement after a non-blocking readout) holds
+                # the sequencer until that capture's result is in: capture end + latency.
+                marks = {address: None for address in self.control_flow.get("cmacc_polls", ())}
                 walked = _executed_path(self.control_flow, triggers[from_nth] + 1,
-                                        triggers[to_nth], executed_nths, arms)
+                                        triggers[to_nth], executed_nths, arms, backedge,
+                                        marks=marks)
                 if walked is not None:
                     issue, penalty = walked
-                    t_seq += issue + penalty
+                    reached = [mark for mark in marks.values() if mark is not None]
+                    if reached and capture_end is not None:
+                        before, before_penalty = min(reached)
+                        at_poll = t_seq + before + before_penalty
+                        ready = capture_end + MEASURED_CMACC_RESULT_LATENCY
+                        t_seq = max(at_poll, ready) + (issue - before) + (penalty - before_penalty)
+                    else:
+                        t_seq += issue + penalty
                     pending_issue = issue
 
         self.placements.append(placement)

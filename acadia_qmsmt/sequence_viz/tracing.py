@@ -93,6 +93,13 @@ DMA_STATUS_REGISTER = 1
 # firmware's fetch pipeline ever gains or loses a stage, this must follow it.
 MEASURED_BRANCH_PENALTY = 3
 
+# A CMACC result ("measurement complete") becomes visible to the sequencer this many cycles
+# after the end of its capture window. Only a NON-blocking block exposes it: there the
+# sequencer reaches get_measurement's `repeat_until(cmacc_done)` poll while the readout is still
+# playing and waits on the CMACC itself. (After a blocking block the DMA-idle wait already
+# covers it.) Measured on the loopback, see docs/EMPIRICAL_CONSTANTS.md section 3.
+MEASURED_CMACC_RESULT_LATENCY = 11
+
 # `test` condition strings come from dryrun's branch_recorder (a rendering of the Python
 # condition object), NOT from the compiled program -- so this stays a small text match.
 CONDITION_RE = re.compile(r"^(REG\d+)\s*(==|!=|<=|>=|<|>)\s*(\S+)$")
@@ -121,6 +128,9 @@ class Command:
     pulse: Optional[str] = None
     io_name: Optional[str] = None
     address: Optional[int] = None
+    # For a symbolic DMA length, the register may already hold length - 1.
+    # Constants are converted during capture; registers are converted at layout.
+    length_is_minus_one: bool = False
 
     @property
     def stop(self):
@@ -436,14 +446,17 @@ class SequenceTrace:
         contains, so cross-checks must use it rather than the unrolled view."""
         return [c for b in self.blocks for c in b.commands]
 
-    def evaluate_condition(self, condition, index=None):
+    def evaluate_condition(self, condition, index=None, assume_unknown=False):
         """Try to decide a ``test`` condition from the register values of this point.
 
         Only the simple ``REGn <op> literal`` forms are handled -- which is what
         ``reg.load(cache[k])`` followed by ``test(reg == value)`` produces, and the register
         value is known because the cache is captured per sweep point. Anything else (a
         measurement result, register arithmetic) returns None and the caller falls back to
-        ``path_choices`` or to assuming the body runs.
+        ``path_choices`` or an explicitly labelled assumed path. With
+        ``assume_unknown=True``, an unresolved scalar is provisionally zero:
+        complementary comparisons then select one possible outcome, rather
+        than executing both mutually exclusive bodies in the drawing.
 
         ``index`` (the first block of the test's body) picks the load IN FORCE there: the last
         write to the register before the first triggering block from ``index`` on. Without it,
@@ -457,7 +470,9 @@ class SequenceTrace:
         if value is None:
             value = self.register_cycles.get(name)
         if value is None:
-            return None
+            if not assume_unknown:
+                return None
+            value = 0  # drawing assumption only; never a claimed measurement result
         try:
             literal = int(literal, 0)
         except ValueError:
@@ -554,6 +569,8 @@ class SequenceTrace:
         # are compile-time immediates, so N is arithmetic.
         entering = self._entering_immediate(counter, index)
         start = entering if entering is not None else self.register_immediates.get(counter, 0)
+        if entering is not None:
+            start += self._straight_advances(counter, index)
         count = target - int(start)
         if count < 0:
             return None
@@ -599,6 +616,31 @@ class SequenceTrace:
         nth = sum(1 for block in self.blocks[:index] if block.trigger)
         return triggers[nth] if nth < len(triggers) else None
 
+    def queued_arm_bodies(self):
+        """``{block index: program address}`` for `channel_synchronizer(trigger=False)` arms in a `test`.
+
+        Such an arm pushes its commands where its test body sits, but has no trigger address.
+        Arms and trigger-less forward branches (a body containing no trigger) are paired in
+        program order -- the same pairing edge_gap's queued-arm accounting relies on. Empty when
+        the counts disagree, so callers keep their old behaviour.
+        """
+        triggers = (self.control_flow or {}).get("triggers") or []
+        branches = (self.control_flow or {}).get("branches") or []
+        arms = [i for i, block in enumerate(self.blocks)
+                if not block.trigger and block.conditional
+                and block.conditional[-1].get("kind") == "test"]
+        bodies = [b + 1 for b, t in sorted(branches)
+                  if b < t and not any(b < x < t for x in triggers)]
+        return dict(zip(arms, bodies)) if len(arms) == len(bodies) else {}
+
+    def _loop_anchor(self, index):
+        """A program address inside block ``index``'s loop body: its trigger, or for a queued
+        `test` arm its body (see queued_arm_bodies)."""
+        address = self.block_address(index) if index is not None else None
+        if address is None and index is not None:
+            address = self.queued_arm_bodies().get(index)
+        return address
+
     def pointer_cep_per_pass(self, index, counter):
         """Cache words ONE pass of the loop starting at block ``index`` walks ``counter`` over.
 
@@ -621,7 +663,7 @@ class SequenceTrace:
             behaviour, and right for every one-advance loop).
         """
         sites = (self.cep_sites or {}).get(counter)
-        address = self.block_address(index)
+        address = self._loop_anchor(index)
         if not sites or address is None:
             return 1
         spans = [(target, branch)
@@ -640,13 +682,27 @@ class SequenceTrace:
 
         The innermost back-edge enclosing the block's trigger, as in pointer_cep_per_pass.
         """
-        address = self.block_address(index) if index is not None else None
+        address = self._loop_anchor(index)
         if address is None:
             return None
         spans = [(target, branch)
                  for branch, target in ((self.control_flow or {}).get("back_branches") or ())
                  if target <= address <= branch]
         return max(spans)[0] if spans else None
+
+    def _straight_advances(self, counter, index):
+        """``pulse_cep()`` steps of ``counter`` between its last load and the loop at ``index``
+        that sit in no earlier loop: e.g. a body that PREFETCHES its first row before entering
+        the loop (the GKP FPGA loop reads words 0-5 ahead). Earlier loops are counted by
+        :meth:`_advanced`; these straight-line steps were not counted at all."""
+        head = self._loop_head(index)
+        entry = self._entering_write(counter, index)
+        sites = (self.cep_sites or {}).get(counter) or ()
+        if head is None or entry is None:
+            return 0
+        loops = (self.control_flow or {}).get("back_branches") or ()
+        return sum(1 for site in sites if entry[0] < site < head
+                   and not any(target <= site <= branch < head for branch, target in loops))
 
     def _entering_write(self, token, index):
         """``(address, immediate or None)``: the last write to ``token`` before the loop at
@@ -767,7 +823,8 @@ class SequenceTrace:
         counter, _, base, target = pair
         entry = self._entering_write(counter, index)
         words = target - (base + self._advanced(advance, counter,
-                                                None if entry is None else entry[0]))
+                                                None if entry is None else entry[0])
+                          + self._straight_advances(counter, index))
         # A count outside the cache is not a count -- it is a mis-read. Fail safe: leave the loop
         # data-dependent rather than draw a train the cache cannot hold.
         if words < 0 or (self.point_cache and words > len(self.point_cache)):
@@ -945,7 +1002,7 @@ class SequenceTrace:
                 plan.extend(self._expand_contexts(body, depth + 1, 0))
             elif context["kind"] == "test":
                 # explicit choice wins; otherwise try to decide it from the cache;
-                # otherwise assume the body runs (and say so via `assumed_paths`)
+                # otherwise use a consistent scalar assumption (labelled assumed)
                 # Ask the DATA first, always -- even when a pin is in force. Whether the board
                 # decides this arm at runtime is a property of the construct, not of what is being
                 # displayed, and it used to be lost the moment you pinned: the tab dropped its "?"
@@ -969,7 +1026,10 @@ class SequenceTrace:
                 if taken is None:
                     taken = decided
                     if taken is None:
-                        taken = True
+                        taken = self.evaluate_condition(context.get("condition"), first,
+                                                        assume_unknown=True)
+                        if taken is None:
+                            taken = True  # retain the previous fallback for compound predicates
                         self.assumed_paths.add(first)
                         self.assumed_constructs.add(self.construct_key(first, depth + 1))
                 if taken:
@@ -1174,9 +1234,9 @@ class SequenceTrace:
                     source = ("pinned" if pinned is not None
                               else "assumed" if self.construct_key(first, level) in getattr(self, "assumed_constructs", set()) else "resolved")
                     # Whether the arm RAN is read off the executed plan, not inferred from
-                    # assumed_paths. An assumed test is drawn TAKEN (the tracer's default when it
-                    # cannot decide), so "assumed" and "skipped" are not the same thing -- reading
-                    # one as the other would caption a drawn body as a skipped one.
+                    # assumed_paths. An assumed scalar comparison may take or skip its body,
+                    # so "assumed" and "skipped" are not the same thing -- reading one as the
+                    # other would caption a drawn body as a skipped one.
                     taken = (pinned if pinned is not None
                              else any(p.index == first for p in (self.placements or ())))
                     entries.append({
@@ -1937,6 +1997,7 @@ def _build_trace(runtime, raw_blocks, resolve):
                         channel=ch_name,
                         kind=KIND.get(c["command_type"], str(c["command_type"])),
                         start=0, length=length, symbolic=symbolic,
+                        length_is_minus_one=bool(c.get("length_is_minus_one", False)),
                         is_padding=id(c) not in raw["user_ids"],
                         pulse=pulse, io_name=io_name, address=address))
             block.subschedules.append(group)
@@ -1945,6 +2006,34 @@ def _build_trace(runtime, raw_blocks, resolve):
 
     _compute_config_envelopes(runtime, trace)
     return trace
+
+
+def cmacc_poll_addresses(acadia, prog=None):
+    """Program addresses of CMACC "measurement complete" polls.
+
+    acadia's ``cmacc_done`` (used by get_measurement) reads the CMACC module's status register,
+    ``module<N>_registers`` in the sequencer bus decoder (base .. base+3), inside a
+    ``repeat_until``. So: a conditional PC hold whose last BUS_ADDR is one of those registers.
+    It compiles like a DMA poll, but it waits for a measurement, not for a block's DMAs.
+    """
+    prog = decode_program(acadia) if prog is None else prog
+    decoder = acadia._firmware.sequencer_bus_decoder
+    registers = set()
+    for name in getattr(decoder, "keys", lambda: [])():
+        if re.fullmatch(r"module\d+_registers", str(name)):
+            try:
+                base = decoder[name].address().value()
+            except Exception:
+                continue
+            registers.update(range(base, base + 4))
+    polls, last_address = set(), None
+    for r in prog:
+        address = _bus_addr(r)
+        if address is not None:
+            last_address = address
+        if r.d1 == "PC" and r.conditional and r.s2 == "BUS_DATA" and last_address in registers:
+            polls.add(r.i)
+    return polls
 
 
 def sequencer_control_flow(acadia):
@@ -1956,10 +2045,11 @@ def sequencer_control_flow(acadia):
     branch and its target address are needed as well.
 
     :return: ``{"triggers": [addr], "polls": {nth trigger: addr}, "branches": [(addr, target)],
-                "back_branches": [(branch addr, target addr)]}``
+                "back_branches": [(branch addr, target addr)], "cmacc_polls": {addr}}``
     """
     prog = decode_program(acadia)
 
+    cmacc_polls = cmacc_poll_addresses(acadia, prog)
     triggers = [r.i for r in prog if _is_trigger(r)]
     polls = {}
     for nth, trigger in enumerate(triggers):
@@ -1972,8 +2062,10 @@ def sequencer_control_flow(acadia):
         # straight through; inside a loop the next executed block is the loop head, reached
         # backwards over the branch, and the address-order span overcharges by one cycle every
         # pass (batch_in_loop measured exactly 5.00 ns x (loop_count - 1)).
+        # A CMACC poll compiles to the same hold instruction but waits for a measurement,
+        # not for this block's DMAs: it is not the block's poll.
         poll = next((j for j in range(trigger + 1, limit)
-                     if _is_dma_poll(prog[j]) or _is_drain_poll(prog[j])), None)
+                     if (_is_dma_poll(prog[j]) or _is_drain_poll(prog[j])) and j not in cmacc_polls), None)
         if poll is not None:
             polls[nth] = poll
 
@@ -2003,7 +2095,7 @@ def sequencer_control_flow(acadia):
             elif r.op == "xor" and mask is not None:
                 simple_branches[r.i] = (f"REG{r.s2_minor}", r.condition_invert, mask)
     return {"triggers": triggers, "polls": polls, "branches": branches,
-            "simple_branches": simple_branches,
+            "simple_branches": simple_branches, "cmacc_polls": cmacc_polls,
             "back_branches": [(b, t) for b, t in branches if t < b]}
 
 
@@ -2040,7 +2132,8 @@ def _branch_is_taken(at, target, goal, triggers, executed, arms):
     return True
 
 
-def _executed_path(control_flow, poll, goal, executed_nths, arms=(), backedge=None, branch_values=None):
+def _executed_path(control_flow, poll, goal, executed_nths, arms=(), backedge=None, branch_values=None,
+                   marks=None):
     """Instructions FETCHED walking from ``poll`` to ``goal``, and the branch penalty paid.
 
     Counting an address range is only right while control stays in address order, and it does
@@ -2060,6 +2153,8 @@ def _executed_path(control_flow, poll, goal, executed_nths, arms=(), backedge=No
 
     Returns ``(fetched, penalty)``, or ``None`` if the walk does not reach the goal -- in which
     case the caller keeps the address-order count rather than trusting a partial walk.
+    ``marks``, if given, is a dict ``{address: None}``; the walk fills in ``(fetched, penalty)``
+    as they stood when it FIRST reached each address (e.g. a CMACC poll on the way).
     """
     triggers = control_flow["triggers"]
     branch_at = dict(control_flow["branches"])
@@ -2071,6 +2166,8 @@ def _executed_path(control_flow, poll, goal, executed_nths, arms=(), backedge=No
     before, after = branch_values or ({}, {})
     values = dict(before or after)
     for _ in range(limit):
+        if marks is not None and pc in marks and marks[pc] is None:
+            marks[pc] = (fetched, penalty)
         if backedge is not None and pc == backedge[0]:
             fetched += 1
             penalty += MEASURED_BRANCH_PENALTY
@@ -2082,6 +2179,11 @@ def _executed_path(control_flow, poll, goal, executed_nths, arms=(), backedge=No
             return fetched + 1, penalty          # the goal instruction is fetched too
         fetched += 1
         target = branch_at.get(pc)
+        if target == pc:
+            # A hold (poll) jumps to itself until its condition clears. Its WAIT is modelled
+            # by the caller (e.g. a CMACC poll via `marks`); the walk just passes it.
+            pc += 1
+            continue
         checkpoint = backedge[0] if backedge is not None else goal
         taken = None
         predicate = control_flow.get("simple_branches", {}).get(pc)
@@ -2398,9 +2500,32 @@ def pointer_register_words(trace, plan, nth_of_block, executed_nths):
             elif kind == "reg_other":
                 words.pop(f"REG{event[1]}", None)
 
+    # A `channel_synchronizer(trigger=False)` arm inside a `test` pushes its commands
+    # (copying the registers' CURRENT values into the DMA queue) where its body sits,
+    # not at the next trigger. Anchor each such arm at its body so it reads the
+    # registers at push time (see SequenceTrace.queued_arm_bodies). Without an anchor
+    # the old behaviour (state of the walk so far) is kept.
+    arm_body = trace.queued_arm_bodies()
+
     for index, _iteration, _path in plan:
         nth = nth_of_block.get(index)
         if nth is None:
+            body = arm_body.get(index)
+            if body is not None:
+                for _ in range(limit):        # walk into this arm's body, then read the registers
+                    apply(pc)
+                    if pc == body:
+                        break
+                    target = branch_at.get(pc)
+                    if target is not None and _branch_is_taken(pc, target, body, triggers, executed, []):
+                        pc = target
+                    else:
+                        pc += 1
+                else:
+                    return None
+                out.append(dict(words))
+                pc = body + 1
+                continue
             out.append(dict(words))
             continue
         goal = triggers[nth]

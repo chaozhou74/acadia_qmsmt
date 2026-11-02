@@ -1,8 +1,8 @@
 # Empirical constants in the timing model — and where to hunt for them in acadia
 
 Every number the visualizer uses is derived from the firmware config or counted out of the
-compiled program, **except** the two below. Both were measured on the 4-channel loopback and
-neither has been traced to its source in acadia yet. This file is the to-do list for that
+compiled program, **except** the three below. All three were measured on the 4-channel loopback and
+none has been traced to its source in acadia yet. This file is the to-do list for that
 hunt: what the number is, what it is not, and what evidence any candidate explanation has to
 account for.
 
@@ -71,6 +71,30 @@ sequencer gateware; if it is not 3, the explanation is wrong.
 
 **Not yet filed separately** — recorded here and in the constant's docstring; see KI_003 for
 the related boundary offset.
+
+---
+
+## 3. `MEASURED_CMACC_RESULT_LATENCY = 11` cycles (55 ns)
+
+**What.** A CMACC result ("measurement complete", polled by acadia's `cmacc_done` inside
+get_measurement) becomes visible to the sequencer 11 cycles after the end of its capture
+window. It only matters after a NON-blocking block: the sequencer then reaches the CMACC poll
+while the readout is still playing and waits on it. After a blocking block, the DMA-idle poll
+already holds the sequencer until the capture ends and this latency is hidden in the measured
+boundary terms. The poll is found from the program (`cmacc_poll_addresses`: a hold whose bus
+address is a `module<N>_registers` status register), and the layout then sets the sequencer
+clock to max(reached poll, capture end + latency) plus the counted instructions after it.
+
+**Evidence (XM650 loopback, 2026-10-31, GKP FPGA loop with prefetch, forced e).**
+- Fitted on the stabilization cycle with a 200-sample forced window: board 3090 ns.
+- Same value, no retuning: the logical-measurement cycle (different CD, same window), board
+  2450 ns, SeeQuence 2450 ns.
+- Out of sample: a 120-sample window (capture ends 400 ns earlier, same instructions): board
+  2689.1-2690.0 / 2049.7-2050.7 / 9599.6-9600.2 ns; SeeQuence 2690 / 2050 / 9600 ns.
+
+**Candidates, none confirmed.** The CMACC's accumulate-and-classify pipeline after the last
+window sample, plus the status-bit bus latency. Look for the CMACC done-flag pipeline depth in
+the gateware.
 
 ---
 
