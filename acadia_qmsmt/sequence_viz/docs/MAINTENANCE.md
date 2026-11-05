@@ -24,11 +24,11 @@ Claude, and assumes only the checks already in `validation/`.
 4. **Re-validate.** Re-run the three checks; `--revalidate` must hold all cases at ≤0.15 ns and
    `selftest.py` must be green. If the change is in the *gateware* (not the Python API) — the
    timing shifts by whole cycles on every boundary — re-measure on the loopback board
-   (`--all`, see `validation/README.md`) and update the constants in `tracing.py` and
-   `EMPIRICAL_CONSTANTS.md`.
+   (`--all`, see `validation/README.md`), find what changed in the HDL, and update the
+   constants or `gateware_timing()` in `tracing.py` and `TIMING_MODEL.md`.
 
 5. **Update the docs** the change touched: `DEVELOPER_NOTES.md` (known issues / gotchas),
-   `validation/README.md` (method + results), `EMPIRICAL_CONSTANTS.md` (the two constants).
+   `validation/README.md` (method + results), `TIMING_MODEL.md` (the timing model).
 
 ## Symptom → likely cause → where to look
 
@@ -37,7 +37,7 @@ Claude, and assumes only the checks already in `validation/`.
 | trace raises, or `selftest` reports a `compiled.log` mismatch | acadia changed the compiled-program or `compiled.log` string format | marker/regex constants at top of `tracing.py`; `CMD_RE`/`TRIGGER_RE` + word encoding in `compiled_log.py` |
 | `AttributeError` / `KeyError` during trace | a renamed private attr or `_firmware` key | `dryrun.py` (patched entry points, memory pools), `tracing.py` (`_sequencer_type`, `_firmware`, `_bus_latency`, runtime `_ios`/`_config`/`_pulse_cache`) |
 | dry run touches hardware, or a new hardware call slips through | acadia added/renamed a hardware entry point not in the no-op list | `dryrun.hardware_stubbed` patch list |
-| trace succeeds but `--revalidate` drifts by whole cycles on every boundary | gateware timing change | re-measure (`--all`); update `MEASURED_BOUNDARY_OFFSET` / `MEASURED_BRANCH_PENALTY` in `tracing.py` per `EMPIRICAL_CONSTANTS.md` |
+| trace succeeds but `--revalidate` drifts by whole cycles on every boundary | gateware or firmware-configuration timing change | re-measure (`--all`); compare the HDL against `TIMING_MODEL.md`; update the constants / `gateware_timing()` in `tracing.py` |
 | condition/loop/test mis-read | `Sequencer.{test,loop,repeat_until}` or `Operation` repr changed | `dryrun.branch_recorder`, `tracing.evaluate_condition`/`execution_plan` |
 | envelopes wrong or missing | `io.compute_pulse` / pulse-cache shape changed | `tracing._compute_config_envelopes`, `_snapshot`, `_pulse_address_map` |
 

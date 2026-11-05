@@ -18,6 +18,13 @@ stimulus0:
       ramp: 20e-9
       flat: 100e-9
       use_stretch: false
+    # counted_pair_train: same length as the real bs50_simul (ramp 20 ns + flat 495 ns)
+    bs50_like:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 495e-9
+      use_stretch: false
     # rb_stream gate set: three SHORT pulses that differ only in amplitude, so a
     # back-to-back train encodes its gate sequence as a staircase of plateau heights
     # (power ~ scale^2, i.e. 1 : 4 : 9) that stays readable even when the pulses merge.
@@ -99,11 +106,20 @@ stimulus1:
     mix_reconstruction: false
     nco_frequency: 1.0e+9
   pulses:
+    # xeb_cycle_*: the second qubit's gate (138 cycles)
+    xeb_party_like: {data: hann, scale: 0.3, ramp: 20e-9, flat: 670e-9, use_stretch: false}
     test_pulse:
       data: hann
       scale: 0.3
       ramp: 20e-9
       flat: 100e-9
+      use_stretch: false
+    # counted_pair_train: same length as the real bs50_simul (ramp 20 ns + flat 495 ns)
+    bs50_like:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 495e-9
       use_stretch: false
     # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
     # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
@@ -154,11 +170,20 @@ stimulus2:
     mix_reconstruction: false
     nco_frequency: 1.0e+9
   pulses:
+    # xeb_cycle_*: the swap around the entangling pulse (19 cycles)
+    xeb_swap_like: {data: hann, scale: 0.3, ramp: 20e-9, flat: 75e-9, use_stretch: false}
     test_pulse:
       data: hann
       scale: 0.3
       ramp: 20e-9
       flat: 100e-9
+      use_stretch: false
+    # counted_pair_train: same length as the real bs50_simul (ramp 20 ns + flat 495 ns)
+    bs50_like:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 495e-9
       use_stretch: false
     # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
     # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).
@@ -209,11 +234,20 @@ stimulus3:
     mix_reconstruction: false
     nco_frequency: 1.0e+9
   pulses:
+    # xeb_cycle_*: the entangling pulse (34 cycles)
+    xeb_berry_like: {data: hann, scale: 0.3, ramp: 20e-9, flat: 150e-9, use_stretch: false}
     test_pulse:
       data: hann
       scale: 0.3
       ramp: 20e-9
       flat: 100e-9
+      use_stretch: false
+    # counted_pair_train: same length as the real bs50_simul (ramp 20 ns + flat 495 ns)
+    bs50_like:
+      data: hann
+      scale: 0.3
+      ramp: 20e-9
+      flat: 495e-9
       use_stretch: false
     # Stretchable pulse, for validating the half/hold/half DMA geometry the visualizer
     # draws. No detune: use_stretch and detune cannot coexist (compute_pulse raises).

@@ -9,3 +9,4 @@ from .linear import Linear
 from .zero_center_gaussian import ZeroCenterGaussian
 from .driven_decoherence import DrivenDecoherence
 from .arctan import Arctan, ArctanWrapped
+from .displacement_vacuum_rabi import DisplacementVacuumRabi

@@ -12,10 +12,12 @@ A folder produced by ``Runtime.deploy`` is self-describing:
 ``compiled.log``      the sequencer program that actually ran
 ===================== ====================================================
 
-Loading is delegated to ``acadia_qmsmt.utils.saved_runtime_loader``, which is the
-same path acadia_gui's ``LivePlotWidget`` uses -- so a folder that opens in the
-GUI traces here, and vice versa.
+The class comes from ``acadia_qmsmt.utils.saved_runtime_loader``, the same path
+acadia_gui's ``LivePlotWidget`` uses -- so a folder that opens in the GUI traces
+here, and vice versa. The instance is built from ``kwargs.json`` alone, as on the
+board, without loading the recorded data.
 """
+import json
 import logging
 from pathlib import Path
 
@@ -42,7 +44,7 @@ def load_runtime(folder, use_saved_qmsmt=True, overrides=None):
         a sweep so the dry run is quick.
     :return: ``(runtime, class_name, used_saved_qmsmt)``
     """
-    from acadia_qmsmt.utils.saved_runtime_loader import load_runtime_from_data_dir
+    from acadia_qmsmt.utils.saved_runtime_loader import get_saved_runtime_class
 
     folder = Path(folder)
     if not is_data_folder(folder):
@@ -50,17 +52,28 @@ def load_runtime(folder, use_saved_qmsmt=True, overrides=None):
             f"{folder} is not a deployed data folder "
             f"(needs kwargs.json and runtime.py)")
 
+    def load(use_saved):
+        # Runtime.load without reading the recorded data, which the tracer never uses and which
+        # took seconds on a large folder
+        from acadia import DataManager
+        runtime_cls = get_saved_runtime_class(str(folder), use_saved)
+        with open(folder / "kwargs.json") as fh:
+            runtime = runtime_cls(**runtime_cls._untransform_arg(json.load(fh)))
+        runtime.data_manager = DataManager()
+        runtime.local_directory = str(folder)
+        return runtime
+
     used_saved = bool(use_saved_qmsmt)
     if used_saved:
         try:
-            runtime = load_runtime_from_data_dir(str(folder), use_saved_qmsmt=True)
+            runtime = load(True)
         except Exception as exc:
             logger.warning("Failed to load the acadia_qmsmt.py saved in %s (%s); "
                            "falling back to the installed package", folder, exc,
                            exc_info=True)
             used_saved = False
     if not used_saved:
-        runtime = load_runtime_from_data_dir(str(folder), use_saved_qmsmt=False)
+        runtime = load(False)
 
     for name, value in (overrides or {}).items():
         setattr(runtime, name, value)
