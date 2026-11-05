@@ -597,6 +597,7 @@ class InputOutput:
                    memory: Union[str, Dict, WaveformMemory] = None,
                    pulse: Union[str, Dict, NDArray, float, complex] = None,
                    zero_pad:Union[bool, Literal["pre", "post", "both"]] = False,
+                   cache: bool = True,
                    **kwargs) -> None:
         """
         Compute and load a pulse into the specified waveform memory.
@@ -610,6 +611,9 @@ class InputOutput:
             If False, a ValueError will be raised if the pulse shape is not compatible with the memory length.
             If "pre", "post", or "both", the pulse will be padded with zeros on the left, right, or both sides,
             respectively, to fit the memory length.
+        :param cache: If False, a pulse with scale/phase/detune is not stored in the pulse cache
+            (only its unscaled base is). Use it when these change continuously shot to shot,
+            e.g. a tracked phase, otherwise the cache grows without bound.
         :param kwargs: Additional keyword arguments to be passed to the pulse
             generation function. These will override values specified using a str, or Dict
         """
@@ -656,7 +660,7 @@ class InputOutput:
 
         # `compute_pulse` return samples as integer pairs that have been converted using `complex_to_samples`
         # so we can directly copy it to the memory
-        sample_data = self.compute_pulse(pulse, return_raw=True)
+        sample_data = self.compute_pulse(pulse, return_raw=True, cache=cache)
         if not zero_pad:
             samples = sample_data
         else:
@@ -675,6 +679,7 @@ class InputOutput:
     def compute_pulse(self, 
                         pulse: Union[str,dict,None] = None, 
                         return_raw = True,
+                        cache: bool = True,
                         **kwargs) -> NDArray:
         """
         This method computes a pulse waveform based on the configuration. This method 
@@ -705,6 +710,16 @@ class InputOutput:
                             "cannot advance its phase through it. A detune of 0 (or None) is "
                             "allowed, since it applies no rotation.")
         
+        if not cache and (scale is not None or phase is not None or detune is not None):
+            # The unscaled base is computed (and cached, once) through the normal path; the
+            # scaled copy is built on the fly and never stored.
+            base_config = pulse_config.copy()
+            base_config.update(scale=None, phase=None, detune=None)
+            complex_samples = InputOutputWaveforms.scale_detune_pulse(
+                self.compute_pulse(base_config, return_raw=False), scale, phase, detune,
+                self._channel.interface_sample_frequency)
+            return complex_to_sample(complex_samples) if return_raw else complex_samples
+
         if pulse_config["name"] is not None:
             # Look in the cache for the pulse
             pulse_hash = self.prepare_pulse_params(pulse_config)
@@ -1808,18 +1823,19 @@ class Qubit:
 
         ## Measure + conditional flip, until we get the target state
         # todo: try getting the number of msmts in this loop using a counter register
-        with a.sequencer().repeat_until(reg == quadrant_reg_value):
-            with a.channel_synchronizer():
-                self._stimulus.schedule_pulse(pulse_waveform_memory)
-                # self._stimulus.dwell(100e-9)
-                a.barrier()
-                measurement_resonator.measure(measurement_stimulus_waveform_memory,
-                                              measurement_capture_waveform_memory,
-                                              measurement_cmacc_window)
-            with a.channel_synchronizer():
-                self._stimulus.dwell(measurement_post_delay)
+        with a.sequencer().test(reg != quadrant_reg_value): # Check if the first measurement was |g>
+            with a.sequencer().repeat_until(reg == quadrant_reg_value):
+                with a.channel_synchronizer():
+                    self._stimulus.schedule_pulse(pulse_waveform_memory)
+                    # self._stimulus.dwell(100e-9)
+                    a.barrier()
+                    measurement_resonator.measure(measurement_stimulus_waveform_memory,
+                                                measurement_capture_waveform_memory,
+                                                measurement_cmacc_window)
+                with a.channel_synchronizer():
+                    self._stimulus.dwell(measurement_post_delay)
 
-            reg.load(measurement_resonator.get_measurement())
+                reg.load(measurement_resonator.get_measurement())
         
         return reg
     
@@ -2106,7 +2122,81 @@ class QubitQmCooler:
                 self.beamsplitter.schedule_pulse(bs_pulse_name)
             self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
                                ro_pulse_name, ro_capture_mem, ro_cmacc_window, measurement_post_delay, reg)
-            
+
+        return reg
+
+
+class QubitQmLadderCooler(QubitQmCooler):
+    """
+    Cools a QM holding many photons by walking down the Jaynes-Cummings ladder: the qubit-QM swap
+    tuned to |n,g> <-> |n-1,e> for n = ladder_top ... 1, each followed by a measure-and-reset of the
+    qubit, then `extra_rounds` more swaps at the n = 1 time. A full swap on rung n takes
+    t_n = t_1 / sqrt(n) on the effective time (flat + ramp/2). The swap plays from a use_stretch copy
+    whose stretch length is read from a cache, so the program size does not depend on ladder_top.
+
+    Host side: `setup()` before compile, `load()` after the board is loaded. `cool()` goes in the sequence.
+    """
+
+    def __init__(self, qubit: Qubit, readout: MeasurableResonator, beamsplitting: InputOutput,
+                 swap_pulse_name: str = "swap", ladder_top: int = 1, extra_rounds: int = 0):
+        super().__init__(qubit, readout, beamsplitting)
+        if ladder_top < 0 or extra_rounds < 0 or ladder_top + extra_rounds < 1:
+            raise ValueError(f"need ladder_top >= 0, extra_rounds >= 0 and at least one round, got {ladder_top}, {extra_rounds}")
+        self.swap_pulse_name = swap_pulse_name
+        self.ladder_top = int(ladder_top)
+        self.extra_rounds = int(extra_rounds)
+
+    def setup(self):
+        a = self.beamsplitter._acadia
+        cfg = self.beamsplitter.get_pulse_config(self.swap_pulse_name)
+        if cfg.get("detune"):
+            raise ValueError(f"'{self.swap_pulse_name}' has a detune; use_stretch pulses cannot (move it to the NCO)")
+        ramp, flat = float(cfg.get("ramp") or 0.0), float(cfg["flat"])
+        clk = 1 / a.sequencer_clock_frequency()
+        n = np.arange(self.ladder_top, 0, -1)
+        flats = np.concatenate([(flat + ramp / 2) / np.sqrt(n) - ramp / 2, np.full(self.extra_rounds, flat)])
+        # the use_stretch memory holds one flat cycle; the register adds the rest. A 0-cycle stretch wraps, so floor at 1
+        self.stretch_cycles = np.maximum(np.round(flats / clk).astype(int) - 1, 1)
+        self.flat_times = (self.stretch_cycles + 1) * clk
+        self.stretch_pulse = self.beamsplitter.duplicate_pulse(self.swap_pulse_name, f"{self.swap_pulse_name}_ladder",
+                                                               use_stretch=True)
+        self.cache = a.CacheArray(shape=(len(self.stretch_cycles),), dtype=np.dtype("<i4"))
+
+    def load(self):
+        self.beamsplitter.load_pulse(self.stretch_pulse)
+        # the cache is an mmap of /dev/mem: write element by element (a slice copy can SIGBUS)
+        for i, c in enumerate(self.stretch_cycles):
+            self.cache[i] = int(c)
+
+    def cool(self,
+             state_quadrant: Literal[1,2,3,4] = 1,
+             qubit_pulse_name: str = None,
+             ro_pulse_name: str = None,
+             ro_capture_mem: str = None,
+             ro_cmacc_window: str = None,
+             measurement_post_delay: float = 100e-9,
+             state_register = None) -> None:
+        a = self.qubit._stimulus._acadia
+
+        reg = a.sequencer().Register() if state_register is None else state_register
+        pointer, length, end = a.sequencer().DSP(), a.sequencer().Register(), a.sequencer().Register()
+
+        self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
+                           ro_pulse_name, ro_capture_mem, ro_cmacc_window, measurement_post_delay, reg)
+
+        base = a._firmware.sequencer_bus_decoder["cache"].address().value() + self.cache.index
+        pointer.load(base)
+        pointer.configure(mode="P+1", dsp_cep="reset")
+        end.load(base + len(self.stretch_cycles))
+
+        with a.sequencer().repeat_until(pointer == end):
+            length.load(a.sequencer().bus_read(pointer, latency=a._bus_latency("cache")))
+            with a.channel_synchronizer():
+                self.beamsplitter.schedule_pulse(self.stretch_pulse, stretch_length=length)
+            self.qubit.prepare(state_quadrant, self.readout, qubit_pulse_name,
+                               ro_pulse_name, ro_capture_mem, ro_cmacc_window, measurement_post_delay, reg)
+            pointer.pulse_cep()
+
         return reg
 
 

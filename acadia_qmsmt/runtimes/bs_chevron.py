@@ -235,7 +235,7 @@ class BSChevronRuntime(QMsmtRuntime):
 
     
     @annotate_method(button_name="coarse_swap_and_bs50_update")
-    def update_coarse_swap_time(self, pulses:list[str]=("swap", "swap_stretchable", "bs50")):
+    def update_coarse_swap_time(self, pulses:list[str]=("swap", "bs_50_50")):
         # Find the center frequency from the FFT data, use that for frequency
         if (self.best_swap_freq is not None) and (self.best_swap_time is not None):
             # update NCO first
@@ -257,11 +257,11 @@ class BSChevronRuntime(QMsmtRuntime):
             available = self._ios["bs_stimulus"].get_config("pulses")
             for pulse in pulses:
                 if pulse in available:
-                    if pulse != "bs50":
+                    if pulse not in ("bs_50_50", "bs50"):
                         swap_config["use_stretch"] = available[pulse].get("use_stretch", False)
                         self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}", swap_config)
                     else:
                         bs50_config["use_stretch"] = available[pulse].get("use_stretch", False)
-                        self.update_io_yaml_field("bs_stimulus", f"pulses.bs50", bs50_config)
+                        self.update_io_yaml_field("bs_stimulus", f"pulses.{pulse}", bs50_config)
                 else:
                     logger.warning(f"Pulse {pulse} not found in bs_stimulus, not updated")
