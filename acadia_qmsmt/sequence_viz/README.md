@@ -531,6 +531,11 @@ amplitude fidelity for shape legibility.
 `trace.envelope(io_name, pulse, source)` gives the samples directly; the memory
 source falls back to the config when a pulse was never loaded.
 
+A memory counts as loaded if the run called `load_pulse` on it **or** it holds nonzero
+samples at any captured point (2026-11-05). Runtimes that switch points by `np.copyto` of
+precomputed raw samples (no `load_pulse`) therefore show their zero-scale settings, e.g. the
+g preparation of CD tomography, as zeros rather than as the nominal config pulse.
+
 A solid background marks the scheduled memory duration, including memories containing
 only zeros. Such a memory has no nonzero envelope to draw. If repeated shots keep showing
 an identity pair, select a later trace point as explained above.
@@ -638,3 +643,20 @@ The 83-case timing dry run passes. Local RB and XEB archive samples retain their
 baseline trains; the XEB capture intentionally repeats identical circuits and
 retains the same baseline identical-train diagnostic. The current GKP loopback
 report records actual emitted complex I/Q for the new cache-driven sequences.
+
+### Explicit DMA-running waits after non-blocking triggers (2026-11-05)
+
+`sequencer_control_flow` now decodes DMA-running poll addresses and their
+channel masks. The non-blocking layout applies those waits, and any later
+CMACC waits, in executed instruction order. Waiting only for the integration
+result had drawn the next counting measurement 80 ns early when its readout
+tone outlasted its integration window. The decoder uses the configured bus
+address, channel mask, channel cursors and existing timing terms; no runtime
+or pulse names are recognized. `qmsmt.py` is unchanged.
+
+`validation/explicit_dma_wait.py` checks two channel assignments, two pulse
+length differences (200/600 ns), two masks and three loop passes (24 marker
+pulses). The timing dry-run matrix passes 83/83 cases. The first two-cavity
+loopback recording changes from 160 ns error per two-readout round to at most
+0.50 ns across 20 emitted pulses. Further measurements and paths live in
+`msmt_workbench/rfsoc/msmt/loopback_measurements/quantum_simulation/README.md`.

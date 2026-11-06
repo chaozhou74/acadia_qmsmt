@@ -761,3 +761,14 @@ including packed DMA identities and dwell lengths. `conditional_register_dma.py`
 also places its conditional immediate stores inside an enclosing PC branch.
 These prevent a reused register's last source or an outer case from hiding the
 actual pulse that a block plays.
+
+## Explicit DMA wait masks — 2026-11-05
+
+`python validation/explicit_dma_wait.py` checks a non-blocking two-channel
+block followed by a DMA-running poll outside the synchronizer. A third channel
+marks the release. Waiting for the long versus short channel changes its first
+start by exactly 200 or 600 ns, on two channel assignments; all three loop
+passes must remain visible (24 marker pulses total). The viewer must decode
+both the bus address and mask, and must keep any later CMACC wait separate.
+The corresponding real counting recording had an 80 ns/readout model error
+before this fix and <=0.50 ns interval error afterwards.

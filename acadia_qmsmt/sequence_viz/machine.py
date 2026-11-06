@@ -1096,20 +1096,40 @@ def machine_layout(trace):
                                      triggers[from_nth], triggers[to_nth])
                 # A CMACC poll on the way (get_measurement after a non-blocking readout) holds
                 # the sequencer until that capture's result is in: capture end + latency.
+                dma_polls = self.control_flow.get("dma_polls", {})
                 marks = {address: None for address in self.control_flow.get("cmacc_polls", ())}
+                marks.update({address: None for address in dma_polls})
                 walked = _executed_path(self.control_flow, triggers[from_nth] + 1,
                                         triggers[to_nth], executed_nths, arms, backedge,
                                         marks=marks)
                 if walked is not None:
                     issue, penalty = walked
-                    reached = [mark for mark in marks.values() if mark is not None]
-                    if reached and capture_end is not None:
-                        before, before_penalty = min(reached)
-                        at_poll = t_seq + before + before_penalty
-                        ready = capture_end + MEASURED_CMACC_RESULT_LATENCY
-                        t_seq = max(at_poll, ready) + (issue - before) + (penalty - before_penalty)
-                    else:
-                        t_seq += issue + penalty
+                    # Apply waits in executed order. A DMA-running hold can wait
+                    # for a readout tone longer than its integration window; the
+                    # later CMACC-done poll alone therefore understates the gap.
+                    extra_wait = 0
+                    waited_for_dma = False
+                    reached = sorted((mark, address) for address, mark in marks.items()
+                                     if mark is not None)
+                    for (before, before_penalty), address in reached:
+                        at_poll = t_seq + before + before_penalty + extra_wait
+                        if address in dma_polls:
+                            mask = dma_polls[address]
+                            ends = [end for channel, end in cursor.items()
+                                    if mask & (1 << (int(str(channel)[3:]) +
+                                        (16 if str(channel).startswith("ADC") else 0)))]
+                            ready = max(ends, default=at_poll)
+                            if ready > at_poll:
+                                ready += self.gap_terms.get("detect", 3) + DMA_STATUS_REGISTER
+                                waited_for_dma = True
+                        elif capture_end is not None:
+                            ready = capture_end + MEASURED_CMACC_RESULT_LATENCY
+                        else:
+                            continue
+                        extra_wait += max(ready - at_poll, 0)
+                    t_seq += issue + penalty + extra_wait
+                    if waited_for_dma:
+                        t_seq += self.gap_terms.get("propagate", 2)
                     pending_issue = issue
 
         self.placements.append(placement)

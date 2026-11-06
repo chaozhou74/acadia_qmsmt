@@ -1549,6 +1549,15 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                 "channel_synchronizer, or it stopped earlier than expected")
 
         trace = _build_trace(runtime, raw_blocks, resolve_indeterminate)
+        # A memory the run writes directly -- np.copyto of precomputed raw samples, the fast
+        # path runtimes use instead of load_pulse between points -- is invisible to the
+        # load_pulse spy. If it holds nonzero samples at ANY captured point, the run wrote it,
+        # so its zeros at another point are real zeros (e.g. the zero-scale g preparation),
+        # not "never loaded". Memories that stay zero everywhere still fall back to the config.
+        for snapshot in snapshots:
+            for key, array in snapshot["memories"].items():
+                if array.any():
+                    loaded_pulses.add(key)
         trace.loaded_pulses = loaded_pulses
         trace.register_overrides = dict(resolve_registers or {})
         trace.register_names = dict(register_names or {})
@@ -2036,6 +2045,30 @@ def cmacc_poll_addresses(acadia, prog=None):
     return polls
 
 
+def dma_poll_addresses(acadia, prog=None):
+    """DMA-running holds and their channel masks, including waits outside synchronizers.
+
+    A non-blocking block can prefetch cache words, then explicitly wait on a
+    subset of its DMAs. Decode the bus address and mask; a CMACC-done hold or a
+    FIFO-drain hold must not be mistaken for this wait.
+    """
+    prog = decode_program(acadia) if prog is None else prog
+    running = acadia._firmware.sequencer_bus_decoder["dma_running"].address().value()
+    polls, last_address, mask = {}, None, None
+    for instruction in prog:
+        address = _bus_addr(instruction)
+        if address is not None:
+            last_address = address
+        for destination, source, immediate in (
+                (instruction.d1, instruction.s1, instruction.imm1),
+                (instruction.d2, instruction.s2, instruction.imm2)):
+            if destination == "MASK":
+                mask = _resolve_imm(immediate) if source == "IMM" else None
+        if _is_dma_poll(instruction) and last_address == running and mask is not None:
+            polls[instruction.i] = mask
+    return polls
+
+
 def sequencer_control_flow(acadia):
     """Trigger/poll addresses and branches, for costing an executed edge.
 
@@ -2096,6 +2129,7 @@ def sequencer_control_flow(acadia):
                 simple_branches[r.i] = (f"REG{r.s2_minor}", r.condition_invert, mask)
     return {"triggers": triggers, "polls": polls, "branches": branches,
             "simple_branches": simple_branches, "cmacc_polls": cmacc_polls,
+            "dma_polls": dma_poll_addresses(acadia, prog),
             "back_branches": [(b, t) for b, t in branches if t < b]}
 
 
