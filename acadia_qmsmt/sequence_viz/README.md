@@ -318,7 +318,7 @@ amplitude fidelity for shape legibility.
 | option | values | meaning |
 |---|---|---|
 | `envelope_source` | **`memory`**, `config` | `memory` reads the DAC waveform memory, i.e. the samples actually loaded at this sweep point — swept scale, detune and phase included. `config` recomputes from the yaml, which ignores anything `load_pulse` overrode (the nominal pulse) |
-| `envelope_scale` | **`per-pulse`**, `channel`, `shared`, `absolute` | `per-pulse` normalises each pulse to its own peak, so every bar is full height and **amplitude is not readable**. The others divide by the loudest pulse on that DAC / anywhere / DAC full scale, making heights comparable |
+| `envelope_scale` | **`per-pulse`**, `channel`, `shared`, `absolute` | `per-pulse` normalises each pulse to its own peak, so every bar is full height and **amplitude is not readable**. The others divide by the loudest pulse on that DAC over all captured sweep points / anywhere over all captured sweep points / DAC full scale, making heights comparable |
 | `envelope_mode` | **`magnitude`**, `iq` | `magnitude` draws `\|s\|`, which hides detune, phase and the DRAG quadrature entirely — a −131 MHz detuned pulse looks flat-topped. `iq` draws I and Q about the lane centre and shows all three |
 
 `trace.envelope(io_name, pulse, source)` gives the samples directly; the memory

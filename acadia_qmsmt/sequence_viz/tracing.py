@@ -438,6 +438,7 @@ class SequenceTrace:
     used_saved_qmsmt: bool = None    # None for a live runtime
 
     snapshots: list = field(default_factory=list)   # one per acadia.run()
+    _point_peaks: Optional[dict] = field(default=None, repr=False)  # see peak_over_points
     placements: list = field(default_factory=list)   # what executes, loops unrolled
     control_flow: dict = field(default_factory=dict)
     loop_counts: dict = field(default_factory=dict)  # block index (or (block, depth)) -> iterations to draw
@@ -1243,6 +1244,26 @@ class SequenceTrace:
             if samples is not None and len(samples):
                 return samples
         return self.envelopes.get((io_name, pulse))
+
+    def peak_over_points(self, io_name, pulse, source="memory"):
+        """Largest ``|envelope|`` of a pulse across every captured sweep point, in DAC
+        full-scale units. Falls back to the current point when there are no snapshots."""
+        if source != "memory" or not self.snapshots:
+            samples = self.envelope(io_name, pulse, source)
+            return float(np.abs(samples).max()) if samples is not None and len(samples) else 0.0
+        if self._point_peaks is None:
+            peaks = {}
+            for snapshot in self.snapshots:
+                for key, array in snapshot["memories"].items():
+                    if len(array):
+                        peak = float(np.hypot(array[:, 0].astype(np.float64),
+                                              array[:, 1].astype(np.float64)).max())
+                        peaks[key] = max(peaks.get(key, 0.0), peak / INT16_FULL_SCALE)
+            self._point_peaks = peaks
+        if (io_name, pulse) in self._point_peaks:
+            return self._point_peaks[(io_name, pulse)]
+        samples = self.envelopes.get((io_name, pulse))
+        return float(np.abs(samples).max()) if samples is not None and len(samples) else 0.0
 
     @property
     def dead_time_ns(self):

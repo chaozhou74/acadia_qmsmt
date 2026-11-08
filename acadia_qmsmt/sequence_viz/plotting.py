@@ -381,9 +381,9 @@ def _reference_peaks(trace, envelope_scale, envelope_source):
     """Peak each envelope is divided by, per ``(io_name, pulse)``.
 
     ``per-pulse`` fills every bar (best for reading shape, tells you nothing about
-    amplitude). ``channel`` normalises to the loudest pulse on that DAC, ``shared``
-    to the loudest anywhere, ``absolute`` to DAC full scale -- those three make bar
-    heights comparable.
+    amplitude). ``channel`` normalises to the loudest pulse on that DAC, ``shared`` to
+    the loudest anywhere -- both over every captured sweep point, so heights stay
+    comparable as you step -- and ``absolute`` to DAC full scale.
     """
     keys = {(c.io_name, c.pulse) for c in trace.commands if c.pulse}
     peaks, by_channel = {}, {}
@@ -393,7 +393,8 @@ def _reference_peaks(trace, envelope_scale, envelope_source):
         peak = float(np.abs(samples).max()) if samples is not None and len(samples) else 0.0
         peaks[key] = peak
         channel = channel_of.get(key)
-        by_channel[channel] = max(by_channel.get(channel, 0.0), peak)
+        sweep_peak = trace.peak_over_points(key[0], key[1], envelope_source)
+        by_channel[channel] = max(by_channel.get(channel, 0.0), sweep_peak)
 
     if envelope_scale == "per-pulse":
         return {k: v for k, v in peaks.items()}
@@ -402,7 +403,7 @@ def _reference_peaks(trace, envelope_scale, envelope_source):
     if envelope_scale == "channel":
         return {k: by_channel.get(channel_of.get(k), 0.0) for k in peaks}
     if envelope_scale == "shared":
-        overall = max(peaks.values(), default=0.0)
+        overall = max(by_channel.values(), default=0.0)
         return {k: overall for k in peaks}
     raise ValueError(f"unknown envelope_scale: {envelope_scale!r}")
 
