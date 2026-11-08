@@ -4,6 +4,8 @@ import pickle
 import logging
 import warnings
 
+from types import SimpleNamespace
+
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
@@ -206,3 +208,68 @@ if __name__ == "__main__":
     # button_ax2, button2 = add_button(fig, label="Click Me", event=func)
 
     plt.show()
+
+
+NO_QUADRATURE = "No quadrature data, set quadrature ramsey flag to true"
+
+
+def signed_ramsey(t, cos_shots, sin_shots, amp_cut=0.15):
+    """Signed (quadrature) Ramsey: the final pi/2 is played at an extra phase 0 and pi/2 for every delay.
+
+    The unwrapped atan2 of the two fringes is linear in the delay with slope 2 pi f_s, so f_s keeps its sign
+    (an ExpCosine fit only gives |f|). Frequencies come out in the inverse unit of `t`.
+
+    Sign of f_s relative to the frame, with r the rate (Hz) in the final pi/2's phase ramp exp(1j 2 pi r t)
+    (r = +vd for exp(+1j...), -vd for exp(-1j...)):
+        plain Ramsey            offset = r + f_s          (acadia_qmsmt qubit_t2: detuning = vd + f_delta)
+        echoed (pump, pi, free) offset = -(r + f_s)       (the pi conjugates the phase picked up under the pump)
+    Reliable for >= 1.5 fringes in the window and |f_s| dt <= 0.4 (synthetic test, 2026-11-05).
+
+    cos_shots / sin_shots: (iterations, delays) shots at extra phase 0 / pi/2. Returns None if the fits fail.
+    """
+    from acadia_qmsmt.analysis.fitting import ExpCosine, Linear
+
+    t = np.asarray(t, dtype=float)
+    n = min(len(cos_shots), len(sin_shots))
+    if n < 2:
+        return None
+    cos_shots, sin_shots = np.asarray(cos_shots[:n], float), np.asarray(sin_shots[:n], float)
+    floor = 0.5 / n
+    c_avg, s_avg = cos_shots.mean(0), sin_shots.mean(0)
+    c_sig = np.maximum(cos_shots.std(0) / np.sqrt(n), floor)
+    s_sig = np.maximum(sin_shots.std(0) / np.sqrt(n), floor)
+    try:
+        fit_cos = ExpCosine(t, c_avg, sigma=c_sig)
+        fit_sin = ExpCosine(t, s_avg, sigma=s_sig)
+        offset = np.mean([fit_cos.ufloat_results["of"].n, fit_sin.ufloat_results["of"].n])
+    except Exception:
+        return None
+    if not np.isfinite(offset):
+        return None
+
+    c, s = c_avg - offset, s_avg - offset
+    amp_sq = np.maximum(c**2 + s**2, 1e-12)
+    sigma_phase = np.minimum(np.sqrt((c * s_sig)**2 + (s * c_sig)**2) / amp_sq, np.pi)
+    amp = np.sqrt(amp_sq)
+    amp_sig = np.sqrt((c * c_sig)**2 + (s * s_sig)**2) / amp
+    order = np.argsort(t)
+    keep = order[amp[order] > np.maximum(3 * amp_sig[order], amp_cut * amp.max())]
+    if np.any(np.diff(keep) != 1):
+        keep = keep[:max(np.argmax(np.diff(keep) != 1) + 1, 3)]
+    if len(keep) < 3:
+        return None
+    phase = np.unwrap(np.arctan2(s, c)[keep])
+    try:
+        fit = Linear(t[keep], phase, sigma=sigma_phase[keep], error_model="wls")
+    except Exception:
+        return None
+    f = fit.ufloat_results["m"] / (2 * np.pi)
+    window, dt = np.ptp(t[keep]), np.min(np.diff(np.sort(t)))
+    if abs(f.n) * window < 1.5 or abs(f.n) * dt > 0.4:
+        import logging
+        logging.getLogger("acadia").warning(
+            f"Signed Ramsey f_s = {f:.4g}: {abs(f.n) * window:.2g} fringes in the fitted window, |f| dt = {abs(f.n) * dt:.2g}. "
+            f"Reliable for >= 1.5 fringes and |f| dt <= 0.4: change the virtual detuning or the delay step.")
+    return SimpleNamespace(t=t, cos_avg=c_avg, cos_sig=c_sig, sin_avg=s_avg, sin_sig=s_sig,
+                           fit_cos=fit_cos, fit_sin=fit_sin, offset=offset,
+                           times=t[keep], phase=phase, phase_sigma=sigma_phase[keep], fit=fit, f=f)

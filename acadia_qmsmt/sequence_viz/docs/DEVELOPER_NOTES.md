@@ -2,18 +2,13 @@
 
 Maintenance notes for `sequence_viz`: known issues, gotchas, and open items. For
 usage see `README.md`; for the timing model and its hardware validation see
-`../validation/README.md` and `EMPIRICAL_CONSTANTS.md`.
+`../validation/README.md` and `TIMING_MODEL.md`.
 
 ## Known issues
 
 - **KI_001** — the last channel in the ADC trigger loop arrives ~36 ns early. Workaround is
   a sacrificial dummy capture channel, which the loopback test config enables.
 - **KI_002** — barrier `max()` bug; **fixed** in acadia.
-- **KI_003** — every blocking boundary costs +1 cycle beyond `detect + issue + propagate`,
-  carried as `MEASURED_BOUNDARY_OFFSET = 1` in `tracing.py`. Best-guess source (not yet
-  confirmed in gateware): the DMA-poll/hold takes one registered cycle to *act* on the
-  de-asserted `dma_running` it read, beyond the cycles `_bus_latency` counts to get the value
-  into `BUS_DATA`. See `EMPIRICAL_CONSTANTS.md`.
 - **KI_004** — `test(..., speculation=False)`: the taken arm mistimes by ~25 ns and the
   skipped arm **hangs the sequencer** (`TimeoutError` in `DataManager.sync`, no `t_data`;
   the board recovers on the next deploy). Root cause found by reading the compiled program:
@@ -22,11 +17,6 @@ usage see `README.md`; for the timing model and its hardware validation see
   return stack and jumps to garbage. Wants a fix in acadia (`compiler.block_end` return
   placement), not a workaround here. The tracer flags such blocks in `unsupported_paths`;
   `speculation=True` (the default) is validated on both arms.
-
-Plus `MEASURED_BRANCH_PENALTY = 3` cycles on any taken branch (loop back-edge or skipped
-`test`) — fitted on loop back-edges, then it predicted the forward `test` skip gap (95 ns)
-with no retuning. Best guess: a fixed pipeline-flush depth in the sequencer core, in gateware
-(the instruction-memory pipeline knobs are 0, so it is not memory latency).
 
 ## Instrument safety — do not weaken this
 
@@ -61,6 +51,21 @@ Two bugs the sweep found, now fixed:
 
 ## Gotchas
 
+- **Never compare two `conditional` context dicts with plain `==`.** Since 2026-09-25
+  each carries the raw condition `Operation`/`Register` tree (`condition_obj`, next to
+  the already-rendered `condition` text) so `evaluate_condition` can substitute this
+  point's register values into it. `Operation`/`Register` overload comparison
+  operators to build ANOTHER symbolic `Operation` rather than a bool, so `dict.__eq__`
+  -- which compares values with `==` -- raises `TypeError: __bool__ should return
+  bool, returned Operation` the moment it reaches that key, which it will as soon as
+  two *different* `test()`/`repeat_until()` calls happen to render identical text
+  (the same register reloaded and re-tested every pass of a Python loop, e.g. the
+  `flag != 0` idiom of a round loop). Use `tracing._same_context`
+  (a single context) or `tracing._same_conditional` (a whole `conditional` tuple) --
+  both compare `condition_obj` by identity instead, which is also the semantically
+  right test (every block compiled inside one `with test(...):` shares the exact same
+  `condition_obj` reference; a different call gets a fresh one even with identical
+  text). `execution_plan`/`_plan_level` and `plotting.branch_regions` both need this.
 - **A runtime object can only be traced once** (`Processor data is non-empty`). `trace_folder`
   builds a fresh one each call; `already_traced()` gives the explanatory error.
 - **Tracing must not mutate the runtime.** `duplicate_pulse` appends to `io._config["pulses"]`,
@@ -74,11 +79,8 @@ Two bugs the sweep found, now fixed:
 
 ## Open items
 
-1. Trace `MEASURED_BOUNDARY_OFFSET` (KI_003) and `MEASURED_BRANCH_PENALTY` to their source in
-   the acadia gateware. `EMPIRICAL_CONSTANTS.md` is the brief; `--revalidate` holding all
-   cases at ≤0.15 ns is the acceptance test for any candidate explanation.
-2. KI_004 wants a fix in acadia (`compiler.block_end` return placement), not a workaround here.
-3. `repeat_until` has no hardware validation and cannot have one; if a way to bound the trip
+1. KI_004 wants a fix in acadia (`compiler.block_end` return placement), not a workaround here.
+2. `repeat_until` has no hardware validation and cannot have one; if a way to bound the trip
    count from archived data turns up, that changes.
-4. The Qt wrapper now lives in acadia_gui (`gui/sequence_view.py`); finish wiring it into the
+3. The Qt wrapper now lives in acadia_gui (`gui/sequence_view.py`); finish wiring it into the
    data browser (a toggle between the live plot view and the sequence view).

@@ -354,3 +354,43 @@ def add_complex_2d_colorbar(plot_ax=None, cmap_2d=None, n_phase=256, n_amp=256,
     plot_ax.set_xticklabels([r"$0$", r"$\pi$", r"$2\pi$"])
 
     return fig, plot_ax
+
+
+def plot_quadratures(ax, series, t_scale=1.0):
+    """series: list of (label, color, result). Phase-0 fringe as circles, pi/2 fringe as squares."""
+    if not any(r is not None for _, _, r in series):
+        no_quadrature(ax)
+        return
+    for label, color, r in series:
+        if r is None:
+            continue
+        x = r.t * t_scale
+        xf = np.linspace(x.min(), x.max(), 5 * len(x))
+        ax.errorbar(x, r.cos_avg, yerr=r.cos_sig, fmt="o", ms=3, color=color, alpha=0.7)
+        ax.errorbar(x, r.sin_avg, yerr=r.sin_sig, fmt="s", ms=3, color=color, alpha=0.35)
+        ax.plot(xf, r.fit_cos.eval(xf / t_scale), color=color, label=f"{label}, phase 0")
+        ax.plot(xf, r.fit_sin.eval(xf / t_scale), "--", color=color, label=f"{label}, phase pi/2")
+    ax.set_ylabel("Population")
+    ax.legend(fontsize=7)
+    ax.grid(True)
+
+
+def plot_phase_fits(ax, series, unit="MHz", t_scale=1.0):
+    """series: list of (label, color, result). Unwrapped phase and its linear fit."""
+    if not any(r is not None for _, _, r in series):
+        no_quadrature(ax)
+        return
+    for label, color, r in series:
+        if r is None:
+            continue
+        x = r.times * t_scale
+        ax.errorbar(x, r.phase, yerr=r.phase_sigma, fmt="o", ms=3, color=color)
+        ax.plot(x, r.fit.eval(r.times), color=color, label=f"{label}: f_s = {r.f:.5g} {unit}")
+    ax.set_ylabel("unwrapped atan2 phase (rad)")
+    ax.legend(fontsize=7)
+    ax.grid(True)
+
+
+def no_quadrature(ax):
+    from acadia_qmsmt.plotting.utils import NO_QUADRATURE
+    ax.text(0.5, 0.5, NO_QUADRATURE, ha="center", va="center", transform=ax.transAxes)

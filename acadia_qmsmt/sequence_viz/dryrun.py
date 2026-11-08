@@ -125,11 +125,15 @@ OPERATOR_SYMBOLS = {
 }
 
 
-def _describe_condition(value, limit=56):
-    """Render a sequencer condition readably.
+def describe_operation(value, limit=56):
+    """Render a compiled condition or length expression readably.
 
     ``Operation.__str__`` gives ``Operation(<built-in function eq>, (REG0, 0), {})``;
-    this turns nested operations back into ``REG0 == 0``.
+    this turns nested operations back into ``REG0 == 0`` (or ``max(131, 122, 103)``
+    for a non-comparison op such as a barrier-padding length). Used both for
+    ``test``/``repeat_until`` conditions (see :func:`branch_recorder`) and, in
+    ``tracing.py``, for a command length that could not be folded to a concrete
+    number (see :func:`~.tracing._operation_value`).
     """
     from acadia.compiler import Operation
 
@@ -149,8 +153,19 @@ def _describe_condition(value, limit=56):
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+# attributes a bus-read Source carries: its address, and the pointer counters at the read
+# (see branch_recorder and tracing._register_spy)
+BUS_ADDRESS_ATTR = "_sv_bus_address"
+BUS_STATE_ATTR = "_sv_bus_state"
+
+
+def counters(register_exprs):
+    """The compile-order DSP counters in a register-load map (its tuple keys)."""
+    return {k: v for k, v in (register_exprs or {}).items() if isinstance(k, tuple)}
+
+
 @contextmanager
-def branch_recorder(stack):
+def branch_recorder(stack, register_exprs=None):
     """Track which control-flow blocks the sequence is inside while it compiles.
 
     ``test``, ``repeat_until`` and ``loop`` are ``@contextmanager`` generators, so
@@ -162,6 +177,13 @@ def branch_recorder(stack):
     ``True`` the body is inline and the branch jumps past it when the condition
     fails; with ``False`` the body is out-of-line and the taken path costs two
     extra instructions. Execution order is then not address order.
+
+    ``register_exprs`` is the LIVE register-load map from
+    ``tracing._register_spy``. Each context takes a snapshot of it on entry, because
+    a scratch register is reloaded with a different expression before each use
+    (``flag`` carries a different round's mask at every pass of a round loop) -- so
+    only the value it held right
+    *here* says what this particular ``test`` gates on.
     """
     from acadia.sequencer import Sequencer
 
@@ -173,22 +195,33 @@ def branch_recorder(stack):
 
         @contextmanager
         def wrapped(self, *args, **kwargs):
-            stack.append(describe(args, kwargs))
+            context = describe(args, kwargs)
+            context["register_exprs"] = dict(register_exprs or {})
+            # the pointer counters at the body's end, so the plan knows what one pass steps;
+            # filled on exit into this same dict object, which every block's copy shares
+            context["exit_counters"] = {}
+            stack.append(context)
             try:
                 with original(self, *args, **kwargs) as value:
                     yield value
             finally:
+                context["exit_counters"].update(counters(register_exprs))
                 stack.pop()
 
         setattr(Sequencer, name, wrapped)
 
     wrap("test", lambda a, k: {
         "kind": "test",
-        "condition": _describe_condition(a[0] if a else k.get("condition")),
+        "condition": describe_operation(a[0] if a else k.get("condition")),
+        # the raw Operation/Register tree, kept alongside the rendered text so
+        # SequenceTrace.evaluate_condition can substitute this point's register
+        # values into it rather than re-parsing the text (see tracing.py)
+        "condition_obj": a[0] if a else k.get("condition"),
         "speculation": k.get("speculation", a[2] if len(a) > 2 else True)})
     wrap("repeat_until", lambda a, k: {
         "kind": "repeat_until",
-        "condition": _describe_condition(a[0] if a else k.get("condition")),
+        "condition": describe_operation(a[0] if a else k.get("condition")),
+        "condition_obj": a[0] if a else k.get("condition"),
         "speculation": None})
     def loop_count(args):
         """Iterations, using the same signatures as ``range`` (see Sequencer.loop)."""
@@ -204,9 +237,25 @@ def branch_recorder(stack):
         "condition": f"range{a}" if a else "forever",
         "count": loop_count(a),
         "speculation": None})
+    # tag each bus read with its address (a literal, or the DSP walking the cache), so
+    # a register loaded from one can be resolved from this point's cache
+    original_bus_read = Sequencer.bus_read
+
+    def bus_read(self, address=None, *args, **kwargs):
+        source = original_bus_read(self, address, *args, **kwargs)
+        if address is not None:
+            try:
+                setattr(source, BUS_ADDRESS_ATTR, address)
+                setattr(source, BUS_STATE_ATTR, counters(register_exprs))
+            except Exception:
+                pass
+        return source
+
+    Sequencer.bus_read = bus_read
     try:
         yield
     finally:
+        Sequencer.bus_read = original_bus_read
         for name, original in originals.items():
             setattr(Sequencer, name, original)
 

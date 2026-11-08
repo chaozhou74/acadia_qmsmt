@@ -46,6 +46,7 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          "barrier_single_channel", "rb_stream", "rb_stream_uniform", "batch_resync",
          "simulbus_transition", "batch_two_channels", "batch_uneven", "batch_interleaved",
          "loop_batch", "stream_then_batch", "batch_concurrent_blocking",
+         "counted_pair_train", "xeb_cycle_cz", "xeb_cycle_ref",
          # KI_002 cases: these could not compile before the 2026-07-27 acadia pull
          "barrier_uneven_pulses", "barrier_uneven_2ch", "barrier_uneven")
 
@@ -53,6 +54,13 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
 # rb-pulse allocation, and the cache fill. rb_stream_uniform is rb_stream with uniform-amplitude
 # final gates (clean timing of the back-to-back block; see README on the edge-detection artifact).
 STREAM_CASES = ("rb_stream", "rb_stream_uniform", "stream_then_batch")
+
+# A streamed two-qubit gate cycle (cross-entropy benchmarking): one register-fired gate per
+# line from its own cache pointer, two guarded loops (with and without the entangling block)
+# sharing the pointer, a fifo_almost_empty poll on the first gate line only. ch0 / ch1 = the
+# two qubits' gates, ch2 = two swaps, ch3 = the entangling pulse between them; 103 / 138 /
+# 19 / 34 cycles.
+XEB_CASES = ("xeb_cycle_cz", "xeb_cycle_ref")
 
 
 class LoopbackTimingCaseRuntime(QMsmtRuntime):
@@ -100,6 +108,21 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                                       # for the pulse-length sweep that maps the ~110 ns floor
     batch_resync_pulses: int = 8      # batch_resync: how many pulses the block=False batches play
                                       # before the dwell(pulse_length) + barrier + readout re-sync
+    train_pairs: int = 5              # counted_pair_train: cache[0], the runtime-variable number
+                                      # of two-channel pulse pairs the DSP/Register loop plays
+    train_pairs_list: tuple = None    # counted_pair_train: when set, the cache cycles through
+                                      # this list across acadia.run() calls within ONE deployment
+                                      # (a runtime sweeping the count through the cache);
+                                      # analysis slices records[k::len(list)] per count
+    tomo_phase_deg: float = None      # counted_pair_train: when set, the stimulus1 "tomo" pulse
+                                      # is a duplicate loaded with scale*exp(1j*deg2rad(phase)),
+                                      # as a runtime loads a tomography pulse
+    even_phase_deg: float = None      # counted_pair_train: phase loaded onto the 2nd pulse of
+                                      # each swap unit on BOTH channels (a pair-coherence
+                                      # phase correction); None -> 0
+    xeb_depth: int = 4                # xeb_cycle_*: cycles per shot (the cache's stop mark)
+    xeb_phases: tuple = (0, 180)      # xeb_cycle_*: the two gate copies' phases [deg], alternated; 90 reads
+                                      # ~1.2 ns early on DAC0 (I/Q edge systematic), 180 does not
     capture_length_override: float = None  # seconds; lengthen the ADC window past the yaml
     capture_start_delay: float = 0.0  # seconds; dwell the ADC before it triggers, so the
                                       # dead lead-in is skipped and more pulses fit the frame.
@@ -156,6 +179,17 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         # rather than only against the cache itself.
         cache = self.acadia.CacheArray(shape=(1,), dtype=np.dtype("<i4"))
 
+        # counted_pair_train: optional distinct "tomo" pulse on stimulus1, so its complex
+        # scale (phase) can be loaded independently of the train pulses, and the "even"
+        # (2nd-of-unit) duplicates on both channels for the pair-coherence phase. All
+        # duplicated BEFORE compile: a copy made later has no waveform memory.
+        tomo_pulse_c1 = even_pulse_c0 = even_pulse_c1 = None
+        if self.case == "counted_pair_train":
+            if self.tomo_phase_deg is not None:
+                tomo_pulse_c1 = stimuli[1].duplicate_pulse(self.stimulus_pulse_name)
+            even_pulse_c0 = stimuli[0].duplicate_pulse(self.stimulus_pulse_name)
+            even_pulse_c1 = stimuli[1].duplicate_pulse(self.stimulus_pulse_name)
+
         # rb_stream: the randomized-benchmarking idiom. A DSP holds a bus POINTER into a
         # command cache and walks it, issuing each cached word straight to the DMA, until
         # it reaches a final pointer held in a register. The pulse COUNT lives in
@@ -166,6 +200,19 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             rb_cmd_cache = self.acadia.CacheArray(shape=int(rb_count),
                                                   dtype=np.dtype("<i4"))
             rb_num_cache = self.acadia.CacheArray(shape=1, dtype=np.dtype("<i4"))
+
+        # xeb_cycle_*: two phase copies of each gate, fired from the cache (made before compile)
+        xeb_gates = xeb_caches = xeb_stop = None
+        if self.case in XEB_CASES:
+            xeb_gates = []
+            for stim, base in ((stimuli[0], "bs50_like"), (stimuli[1], "xeb_party_like")):
+                scale = stim.get_config("pulses", base, "scale")
+                xeb_gates.append([stim.duplicate_pulse(base, f"xeb_{base}_{deg}", create_memory=True,
+                                                       scale=scale * np.exp(1j * np.radians(deg)))
+                                  for deg in dict.fromkeys(self.xeb_phases)])
+            xeb_caches = [self.acadia.CacheArray(shape=(int(self.xeb_depth),), dtype=np.dtype("<i4"))
+                          for _ in range(2)]
+            xeb_stop = self.acadia.CacheArray(shape=(2,), dtype=np.dtype("<i4"))
 
         for label in self._labels:
             self.data.add_group(f"trace_{label}", uniform=True)
@@ -573,6 +620,119 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                 with a.channel_synchronizer():
                     idle.schedule_pulse(pulse)         # ch2 discriminator
 
+            elif self.case == "counted_pair_train":
+                # A variable-count two-channel pulse train. A DSP pair-counter runs
+                # against a Register target loaded from the cache (cache[0] =
+                # train_pairs), but the body pushes ONE schedule_pulse per channel on TWO channels
+                # (block=False) instead of a bus_read/schedule_direct stream. Each
+                # iteration first waits for ch1's fifo to EMPTY (the queued command was
+                # pulled while its pulse still plays), so the train should be gapless
+                # for pulses longer than the loop's refill floor. After the loop:
+                # fifo-empty drain, the "tomo" pair on both channels (SAME channels as
+                # the train, so it queues serially behind the still-playing tail and
+                # needs no dwell), then a "swap" stand-in on ch2 in its OWN block --
+                # the block boundary polls the bus DMAs to completion, so the swap
+                # starts only after the tomo ends. Measured: putting the
+                # swap in the SAME block behind dwell+barriers fires it ~80 ns after
+                # the tomo STARTS, because after a block=False train the batched
+                # channels are desynced by their still-playing tail while an idle
+                # channel executes its barrier padding from trigger time (the
+                # simulbus_transition phenomenon). ch2 also carries a t0 reference
+                # marker, so its within-channel interval measures the whole train
+                # span and must move by exactly (pulse period) x (pairs delta)
+                # between deploys with different train_pairs.
+                c0, c1, idle = stimuli[0], stimuli[1], stimuli[2]
+                with a.channel_synchronizer():
+                    idle.schedule_pulse(pulse)         # ch2 reference marker (t0)
+                counter = a.sequencer().DSP()
+                counter.load(0)
+                counter.configure(mode="P+1", dsp_cep="reset")
+                target = a.sequencer().Register()
+                target.load(cache[0])
+                # a preparation pair, first into the empty FIFOs (cache[0] = N swap
+                # units, each unit = base pair + phase-corrected "even" pair)
+                with a.channel_synchronizer(block=False):
+                    c0.schedule_pulse(pulse)
+                    c1.schedule_pulse(pulse)
+                with a.sequencer().test(counter != target):
+                    with a.sequencer().repeat_until(counter == target):
+                        with a.sequencer().repeat_until(
+                                a.channel_is_fifo_empty(c1.channel)):
+                            pass
+                        with a.channel_synchronizer(block=False):
+                            c0.schedule_pulse(pulse)
+                            c1.schedule_pulse(pulse)
+                            c0.schedule_pulse(even_pulse_c0)
+                            c1.schedule_pulse(even_pulse_c1)
+                        counter.configure(mode="P+1", dsp_cep="pulse")
+                with a.sequencer().repeat_until(a.channel_is_fifo_empty(c1.channel)):
+                    pass
+                with a.channel_synchronizer():
+                    c0.schedule_pulse(pulse)           # the "tomo" pair: queues behind the tail
+                    c1.schedule_pulse(tomo_pulse_c1 if tomo_pulse_c1 is not None else pulse)
+                with a.channel_synchronizer():
+                    idle.schedule_pulse(pulse)         # ch2: the "swap" stand-in
+
+            elif self.case in XEB_CASES:
+                # the cycle loop of such a runtime, with loopback markers in place of the
+                # state preparation and the readout
+                lines = stimuli
+                one_cycle = 1.0 / a.sequencer_clock_frequency()
+                t_d, t_p, t_swap, t_berry = 515e-9, 690e-9, 95e-9, 170e-9
+                t_layer, t_cz = max(t_d, t_p), 2 * t_swap + t_berry
+                with a.channel_synchronizer():
+                    for stim in lines:
+                        stim.schedule_pulse(pulse)                 # t0 marker
+                pointers = [a.sequencer().DSP(), a.sequencer().DSP()]
+                commands = [a.sequencer().Register(), a.sequencer().Register()]
+                stop_mark = a.sequencer().Register()
+                base = a._firmware.sequencer_bus_decoder["cache"].address().value()
+                for pointer, cache_k in zip(pointers, xeb_caches):
+                    pointer.load(base + cache_k.index)
+                    pointer.configure(mode="P+1", dsp_cep="reset")
+
+                def hold(stim, seconds):
+                    if seconds > one_cycle / 2:
+                        stim.dwell(seconds)
+
+                def cycle(with_cz):
+                    with a.sequencer().repeat_until(a.channel_is_fifo_almost_empty(lines[0].channel)):
+                        pass
+                    for command, pointer in zip(commands, pointers):
+                        command.load(a.sequencer().bus_read(pointer, latency=a._bus_latency("cache")))
+                    t_after = t_cz if with_cz else 0.0
+                    with a.channel_synchronizer(block=False):
+                        for stim, command, t_gate in ((lines[0], commands[0], t_d),
+                                                      (lines[1], commands[1], t_p)):
+                            hold(stim, t_layer - t_gate)
+                            a.schedule_direct(stim.channel, command)
+                            hold(stim, t_after)
+                        if with_cz:
+                            hold(lines[2], t_layer)
+                            lines[2].schedule_pulse("xeb_swap_like")
+                            hold(lines[2], t_berry)
+                            lines[2].schedule_pulse("xeb_swap_like")
+                            hold(lines[3], t_layer + t_swap)
+                            lines[3].schedule_pulse("xeb_berry_like")
+                            hold(lines[3], t_swap)
+                    for pointer in pointers:
+                        pointer.pulse_cep()
+
+                for k, with_cz in enumerate((True, False)):
+                    stop_mark.load(base + xeb_caches[0].index + xeb_stop[k])
+                    with a.sequencer().test(pointers[0] != stop_mark):
+                        with a.sequencer().repeat_until(pointers[0] == stop_mark):
+                            cycle(with_cz)
+                for stim in lines:
+                    with a.sequencer().repeat_until(a.channel_is_fifo_almost_empty(stim.channel)):
+                        pass
+                with a.channel_synchronizer():
+                    for stim in lines:
+                        stim.dwell(one_cycle)
+                with a.channel_synchronizer():
+                    for stim in lines:
+                        stim.schedule_pulse(pulse)                 # end marker
+
             elif self.case == "barrier_single_channel":
                 # The barrier pattern real runtimes actually use: exactly ONE channel
                 # is active before the barrier, so acadia takes its single-element
@@ -679,8 +839,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                          + ([self.rb_loop_gate] if self.rb_loop_gate else [])
                          + ([self.rb_final_gate] if self.rb_final_gate else []))))
 
+        xeb_pulses = {2: ["xeb_swap_like"], 3: ["xeb_berry_like"]} if self.case in XEB_CASES else {}
+
         def names_for(index):
-            return pulses_used + (rb_pulses if index == 0 else [])
+            return pulses_used + (rb_pulses if index == 0 else []) + xeb_pulses.get(index, [])
 
         for i, stim in enumerate(stimuli):
             for name in names_for(i):
@@ -696,8 +858,34 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
             for name in names_for(i):
                 stim.load_pulse(name)
 
+        if tomo_pulse_c1 is not None:
+            base_scale = stimuli[1].get_config("pulses", self.stimulus_pulse_name, "scale")
+            stimuli[1].load_pulse(tomo_pulse_c1,
+                                  scale=base_scale * np.exp(1j * np.deg2rad(self.tomo_phase_deg)))
+        if even_pulse_c0 is not None:
+            even_phase = np.deg2rad(self.even_phase_deg or 0.0)
+            for stim, even_pulse in ((stimuli[0], even_pulse_c0), (stimuli[1], even_pulse_c1)):
+                base_scale = stim.get_config("pulses", self.stimulus_pulse_name, "scale")
+                stim.load_pulse(even_pulse, scale=base_scale * np.exp(1j * even_phase))
+
+        if xeb_gates is not None:
+            # a fixed string per line (alternating phases), so the shot repeats exactly
+            for stim, gates in zip(stimuli, xeb_gates):
+                for name in gates:
+                    stim.load_pulse(name)
+            words = [[int(np.array(self.acadia.waveform_dma_command(stim.get_waveform_memory(n)),
+                                   dtype=np.uint32).view(np.int32)) for n in gates]
+                     for stim, gates in zip(stimuli, xeb_gates)]
+            for k in range(int(self.xeb_depth)):
+                xeb_caches[0][k] = words[0][k % len(words[0])]
+                xeb_caches[1][k] = words[1][(k + 1) % len(words[1])]
+            xeb_stop[0] = int(self.xeb_depth) if self.case == "xeb_cycle_cz" else 0
+            xeb_stop[1] = int(self.xeb_depth)
+
         if self.case == "register_dwell":
             cache[0] = self.acadia.seconds_to_cycles(self.register_dwell)
+        elif self.case == "counted_pair_train":
+            cache[0] = int(self.train_pairs)
         elif self.case.startswith("test_"):
             cache[0] = int(self.test_register_value)
         elif self.case in STREAM_CASES:
@@ -715,6 +903,10 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
         t_data = None
         configure_streams = True
         for i in range(self.iterations):
+            # counted_pair_train count sweep: update the cache between run() calls within
+            # one deployment, as a runtime sweeping the count does
+            if self.case == "counted_pair_train" and self.train_pairs_list:
+                cache[0] = int(self.train_pairs_list[i % len(self.train_pairs_list)])
             self.acadia.run(minimum_delay=self.run_delay, configure_streams=configure_streams)
             configure_streams = False
 

@@ -43,6 +43,20 @@ REPORT = Path(__file__).parent / "timing_validation_results.json"
 
 CHANNEL_OF = {"ch0": "DAC0", "ch1": "DAC2", "ch2": "DAC4", "ch3": "DAC6"}
 
+# Which regions of a capture are pulses.
+# A channel the case never drives is IDLE: its peak is noise, so every threshold relative to its
+# own maximum would pass noise as pulses. Driven loopback channels peak at 4e3-6e4 counts, idle
+# ones below 1 -- both guards sit orders of magnitude from either.
+SILENT_CHANNEL_SIGMAS = 30.0       # driven: peak this many baseline sigmas above the baseline
+IDLE_CHANNEL_FRACTION = 1e-3       # driven: peak at least this fraction of the loudest channel's
+# A region counts as a pulse at >= this fraction of its channel's maximum. 0.05 admitted CROSSTALK
+# from a neighbouring cable (~7 %); archived region peaks fall below 15 % (all crosstalk) or above
+# 25 % (all pulses), nothing between.
+REGION_FLOOR_FRACTION = 0.20
+# Pulses this many cycles apart or less come back as ONE region (a 1-cycle dwell between a
+# stretched swap and its readout does), so the prediction merges them the same way.
+RESOLVED_GAP_CYCLES = 2
+
 # Cases whose measured error is a known MEASUREMENT systematic, not a model error.
 KNOWN_SYSTEMATIC = {
     "stretch_two_blocks":
@@ -66,13 +80,12 @@ KNOWN_SYSTEMATIC = {
         "same slow-ramp edge limit as phase_pair, plus SSB imbalance ripple that differs "
         "between the 10 MHz and 25 MHz pulses and perturbs the plateau peak the half level "
         "is taken from. Timing conclusions rest on the fast-ramp cases.",
-    "rb_stream":
-        "the final '8 basic gates' block plays lo/mid/hi amplitudes back-to-back, merging into "
-        "one region; the 50%-of-region-peak rising edge then latches onto the first HIGH gate, "
-        "reading the block ~70 ns (2 gates) late. Measurement systematic, not a model error -- "
-        "the region START matches the tracer to ~5 ns. The amplitude variation is for gate "
-        "IDENTITY; for timing of that block, set rb_final_gate to one shape (rb_stream_uniform / "
-        "rb_final_gate='rb_gate_hi' validates to ~0-5 ns). The stream unroll itself is exact.",
+    "counted_pair_train":
+        "the train count is data-dependent (cache word drives a DSP/Register repeat_until), "
+        "so the tracer draws ONE loop pass while hardware plays train_pairs pairs -- pulse "
+        "counts read as DROPPED by design. Measured: the count follows the cache exactly "
+        "(5 vs 8 pairs), train+tomo gapless to 0.4 ns, own-block 'swap' fires ~55 ns after "
+        "the tomo ends.",
 }
 
 
@@ -98,6 +111,11 @@ def pulse_regions_ns(runtime, label, threshold_sigmas=10.0):
     noise = float(band.std()) if band.size > 1 else float(y.std())
     if noise == 0.0:                                        # degenerate flat trace
         noise = 1.0
+    loudest = max((float(np.asarray(v).max()) for v in runtime.avg_trace_pwr.values()),
+                  default=0.0)
+    if (y.max() < level + SILENT_CHANNEL_SIGMAS * noise
+            or (loudest > 0 and y.max() < IDLE_CHANNEL_FRACTION * loudest)):
+        return []                                           # an idle channel: noise only
     above = np.where(y > level + threshold_sigmas * noise)[0]
     if not len(above):
         return []
@@ -110,10 +128,22 @@ def pulse_regions_ns(runtime, label, threshold_sigmas=10.0):
 
     # A baseline-sigma threshold alone lets single-sample noise through: on a quiet
     # channel it flagged a 1-sample "pulse" at peak 0.77 against a real peak of 4.8e4.
-    # Require a real pulse to be at least 2 samples wide and 5% of the channel maximum.
-    floor = 0.05 * y.max()
+    # Require a real pulse to be at least 2 samples wide and above the crosstalk floor.
+    floor = REGION_FLOOR_FRACTION * y.max()
     return [(float(t[a]), float(t[b]), float(y[a:b + 1].max()))
             for a, b in regions if b > a and y[a:b + 1].max() >= floor]
+
+
+def _first_peak(y, a, b, peak):
+    """Level of the FIRST pulse in region y[a:b], for its half-level edge: abutting pulses of
+    different amplitude merge into one region, and the region's overall peak then puts the
+    edge on the first LOUD pulse (rb_stream read 2 gates late). The first local maximum held
+    for two samples above the floor is the first pulse's plateau; a single pulse's is its peak."""
+    floor = REGION_FLOOR_FRACTION * peak
+    for i in range(max(a, 1), min(b, len(y) - 2)):
+        if y[i] > floor and y[i] >= y[i - 1] and y[i] > y[i + 1] and y[i] > y[i + 2]:
+            return float(y[i])
+    return float(peak)
 
 
 def pulse_edges_ns(runtime, label, threshold_sigmas=10.0):
@@ -129,7 +159,7 @@ def pulse_edges_ns(runtime, label, threshold_sigmas=10.0):
         b = int(np.searchsorted(t, stop_ns))
         if b <= a:
             continue
-        half = peak / 2.0
+        half = _first_peak(y, a, b, peak) / 2.0
         rising = np.where(y[max(a - 4, 1):b + 1] > half)[0]
         if not len(rising):
             continue
@@ -150,8 +180,10 @@ def measure(folder):
     # load_runtime_from_data_dir call.
     runtime = load_runtime_from_data_dir(str(folder))
     runtime.process_current_data()
-    return {label: pulse_edges_ns(runtime, label) for label in
-            ("ch0", "ch1", "ch2", "ch3")}
+    # a case may capture only some channels
+    return {label: (pulse_edges_ns(runtime, label)
+                    if label in getattr(runtime, "avg_trace_pwr", {}) else [])
+            for label in ("ch0", "ch1", "ch2", "ch3")}
 
 
 # ---------------------------------------------------------------- prediction
@@ -171,15 +203,24 @@ def predict(folder):
     starts = {}
     for label, channel in CHANNEL_OF.items():
         pulses = sorted((c for c in trace.commands
-                         if c.pulse and c.channel == channel),
+                         # a stretched pulse continues in unnamed CONST_CONT / ARB_CONT commands
+                         if c.channel == channel
+                         and (c.pulse or c.kind in ("CONST_CONT", "ARB_CONT"))),
                         key=lambda c: c.start)
         merged = []
         for command in pulses:
-            if merged and command.start <= merged[-1][1]:
+            # pulses closer than the capture resolves (5 ns samples, ramped edges) are one region
+            if merged and command.start <= merged[-1][1] + RESOLVED_GAP_CYCLES:
                 merged[-1][1] = max(merged[-1][1], command.stop)
             else:
                 merged.append([command.start, command.stop])
         starts[label] = [region[0] * trace.ns_per_cycle for region in merged]
+    # A test decided by a live measurement (a feedback reset) is drawn on one assumed arm. If the
+    # board took the other, every later block slides by the skipped duration, on every channel,
+    # so pulses at or after the first assumed block test the assumption, not the model.
+    cutoff = min((pl.start for pl in (trace.placements or [])
+                  if pl.index in trace.assumed_paths), default=None)
+    trace.scoring_cutoff_ns = None if cutoff is None else cutoff * trace.ns_per_cycle
     return starts, trace
 
 
@@ -197,6 +238,11 @@ def compare(folder, verbose=True):
         m_int = [x - m[0] for x in m[1:]] if len(m) > 1 else []
         p_int = [x - p[0] for x in p[1:]] if len(p) > 1 else []
         n = min(len(m_int), len(p_int))
+        cutoff = trace.scoring_cutoff_ns
+        unscored = 0
+        if cutoff is not None:      # only intervals whose pulse precedes the first assumed block
+            scored = sum(1 for x in p[1:n + 1] if x < cutoff)
+            unscored, n = n - scored, scored
         errors = [m_int[i] - p_int[i] for i in range(n)]
         if errors:
             worst = max(worst, max(abs(e) for e in errors))
@@ -212,7 +258,10 @@ def compare(folder, verbose=True):
                      "count_ok": len(m) == len(p),
                      # only where the tracer drew SOME pulses: a channel it (correctly) left
                      # empty can still pick up a stray noise region, which is not a drop
-                     "dropped": (max(0, len(m) - len(p)) if len(p) > 0 else 0),
+                     "dropped": (max(0, len(m) - len(p))
+                                 if len(p) > 0 and cutoff is None else 0),
+                     # after a measurement-fed branch the trace shows one assumed arm
+                     "unscored_after_assumed_branch": unscored,
                      "span_measured_ns": round(span_m, 1),
                      "span_predicted_ns": round(span_p, 1),
                      "span_error_ns": round(abs(span_m - span_p), 1),
@@ -276,7 +325,9 @@ def compare(folder, verbose=True):
                   f"  measured {row['measured_intervals_ns']}"
                   f"  predicted {row['predicted_intervals_ns']}"
                   f"  error {row['error_ns']} ns "
-                  f"({row['error_cycles']} cyc){flag}")
+                  f"({row['error_cycles']} cyc){flag}"
+                  + (f"  ({row['unscored_after_assumed_branch']} after an assumed branch, "
+                     f"not scored)" if row["unscored_after_assumed_branch"] else ""))
         print(f"    worst error: {result['worst_error_ns']} ns "
               f"= {result['worst_error_cycles']} cycles")
         if "stream_ok" in result:
@@ -287,6 +338,11 @@ def compare(folder, verbose=True):
 
 
 # ---------------------------------------------------------------- running
+
+# per-case runtime parameters beyond the shared ones below
+CASE_KWARGS = {"xeb_cycle_cz": {"capture_length_override": 6.5e-6},
+               "xeb_cycle_ref": {"capture_length_override": 6.5e-6}}
+
 
 def build_runtime(case, iterations=5000, dwell_length=200e-9):
     from loopback_timing_cases import (
@@ -305,6 +361,7 @@ def build_runtime(case, iterations=5000, dwell_length=200e-9):
         # condition true and 1 forces it false
         test_register_value=0 if "true" in case else 1,
         yaml_path=YAML_PATH,
+        **CASE_KWARGS.get(case, {}),
     )
 
 

@@ -38,8 +38,8 @@ from a gitignored `paths.local.yaml`:
   `Sequencer.{test,loop,repeat_until,bus_read}` wraps, `_compiled_program`, `_firmware`,
   `_bus_latency`, the `fake_attach` memory pools, and runtime privates (`_ios`, `_config`,
   `_pulse_cache`, `io.channel`).
-- **Gateware constants**: `MEASURED_BOUNDARY_OFFSET`, `MEASURED_BRANCH_PENALTY` in `tracing.py`
-  (see `../docs/EMPIRICAL_CONSTANTS.md`).
+- **Gateware timing**: `TAKEN_BRANCH_CYCLES`, `HOLD_EXIT_CYCLES`, `DMA_START` and
+  `gateware_timing()` in `tracing.py` (see `../docs/TIMING_MODEL.md`).
 
 Only a thin public-API layer (`Acadia.compile`, `io.compute_pulse`, `saved_runtime_loader`, …)
 is stable. Everything else above is what these checks defend.
@@ -84,15 +84,10 @@ segmentation and would trade a well-understood artifact for a subtler one; not w
 
 ## Timing (straight-line + barriers)
 
-The model was initially one cycle short at every blocking boundary. Varying the DMA push count
-in the second block was the discriminator — `issue` scales with pushes (+5 ns each, exactly as
-counted), the residual stayed at +1.00 cycle regardless — proving the instruction counting is
-correct and the shortfall is a fixed per-boundary constant. It compounds linearly
-(`four_blocks` across 3 boundaries ≤0.14 ns) and is absent intra-block (back-to-back pulses,
-`dwell`, `block=False` batching all exact). Carried as `MEASURED_BOUNDARY_OFFSET` (KI_003)
-rather than folded into a derived term, since timing alone cannot say which term owns it; fitted
-on one case, it then predicted `two_blocks_3ch`, `four_blocks`, `barrier_uneven` with no
-retuning.
+Varying the DMA push count in the second block checks the instruction counting: `issue`
+scales with pushes (+5 ns each, exactly as counted), while the fixed part of the boundary stays
+at 6 cycles. It compounds linearly (`four_blocks` across 3 boundaries ≤0.14 ns) and intra-block
+layout (back-to-back pulses, `dwell`, `block=False` batching) is exact.
 
 Register-driven dwell (the T1/T2 shape) checked against a measured interval: predicted 420.0,
 measured ≤0.04 ns. A `use_stretch` pulse is three DMA commands (first half / park / second half)
@@ -148,19 +143,18 @@ skipped `test` bodies dropped). `execution_plan()` → `relayout()` builds place
 own command copies, so changing a loop count or branch choice is a re-layout, not a re-trace.
 
 Gaps on executed edges are counted from the compiled program along the path actually taken (for
-a loop, backwards through the branch). A **taken branch costs 3 cycles beyond the count**
-(`MEASURED_BRANCH_PENALTY`), established by the same discrimination trick — a 4-push body
-measured 20 cycles vs 11 counted, an 8-push body 21 vs 12, and `loop_3`'s intervals are exactly
-linear (220/440 ns), so the cost is per edge. The strongest single result is `test_false`: the
-skipped-body gap `detect 3 + issue 10 + propagate 2 + boundary 1 + branch 3 = 19 cyc = 95 ns`
-was **predicted**, not fitted.
+a loop, backwards through the branch). A **taken branch costs 3 cycles beyond the count**, the
+sequencer's fetch restart: a 4-push loop body measures 20 cycles vs 11 counted, an 8-push body
+21 vs 12, and `loop_3`'s intervals are exactly linear (220/440 ns), so the cost is per edge. The
+forward branch of `test_false` gives `issue 10 + fixed 6 + branch 3 = 19 cyc = 95 ns`, as
+measured.
 
 | claim | result |
 |---|---|
 | loop unrolled to executed timeline | ✅ ≤0.09 ns (`loop_2/3/2_double`) |
 | loop back-edge gap | ✅ derived from the compiled program |
 | `test` taken / skipped (`speculation=True`) | ✅ 0.04 / 0.10 ns (skip **predicted**) |
-| taken-branch cost | ⚠️ 3 cycles, empirical — see `../docs/EMPIRICAL_CONSTANTS.md` |
+| taken-branch cost | ✅ 3 cycles, the sequencer's fetch restart (`../docs/TIMING_MODEL.md`) |
 | `test(speculation=False)` | ❌ unsupported (KI_004); one arm hangs the board |
 | `repeat_until` | ➖ data-dependent count; one pass drawn and labelled as such |
 
@@ -168,4 +162,4 @@ was **predicted**, not fitted.
 `test_true_nospec` mistimes 25 ns and `test_false_nospec` hangs the sequencer (do not redeploy).
 Both are marked UNSUPPORTED; the renderer captions them "TIMING NOT MODELLED (see KI_004)".
 `speculation=True` (the default) is correct on both arms. See `../docs/DEVELOPER_NOTES.md` for
-the KI_004 root cause and open items, and `../docs/EMPIRICAL_CONSTANTS.md` for the two constants.
+the KI_004 root cause and open items, and `../docs/TIMING_MODEL.md` for the timing model.

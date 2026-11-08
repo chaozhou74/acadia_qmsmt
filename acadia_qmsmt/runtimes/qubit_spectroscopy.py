@@ -89,7 +89,7 @@ class QubitSpectroscopyRuntime(QMsmtRuntime):
 
 
     @annotate_method(is_data_processor=True)
-    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]=None):
+    def process_current_data(self, readout_classifier: Annotated[str, "IOConfig", "readout_capture.classifiers"]="rotated_iq"):
         """
         Process the currently acquired readout data.
 
