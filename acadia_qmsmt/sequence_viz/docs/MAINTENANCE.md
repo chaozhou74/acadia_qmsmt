@@ -1,5 +1,45 @@
 # Updating the visualizer when acadia / qmsmt change
 
+## THE RULE: SeeQuence never hardcodes
+
+**SeeQuence is a decompiler, not a recogniser.** Every number it draws must be *derived* from
+the compiled program and the captured cache. A pulse name, channel index, DAC number, runtime
+class, address, length or step count written into `sequence_viz` source is a bug **even when the
+picture looks right** — it makes the viewer agree with the one run you tested and silently lie
+about every other.
+
+```python
+# WRONG -- the viewer now only works for this one experiment
+if command.pulse == 'Q1C1_swap_count_stretch':
+    length = 154
+if dac == 10:
+    length = cache[637]
+
+# RIGHT -- read it out of the program/cache, keyed on KIND and on what the data says
+word = _pointer_length(trace, placement, command, seen)
+if command.kind in ('CONST_CONT', 'ARB_CONT'):
+    length = int(word)                      # a bare hold length
+else:                                       # a packed waveform_dma_command
+    length = (int(word) & 0xFFFF) + 1
+    pulse  = (trace.addr_names or {}).get((dac, int(word) >> 16))
+```
+
+The **only** literals allowed are protocol facts that come from acadia itself and hold for every
+program: the DMA packing `(address << 16) | (length - 1)` (hence `>> 16` and `& 0xFFFF`),
+acadia's own command-kind names (`ARB`, `ARB_CONT`, `CONST_CONT`, `DWELL`), and `ns_per_cycle`.
+The two genuinely *measured* constants are the documented exception and live in one place with
+their provenance: [`EMPIRICAL_CONSTANTS.md`](EMPIRICAL_CONSTANTS.md).
+
+Why it is stated this strongly: a hardcoded value does not fail loudly. It produces a picture
+that is right for the run you tested and wrong for the next one — and SeeQuence is the tool
+people use to decide whether a sequence is correct. A viewer that can be wrong silently is worse
+than no viewer at all.
+
+**How to test for it:** trace at least two runs with *different* configs — different pulse names,
+ladder depth, step counts, channels — and check both. If a change only helps one of them, it is
+recognition, not decoding, and it does not belong in `sequence_viz`.
+
+
 `sequence_viz` decompiles acadia's own compiled program, so it is coupled to acadia/acadia_qmsmt
 internals with no stability guarantee (full surface in `validation/README.md`). When those
 packages change, follow this workflow — it is the intended recipe for a maintainer, human or
@@ -40,6 +80,7 @@ Claude, and assumes only the checks already in `validation/`.
 | trace succeeds but `--revalidate` drifts by whole cycles on every boundary | gateware timing change | re-measure (`--all`); update `MEASURED_BOUNDARY_OFFSET` / `MEASURED_BRANCH_PENALTY` in `tracing.py` per `EMPIRICAL_CONSTANTS.md` |
 | condition/loop/test mis-read | `Sequencer.{test,loop,repeat_until}` or `Operation` repr changed | `dryrun.branch_recorder`, `tracing.evaluate_condition`/`execution_plan` |
 | envelopes wrong or missing | `io.compute_pulse` / pulse-cache shape changed | `tracing._compute_config_envelopes`, `_snapshot`, `_pulse_address_map` |
+| a filled pulse bar has no envelope at some points | the memory may contain zeros, and repeated shots may keep the same identity sequence | inspect `trace.envelope` and select a later point with `trace.select_point`; each `acadia.run()` is a point |
 
 ## What each check can and cannot see
 
@@ -47,3 +88,10 @@ Claude, and assumes only the checks already in `validation/`.
 `--revalidate` proves the *timing model* still matches previously-measured hardware. Neither can
 catch a gateware change that alters real timing — only a fresh board measurement (`--all`) can,
 which is why the loopback harness is kept rather than replaced by the offline checks alone.
+
+2026-10-24: Added compiled immediate/conditional register-store DMA decoding.
+The motivating measurement is the fixed-time zero/active idle-pi GKP reset;
+the implementation uses no pulse/channel/runtime recognition. The dedicated
+validator and 83 timing dry-run cases pass. Local archived RB/XEB samples were
+compared with the unmodified baseline. One forced XEB extra-loop pin already
+invents a gate in the baseline and remains an open independent issue.
