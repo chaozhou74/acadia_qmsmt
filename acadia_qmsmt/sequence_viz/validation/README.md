@@ -116,6 +116,10 @@ hold against the installed acadia/acadia_qmsmt. Current state, 2026-08-14:
                             run is diffed case-by-case against the last known-good, not just by
                             its headline
     render_validation.py    69 / 69 cases; no drawing disagrees with its trace
+                            (2026-11-18, emulator engine default: 82 / 82 cases + all 11 selftest
+                            folders after the checker learned live spans of zero-padded pulses;
+                            three_deep_nest and stretch_zero are skipped by name)
+    --dryrun all            (2026-11-18) 83 / 83 traced OK; three_deep_nest skipped by name
     gui_validation.py       3 / 3 folders, 0 problems (23 flow-rows, 39 hovers)
     sweep-point axis        124 (folder, point) combinations over 24 experiment types, 16 of them
                             with a length that genuinely varies (DualRail_RB: 78 us -> 319 us).

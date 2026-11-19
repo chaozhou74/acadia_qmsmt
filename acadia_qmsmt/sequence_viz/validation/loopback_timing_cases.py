@@ -56,6 +56,8 @@ CASES = ("single", "two_same_block", "two_blocks", "two_blocks_1ch", "two_blocks
          # a SHORT blocking block (the dwell(one_cycle) join after a feedback test or a
          # counting round): does the gap after it still scale with its length?
          "join_dwell_n",
+         # a non-blocking readout released by an explicit dma_running wait, then the CMACC poll
+         "measure_dma_wait_cmacc",
          # COMPOSITIONS: the interactions, which is where the model broke before
          "loop_with_measure", "batch_in_loop", "test_then_batch", "stretch_in_loop",
          "three_deep_nest",
@@ -119,6 +121,7 @@ PRIMITIVES = ("block", "batch", "batch_almost", "dwell", "reg_dwell",
 
 
 READOUT_CASES = ("measure_readout", "measure_two_rounds", "feedback_reset",
+                 "measure_dma_wait_cmacc",
                  "measure_trace_case", "loop_with_measure", "measure_multi",
                  # the counting-round body: swap -> readout -> quadrant -> conditional pi
                  "loop_measure_feedback", "loop_stream_feedback",
@@ -836,6 +839,30 @@ class LoopbackTimingCaseRuntime(QMsmtRuntime):
                         resonator.measure(pulse, "readout_accumulated", "boxcar")
                     with a.channel_synchronizer():
                         stimuli[0].schedule_pulse(pulse)
+                        marker.schedule_pulse(pulse)
+
+                elif self.case == "measure_dma_wait_cmacc":
+                    # The counting/CSWAP prefetch shape (2026-11-18): a NON-blocking readout, an
+                    # explicit dma_running wait on its capture, then get_measurement
+                    # (the CMACC-done poll) and a marker. The poll arrives right at the CMACC's
+                    # completion, which is where the instruction-level emulator and the older
+                    # layout differ by 2 cycles (CSWAP trotter); the ch1 marker interval settles it.
+                    feedback = a.sequencer().Register()
+                    with a.channel_synchronizer():
+                        marker.schedule_pulse(pulse)
+                    with a.channel_synchronizer(block=False):
+                        resonator.measure(pulse, "readout_accumulated", "boxcar")
+                    # wait on the CAPTURE only (it ends first), so the poll that follows lands on
+                    # the CMACC's completion instead of after it
+                    capture = self.io("capture_dummy").channel
+                    bits = 1 << (capture.num() + 16)
+                    running = a.sequencer().bus_read(
+                        a._firmware.sequencer_bus_decoder["dma_running"].address().value(),
+                        latency=a._bus_latency("dma_running"))
+                    with a.sequencer().repeat_until(running & bits == 0):
+                        pass
+                    feedback.load(resonator.get_measurement(classifier="quadrant"))
+                    with a.channel_synchronizer():
                         marker.schedule_pulse(pulse)
 
                 elif self.case == "measure_two_rounds":

@@ -112,13 +112,18 @@ def traced_pulses(trace):
     rectangles there would report a mismatch on every stretch case, which is a fault in this
     checker rather than in the picture.
 
+    Likewise a pulse whose own samples are silent over part of its memory -- a merged train, or a
+    gate zero-padded at both ends -- is drawn only where it plays (``_live_runs`` in plotting,
+    2026-10-13), so it is expected as those runs, not as one whole bar.
+
     The grouping is per LANE, exactly as the renderer does it -- the triple must be consecutive
     on one channel, not merely consecutive in the trace's flat command list.
     """
-    from acadia_qmsmt.sequence_viz.plotting import _stretch_groups
+    from acadia_qmsmt.sequence_viz.plotting import _live_runs, _stretch_groups
 
     ns = trace.ns_per_cycle
     bars = []
+    run_cache = {}
     by_channel = {}
     for command in trace.commands:
         by_channel.setdefault(command.channel, []).append(command)
@@ -132,7 +137,10 @@ def traced_pulses(trace):
             group = groups.get(i)
             start, stop = ((group[0].start, group[2].stop) if group
                            else (command.start, command.stop))
-            bars.append((start * ns, (stop - start) * ns))
+            runs = None if group else _live_runs(trace, command.io_name, command.pulse, "memory",
+                                                 run_cache, command.channel, stop - start)
+            for f0, f1 in (runs or [(0.0, 1.0)]):
+                bars.append(((start + f0 * (stop - start)) * ns, (f1 - f0) * (stop - start) * ns))
     return sorted(bars)
 
 
@@ -214,8 +222,14 @@ def main():
     # which timing_validation checks -- and asking the renderer to agree about a picture nobody
     # should ever see would only make the gate report a problem that is the point of the case.
     PATHOLOGICAL = ("stretch_zero",)
+    # three_deep_nest's dry-run TRACE never finishes (either engine; README "Not done yet"), so
+    # the whole sweep used to hang on it
+    HANGS_IN_TRACE = ("three_deep_nest",)
+    skipped = [c for c in CASES if c in PATHOLOGICAL + HANGS_IN_TRACE]
+    if not args.case:
+        print(f"  not checked: {skipped}")
     cases = ([args.case] if args.case
-             else [c for c in CASES if c not in PATHOLOGICAL])
+             else [c for c in CASES if c not in skipped])
     failures, checked = [], 0
     for name in cases:
         try:

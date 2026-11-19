@@ -447,7 +447,8 @@ def predict(folder):
     # second readout pulse simply started earlier than the guess implied. So everything at or
     # after the earliest assumed block is unscorable.
     assumed_start = min((pl.start for pl in (trace.placements or [])
-                         if pl.index in trace.assumed_paths), default=None)
+                         if pl.index in trace.assumed_paths or getattr(pl, "assumed", False)),
+                        default=None)
     assumed_labels = set()
     if assumed_start is not None:
         cutoff = assumed_start * trace.ns_per_cycle
@@ -592,7 +593,21 @@ def compare(folder, verbose=True):
     # unrolled from the cache to the count the cache holds, and the post-loop blocks MUST sit
     # after the train. This is exactly the regression the tracer fix prevents (a collapsed
     # stream would leave one symbolic placeholder and drag the readout/tail up to the front).
-    if getattr(trace, "stream", None):
+    if getattr(trace, "stream", None) and getattr(trace, "layout_engine", "") == "emulator":
+        # the emulator plays every pass; the streamed gates are the commands on the stream's
+        # channels whose word came from runtime data (Command.streamed)
+        channels = set(trace.stream["channels"])
+        streamed_cmds = [c for c in trace.commands if c.channel in channels and c.streamed]
+        gates = len(streamed_cmds)
+        expected = int(trace.point_cache.get(trace.stream["count_word"], 0)) * max(
+            int(getattr(trace, "stream_repeats", 1) or 1), 1)
+        train_stop = max((c.stop for c in streamed_cmds), default=0)
+        after = any(not c.streamed and c.start >= train_stop for c in trace.commands)
+        result["stream_gates"] = gates
+        result["stream_expected"] = expected
+        result["stream_ok"] = bool(gates == expected and expected > 0
+                                    and not result["pulses_dropped"] and after)
+    elif getattr(trace, "stream", None):
         streamed = [p for p in trace.placements if getattr(p, "stream", False)]
         gates = sum(len(p.commands) for p in streamed)
         expected = int(trace.point_cache.get(trace.stream["count_word"], 0))
@@ -1070,6 +1085,8 @@ def main():
         # regression check: newest run of each case, one line each
         print(f"{'case':22s} {'blocks':>6s} {'gaps (ns)':>22s} {'worst err':>10s}")
         worst_overall = 0.0
+        # how much was actually compared, so a pass can be quoted with its counts
+        totals = {"cases": 0, "intervals": 0, "empty": []}
         for case_dir in sorted(p for p in Path(SAVE_ROOT).glob("*") if p.is_dir()):
             # a case dir holds run dirs; a run dir is one with kwargs.json in it.
             # SAVE_ROOT also holds legacy flat runs from before cases existed.
@@ -1091,6 +1108,11 @@ def main():
                       f"{type(exc).__name__}")
                 continue
             note = systematic_note(case_dir.name, trace=result.get("trace"))
+            compared = sum(r["n_compared"] for r in result["rows"])
+            totals["cases"] += 1
+            totals["intervals"] += compared
+            if not compared:
+                totals["empty"].append(case_dir.name)
             if not note:
                 worst_overall = max(worst_overall, result["worst_error_ns"])
             # dropped pulses / a collapsed cache-pointer stream are structural misses the
@@ -1108,9 +1130,11 @@ def main():
                 flag = "   <-- MISMATCH"
             print(f"{case_dir.name:22s} {result['blocks']:6d} "
                   f"{str(result['gaps_ns']):>22s} "
-                  f"{result['worst_error_ns']:8.2f} ns{flag}")
+                  f"{result['worst_error_ns']:8.2f} ns  ({compared} intervals){flag}")
         print(f"\nworst across all cases (excluding known systematics): "
               f"{worst_overall:.2f} ns")
+        print(f"compared {totals['intervals']} marker intervals over {totals['cases']} cases; "
+              f"cases with NO interval compared: {totals['empty'] or 'none'}")
         for case, note in KNOWN_SYSTEMATIC.items():
             print(f"\nnote on {case}: {note}")
         return
@@ -1119,13 +1143,21 @@ def main():
         from loopback_timing_cases import CASES
         cases = list(CASES) if args.dryrun == "all" else [
             c.strip() for c in args.dryrun.split(",") if c.strip()]
+        if args.dryrun == "all":
+            # its dry-run TRACE never finishes (either layout engine), so "all" hung on it
+            hangs = [c for c in cases if c in ("three_deep_nest",)]
+            cases = [c for c in cases if c not in hangs]
+            print(f"not traced (trace never finishes): {hangs}")
         print("dry run (no hardware):")
+        failed = []
         for case in cases:
             try:
                 dry_run(case)
             except Exception as exc:
+                failed.append(case)
                 print(f"  {case:20s} FAIL {type(exc).__name__}: "
                       f"{str(exc)[:110]}")
+        print(f"\n{len(cases)} cases traced; {len(failed)} raised: {failed or 'none'}")
         return
 
     if args.logs:

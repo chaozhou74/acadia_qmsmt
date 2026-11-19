@@ -802,6 +802,15 @@ def _count_and_source(trace, summary, block, depth, path):
     if entry is None:
         return {"count": None, "source": "assumed", "taken": taken, "indeterminate": True,
                 "nonterminating": stuck}
+    # The emulator layout knows what EACH execution did (an active-reset loop takes a different
+    # number of rounds each time); the summary entry only holds the construct's first execution.
+    each = getattr(trace, "execution_counts", {}).get((block, depth, tuple(path or ())))
+    if each is not None and entry["source"] != "assumed":
+        if entry["kind"] == "test":
+            taken = bool(each)
+        else:
+            return {"count": int(each), "source": entry["source"], "taken": taken,
+                    "indeterminate": indeterminate, "nonterminating": stuck}
     return {"count": entry["count"], "source": entry["source"], "taken": taken,
             "indeterminate": indeterminate, "nonterminating": stuck}
 
@@ -1450,9 +1459,16 @@ def draw(ax, trace, xlim_ns=None, show_envelopes=True, label_pulses=True,
                                    ch, x1 - x0)
                         if (pulse and not group and hatch is None) else None)
                 for f0, f1 in (runs or [(0.0, 1.0)]):
+                    # the live fractions are of the PLAYED length (x1 - x0); the separator inset
+                    # only ever shortens the bar's end, never moves where a run starts
+                    r0 = x0 + f0 * (x1 - x0)
+                    r1 = (min(x0 + f1 * (x1 - x0), x0 + width) if runs
+                          else x0 + width)          # a whole bar: exactly as wide as computed
+                    if r1 <= r0:
+                        continue
                     rect = Rectangle(
-                        ((x0 + f0 * width) * ns, y - LANE_HEIGHT / 2),
-                        (f1 - f0) * width * ns, LANE_HEIGHT,
+                        (r0 * ns, y - LANE_HEIGHT / 2),
+                        (r1 - r0) * ns, LANE_HEIGHT,
                         facecolor=face, edgecolor=edge, hatch=hatch, alpha=alpha,
                         linewidth=lw, zorder=2)
                     if pulse and hatch is None:   # plain pulse fill -> batch it

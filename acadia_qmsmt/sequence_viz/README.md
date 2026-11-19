@@ -660,3 +660,194 @@ pulses). The timing dry-run matrix passes 83/83 cases. The first two-cavity
 loopback recording changes from 160 ns error per two-readout round to at most
 0.50 ns across 20 emitted pulses. Further measurements and paths live in
 `msmt_workbench/rfsoc/msmt/loopback_measurements/quantum_simulation/README.md`.
+
+### Several streamed channels sharing one cache pointer (2026-11-17)
+
+`describe_cache_stream` used to accept one streamed channel per program. `MultiDualRailRB`
+(msmt_workbench `runtimes/randomized_benchmarking/multi_dualrail_rb.py`) streams six pairs, each
+on its own sideband channel, inside six `test(case == k)` branches. All six read ONE cache region
+through ONE walking pointer (P+1 DSP loaded with an immediate cache address) and one count word.
+The detector now accepts several channels when:
+
+* each channel's latched pushes sit in a single innermost loop, and those loops are distinct;
+* there is exactly one walking pointer, and each channel's loop steps (cep) that pointer.
+
+Floor and post-span are measured per channel (`stream["channels"][ch]`). `_is_stream_command` and
+`_expand_stream` use the command's own channel entry. `stream["channel"]`, `"floor"` and
+`"post_span"` remain the first channel's values, so a single-channel program decodes exactly as
+before. No runtime, pulse or channel names are matched.
+
+Regression with HEAD in a separate worktree vs the change (logs identical apart from timings):
+* local streaming archive check: 314 (experiment, point) combinations over 66 experiments,
+  69 pinned, 54 problems in both (all pre-existing);
+* `timing_validation.py --dryrun all`: 83/83 OK in both;
+* `timing_validation.py --revalidate`: same output in both;
+* `selftest.py` over 11 archived runs (single and loopback dual-rail RB, XEB CZ, GKP frame, Z2
+  rabi, six chevrons, partner chevrons, six rabis, T1, CSWAP Trotter, CD flat pi): all 11 OK in
+  both, with identical points, blocks, dead time and registers.
+
+Board evidence (loopback 10.66.3.229, `msmt/loopback_measurements/rb_dualrail/multi_rb_board_check.py`,
+depth 4, one pair per deploy): 18/18 lines (transmon, sideband, readout × 6 pairs) agree in pulse
+count; max |Δ interval| 0.02–2.62 ns; worst phase 1.1°. SeeQuence's train on each sideband line
+equals the circuit (7 gates × 5 copies + 4 attach = 39 on five pairs, × 1 copy = 11 on Q1C2).
+
+Known limit: a program that loads the stream's start AND end pointers from cache values (the
+first MultiDualRailRB form, fridge run `20261116/DualRail_RB/all_six/261117/201606`) is not a
+stream to this detector; `repeat_until_count` then reads an absolute address as a pass count and
+the trace does not finish. That runtime was rewritten into the single-pointer form instead.
+
+## Instruction-level emulator: drawing what the program executes (2026-11-18)
+
+`emulator.py` runs the board's sequencer program instruction by instruction and lays the trace out
+from what it plays. No idioms are recognised (no stream, pointer-pair or cache-sum detectors): the
+same few machine rules apply to every program.
+
+**It is the default** (`trace.layout_engine == "emulator"`, since 2026-11-18, second pass). The older
+layout is `SEQVIZ_LAYOUT=machine` (or `trace.layout_engine = "machine"; trace.relayout()`), and is
+used automatically, with a warning, only when the program cannot be decoded (`trace.program_error`).
+
+### What it executes
+* **The assembled bytes.** `compile_program` decodes exactly what `Acadia.assemble` writes
+  (`decode_binary` is the inverse of `STP.assemble`), and `load_assembled_log` runs an archived run's
+  own `assembled.log`. All 11 selftest folders: re-traced program == archived `assembled.log`, every
+  instruction (`validation/emulator_vs_trace.py` prints `archive: N archived, N re-traced, 0 differ`).
+  acadia's CEP field writes `0x50|minor`, so bits 4 and 6 (premask/op) are set on CEP pulses; they
+  are unconditional, so this has no effect.
+* **Values:** registers, MASK, the ALU (`OP` = src2 premask/AND/XOR), conditional writes, branches,
+  holds, the return stack, DSP slices from their configuration word (UG579; 6995/6995 acadia modes
+  agree with their names), the bus by the firmware decoder (DMA ports base+0..3 commands, +4 reset;
+  trigger; `dma_running`; per-DMA status; module registers; cache).
+* **Clock**, one cycle per instruction, plus:
+  * taken branch +3 (`MEASURED_BRANCH_PENALTY`);
+  * a hold sees DMA status `detect + DMA_STATUS_REGISTER` = 4 cycles late;
+  * a trigger's first sample is `propagate + 1` = 3 cycles after the trigger instruction;
+  * a pushed descriptor reaches the FIFO 2 cycles after its write;
+  * a CMACC-done poll releases at capture end + `MEASURED_CMACC_RESULT_LATENCY - propagate` = 9.
+* **DMA channels** (`DmaChannel`):
+  * a trigger starts only descriptors already in the FIFO;
+  * a descriptor arriving STRICTLY before the current one ends follows on without a trigger;
+  * the trigger pulls the first descriptor, each later one is pulled when the previous ends (so
+    `fifo_empty` / `fifo_almost_empty` drains release at the measured times);
+  * the one-cycle join releases 2 early when the dwell starts exactly at its own trigger.
+* **PC and stack follow the firmware** (`acadia/logic/src/acadia_sequencer.vhd`): a hold that held
+  resumes at its source address (acadia makes that pc + 1, except KI_004's out-of-line body); a
+  `push_return` pushes whether or not its branch is taken; a return from an empty stack is reported
+  as a problem, not guessed.
+* **What it cannot know it says:** a construct decided on a measurement result is listed as
+  assumed (`trace.assumed_paths` = first blocks, `assumed_constructs`, `indeterminate`), and
+  placements after it carry `assumed=True` so `timing_validation` asks the capture which arm ran.
+
+### Control flow: tabs, panel and pins from the executed branches
+* `dryrun.branch_recorder` records which acadia instructions each `test` / `loop` / `repeat_until`
+  created; after compile they carry their addresses, so `emulator.construct_map` knows the exact
+  branch that decides each construct (a loop's back-branch, a test's skip / jump) and its body
+  addresses. Blocks find their trigger the same way (`trigger_blocks`), so out-of-line bodies map
+  correctly.
+* `emulator.ControlFlow` decides those branches while the program runs: from the data, from a pin
+  (`loop_counts` / `path_choices`, same keys and precedence as before, per execution or per
+  construct), or by the board-decided default (one pass / value 0, marked assumed). It numbers every
+  trigger's pass in every enclosing construct (`placement.path`), and records what EACH execution did
+  (`trace.execution_counts`) -- an active-reset loop's tab shows its own execution's count.
+* A pinned layout also runs once unpinned, so a pinned tab still says what the data says.
+* A pin can send the program somewhere it never ends. The GUI check found one (2026-11-18): XEB's
+  stream gate `test @19` pinned "taken" at point 0, where 0 gates are streamed, enters a
+  repeat_until whose counter starts at 0. That stalled the panel for hours. Now:
+  * the pinned run is limited to max(250 000, 10 × the unpinned run's steps);
+  * the loop still passing where the limit stops it (the busiest loop around the stopping pc)
+    is drawn `x∞` and its panel row reads "(never exits)";
+  * that case now takes 10 s, and clearing the pin restores the run.
+* `DmaChannel` status queries scan only descriptors that can still change a flag: the started
+  ones past a finished-prefix cursor, plus pending and reset-orphaned ones. Before this, every
+  hold rescanned every descriptor ever pushed (~descriptors² per hold).
+  * This is a speed change only. 194 emulations (each case, each pin variant, 3 points of each
+    selftest folder) give identical events, problems, steps and cycles with the old full scan:
+    34 652 events, 0 differences (scratch `cursor_equiv.py`).
+  * Open physics question, not changed: descriptors dropped by a DMA reset still count as
+    queued, as they always did.
+* A construct the run did not reach because an enclosing arm was guessed (a measurement) keeps
+  its `?` "decided at runtime" marker, also once pinned. Found by `gui_validation.py` on XEB's
+  active-reset loops (`(1, 3)`, `(3, 3)`, ...): 42 failures across 7 folders, now 0.
+* The GUI time scrollbar counts in units of ⌈length / 1e9⌉ ns, which is 1 ns for any real
+  sequence. A pin can draw a sequence longer than a 32-bit int of ns: CSWAP's Trotter
+  `repeat_until (18, 1)` pinned one pass past its 9 wraps a register-driven dwell to 2³² cycles
+  (43 s). That is what the board would do, but the bar overflowed (81 guard failures).
+* `gui_validation.py` on the 11 selftest folders (default engine), 2026-11-18: 11 folders, 0 with
+  problems. Totals: 497 control-flow rows, 698 tab hovers, 405 assumed alternatives, 6 sweep points
+  each. (Qubit1_T1 has no control flow, so it checks nothing there.)
+  * After these fixes, re-run and identical to before: the engine comparison (76/82 SAME, file
+    identical), `--revalidate` (97 per-case lines identical, worst 0.45 ns, 134 intervals),
+    `--dryrun all` (83 OK, file identical), and render (82 cases, 0 disagree, 11 folders).
+* A loop pinned to 0 skips its body; a `loop` pin is at least 1 pass (as before). A construct the
+  point never reaches is "0, resolved", unless an enclosing arm was guessed (then assumed).
+* Checked against the older layout's tabs (`placement (block, path)` order and every
+  `control_flow_summary` entry; scratch `cf_compare.py`):
+  * dry-run cases: 76/82 identical. The 6 that differ are all the emulator being right:
+    * `rb_stream`, `rb_stream_uniform`, `stream_then_batch`: the stream loop is executed pass by
+      pass with its cache count (5, "resolved") instead of one unrolled block "1, assumed";
+    * `loop_measure_feedback`, `loop_stream_feedback`: the outer `test(DSP0 != REG2)` compares two
+      values computed from the cache -- resolved, not assumed;
+    * `test_true_nospec` (KI_004): runs the bytes into the stack underflow and is reported (the
+      older layout drew straight-line code; the board hangs on the other arm).
+  * pins (each loop +1 pass, each loop -> 0, each test flipped) on 20 control-flow cases: identical
+    except the KI_004 cases above.
+  * selftest folders, 3 points each: 24/33 identical; the rest are the RB / XEB gate streams counted
+    per pass from the cache (up to 1791 passes), and XEB CZ's per-gate `test(REG6 != 0)`, which the
+    emulator reads from each streamed word -- a CZ every 8th gate (folder `P8_8_o8_8`); the older
+    layout assumed none. That closes the XEB command difference listed below.
+  * pins on the XEB CZ folder (point 3519): a pinned count draws that many passes, a flipped arm
+    shows "pinned", 44 ms per relayout; 0 of 114 tabs show `?`.
+* `render_validation.py` (default engine): 82 dry-run cases and all 11 selftest folders draw exactly
+  their trace. It had been failing 5 stream/batch cases under BOTH engines since zero-padded pulses
+  are drawn only where they play (2026-10-13): the checker now expects those live spans, and the
+  renderer no longer shifts a padded pulse's start by the separator inset (it was ~0.7 ns early when
+  two such pulses abut).
+
+### Evidence
+* `timing_validation.py --revalidate`, 99 archived loopback cases:
+  * `SEQVIZ_LAYOUT=emulator`: worst 0.45 ns;
+  * `machine`: worst 25.09 ns;
+  * the emulator is better on 8 cases (7 `test_chain` trigger=False cases, 25 ns -> <=0.09 ns, and
+    `measure_dma_wait_cmacc`, 9.97 -> 0.03 ns) and worse on none.
+* Each rule above came from a board disagreement, and each has a board case:
+  * trigger only what is in the FIFO: `test_chain__trigger_false_n1_b1`, 0.07 ns;
+  * strict follow-on: `batch_uneven`, 0.04 ns;
+  * first descriptor pulled by the trigger: `join_markerempty_*`, 0.08 / 0.05 ns;
+  * CMACC = 9: `gkp/cmacc_feedback_board_check.py --saved 261101_005015`, 20 marker intervals, worst
+    0.935 ns, the same as the older layout;
+  * CMACC after an explicit DMA wait: NEW case `measure_dma_wait_cmacc`, board 420.03 ns, emulator
+    420.0, older layout 430.0;
+  * one-cycle join after a short block=False pulse: NEW `validation/join_after_short_batch.py`,
+    board agrees with the early release (0.04 ns).
+* Command for command against the older layout (`validation/emulator_timing.py`):
+  * dry-run cases: 76/82 identical, 1529 commands. The 6 that differ:
+    * barrier padding the older layout draws at length 0 (`barrier_uneven*` ×3; pulse times
+      identical);
+    * `stretch_zero` (2^32 vs 2^32-1 cycles);
+    * the KI_004 hang `test_true_nospec` (the emulator reports the PC running off the program);
+    * `measure_dma_wait_cmacc`, where the board sides with the emulator.
+  * selftest folders: 45/55 sampled points identical, 12723 commands. The rest:
+    * CSWAP Trotter: −2 cycles after the post-readout CMACC poll, the shape the board settled for
+      the emulator;
+    * XEB CZ: the barrier-padding dwells (138/30/17 cycles) are real DMA writes in the archived
+      instruction memory, and the older layout drew them at 0; points ≥ 2640 also take more
+      measurement-dependent branches.
+    XEB itself is not board-checked: `xeb_cz_mced_board_check.py` no longer builds the current
+    runtime ("three distinct qubits and capture channels"), under either engine.
+* The first MultiDualRailRB form (`20261116/DualRail_RB/all_six/261117/201606`), which the older
+  layout never finished, lays out in 1.9 s total and milliseconds per point. Each point plays its
+  pair's train on that pair's sideband DAC.
+
+* `--revalidate` now prints how many marker intervals each case compared: 134 over 97 cases, the
+  SAME under both engines. 27 cases compare none (single-marker cases such as `single`, `smoke`, and
+  the `stretch_dwell_align` / `direct_dwell_align` families, which have their own scripts), so the
+  0.45 ns worst case rests on the other 70.
+
+### Not done yet
+* Retiring the idiom code in `machine.py` / `tracing.py` (`describe_cache_stream`, `_expand_stream`,
+  `repeat_until_count`, `_pointer_*`, `execution_plan`, ...). It is now only the `SEQVIZ_LAYOUT=machine`
+  comparison and the fallback for an undecodable program; remove it once a few weeks of notebook use
+  show the fallback never fires.
+* `three_deep_nest` dry-run tracing never finishes, with either engine (the board hangs on it too);
+  `render_validation.py` skips it by name.
+* `xeb_cz_mced_board_check.py` is stale (does not build the current runtime), so XEB has no new board
+  run; its sequence is now explained from the cache (above).

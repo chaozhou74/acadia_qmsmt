@@ -151,7 +151,7 @@ def _describe_condition(value, limit=56):
 
 
 @contextmanager
-def branch_recorder(stack):
+def branch_recorder(stack, extents=None):
     """Track which control-flow blocks the sequence is inside while it compiles.
 
     ``test``, ``repeat_until`` and ``loop`` are ``@contextmanager`` generators, so
@@ -163,6 +163,11 @@ def branch_recorder(stack):
     ``True`` the body is inline and the branch jumps past it when the condition
     fails; with ``False`` the body is out-of-line and the taken path costs two
     extra instructions. Execution order is then not address order.
+
+    ``extents``: if a dict, ``extents[id] = (instruction list, first, end)`` records which acadia
+    Instruction objects each construct created -- its own branch and its whole body. After
+    compile those objects carry their program addresses, which is how the instruction-level
+    emulator finds the exact branch that decides each construct (emulator.construct_map).
     """
     from acadia.sequencer import Sequencer
 
@@ -184,11 +189,16 @@ def branch_recorder(stack):
             # time, so one id per entry is exactly one id per control-flow block.
             context["id"] = next(entry_counter)
             stack.append(context)
+            instructions = self.Instruction.instances
+            first = len(instructions)
             try:
                 with original(self, *args, **kwargs) as value:
                     yield value
             finally:
                 stack.pop()
+                if extents is not None:
+                    # after the original's exit code ran, so its closing branch is included
+                    extents[context["id"]] = (instructions, first, len(instructions))
 
         setattr(Sequencer, name, wrapped)
 

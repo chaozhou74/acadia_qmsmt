@@ -13,7 +13,10 @@ extends the subschedule lists in place, so reading its ``schedules`` argument
 back after the call yields the subschedule structure *including* the alignment
 dwells acadia inserted -- which is what makes barriers and padding visible.
 """
+import copy
+import os
 import re
+import warnings
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
@@ -131,6 +134,9 @@ class Command:
     # For a symbolic DMA length, the register may already hold length - 1.
     # Constants are converted during capture; registers are converted at layout.
     length_is_minus_one: bool = False
+    #: the DMA word came from runtime data (the push read it from the cache or a register, not
+    #: an immediate) -- a streamed gate, say. Set by the emulator layout.
+    streamed: bool = False
 
     @property
     def stop(self):
@@ -180,6 +186,9 @@ class Placement:
     gap_after: int = 0
     gap_breakdown: dict = field(default_factory=dict)
     stream: bool = False        # this placement is an unrolled cache-pointer pulse stream
+    #: executed after a branch on a value the board decides (emulator layout), so its timing
+    #: rests on the path guessed for that branch
+    assumed: bool = False
 
     @property
     def stop(self):
@@ -294,6 +303,50 @@ class SequenceTrace:
     # repeat_until(fifo_empty) drain -- the execution-model layout (machine.py) advances the
     # sequencer clock to last-pulled + that boundary gap there.
     drain_blocks: dict = field(default_factory=dict)
+    #: the compiled program and the firmware bus map, for the instruction-level emulator
+    #: (sequence_viz/emulator.py): ``emulator.execute(trace.program, trace.bus, trace.point_cache)``
+    #: runs this point's program and returns every DMA word in executed order.
+    program: Optional[list] = None
+    bus: Optional[list] = None
+    program_error: Optional[str] = None
+    #: {"module<N>_registers": "ADC<k>"}: the ADC each CMACC is fed by (emulator.stream_sources)
+    streams: dict = field(default_factory=dict)
+    #: firmware timing terms for the emulator's clock (emulator.default_timing)
+    timing: dict = field(default_factory=dict)
+    #: "emulator" (default since 2026-11-18): lay out from the executed instruction set
+    #: (emulator.execute + lay_out). "machine": the older idiom-recognising execution model
+    #: (machine.py), kept as the fallback when the program cannot be decoded (program_error) and
+    #: selectable with SEQVIZ_LAYOUT=machine for comparison.
+    layout_engine: str = "emulator"
+    #: the emulator's Execution behind the current layout (layout_engine "emulator")
+    last_run: Optional[object] = None
+    #: {branch address: emulator.Construct} -- the program branch that decides each
+    #: test/loop/repeat_until, found from the instructions each one created (emulator.construct_map)
+    constructs: dict = field(default_factory=dict)
+    #: {trigger program address: block index}, from the instructions each block compiled to
+    block_triggers: dict = field(default_factory=dict)
+    #: emulator layout: {(first block, level, enclosing path): passes, or body ran? for a test}
+    #: -- what EACH execution of a construct did, not just the first one
+    execution_counts: dict = field(default_factory=dict)
+    assumed_constructs: set = field(default_factory=set)
+
+    def emulate(self, choices=None, max_steps=5_000_000, pins=True):
+        """Execute the compiled program for the selected point (see emulator.execute).
+
+        The runtime's test/loop/repeat_until constructs are decided through an
+        emulator.ControlFlow: from this point's cache where the program reads it, from
+        ``loop_counts`` / ``path_choices`` where you pinned them (``pins=False`` ignores pins),
+        and one pass / the value-0 arm where the board decides (a measurement).
+        ``choices``: {program address: taken} for any OTHER branch on a board-decided value."""
+        from .emulator import ControlFlow, execute
+        if self.program is None:
+            raise RuntimeError(f"no compiled program on this trace ({self.program_error})")
+        control = ControlFlow(self.constructs,
+                              self._count_override if pins else None,
+                              self._path_override if pins else None)
+        return execute(self.program, self.bus, self.point_cache or {}, choices=choices,
+                       timing=self.timing or None, streams=self.streams, max_steps=max_steps,
+                       control=control)
 
     @property
     def n_points(self):
@@ -339,6 +392,34 @@ class SequenceTrace:
         layout, loop unrolling via :meth:`execution_plan`, and the boundary-gap constants are
         shared here.
         """
+        if self.layout_engine == "emulator" and self.program is not None:
+            # Execute the instruction set and draw what it plays. Pins (loop_counts,
+            # path_choices) are applied at each construct's own branch (emulator.ControlFlow).
+            from .emulator import lay_out, record_control_flow
+            if not (self.loop_counts or self.path_choices):
+                self.last_run = self.emulate()
+                lay_out(self, self.last_run)
+                return self
+            # Pinned. First what the DATA says, kept beside the pins so a pinned tab can still
+            # say "this run's cache says N" and a board-decided one stays marked as such.
+            unpinned = copy.copy(self)
+            run = self.emulate(pins=False)
+            record_control_flow(unpinned, run.control, run)
+            # A pin can send the program somewhere it never ends: forcing a stream gate open at
+            # a point with 0 gates enters a repeat_until whose counter starts at 0 (XEB, test @19
+            # pinned taken). Bound the pinned run by the real one -- ten times its steps is far
+            # more than any pinned pass count you would want drawn -- so the panel stays live,
+            # and the loop that did not exit is drawn x-infinity.
+            self.last_run = self.emulate(max_steps=max(250_000, 10 * run.steps))
+            lay_out(self, self.last_run)
+            pinned_stuck = self.nonterminating
+            self.repeat_counts = unpinned.repeat_counts
+            self.indeterminate = unpinned.indeterminate
+            self.nonterminating = unpinned.nonterminating | pinned_stuck
+            return self
+        if self.layout_engine == "emulator":
+            warnings.warn(f"SeeQuence: no decodable program ({self.program_error}); drawn with "
+                          f"the older execution model (machine.py) instead of the emulator")
         from .machine import machine_layout
         return machine_layout(self)
 
@@ -349,11 +430,12 @@ class SequenceTrace:
         ``BUS_DATA`` (the cache read issued in the same instruction) or ``REG<n>`` (the read
         latched into a register first, which dualrail_rb does when it issues the same word
         several times per pass -- a raw bus_read result is only valid for a few cycles).
-        :attr:`stream` marks which channel that stream drives, and is only set for a
-        single-channel stream, so the multi-rail XEB idiom cannot reach here.
+        :attr:`stream` marks which channels that stream drives: one, or one per `test` arm when
+        the same walk is written once per channel (see describe_cache_stream). The multi-rail XEB
+        idiom (several rails in one loop, a pointer each) is never a stream, so it cannot reach here.
         """
         symbolic = str(command.symbolic or "")
-        return bool(self.stream and command.channel == self.stream["channel"]
+        return bool(self.stream and command.channel in self.stream["channels"]
                     and (symbolic == "BUS_DATA" or symbolic.startswith("REG")))
 
     def _expand_stream(self, command, placement, start, per_pass_extra=0, extras=(),
@@ -390,6 +472,7 @@ class SequenceTrace:
         :return: the cursor after the train (its start plus ``count`` period slots).
         """
         meta = self.stream
+        own = meta["channels"][command.channel]      # this channel's loop: its floor and DAC number
         cache = self.point_cache or {}
         count = int(cache.get(meta["count_word"], 0))
         # What this train really is, kept for the drawing: the loop's PASS count is deliberately
@@ -399,9 +482,9 @@ class SequenceTrace:
         self.stream_words = count
         self.stream_repeats = max(int(repeats), 1)
         self.stream_gates = count * max(int(repeats), 1)
-        floor = int(meta["floor"])
-        post_span = int(meta.get("post_span", floor))
-        cnum = meta["channel_num"]
+        floor = int(own["floor"])
+        post_span = int(own.get("post_span", floor))
+        cnum = own["channel_num"]
         cursor = start
         for k in range(count):
             word = int(cache.get(meta["start_offset"] + k, 0))
@@ -1460,6 +1543,7 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
     pending_user_ids = []
     snapshots = []
     branch_stack = []
+    construct_extents = {}      # context id -> the acadia instructions it created
     state = {"runs": 0}
 
     orig_create = DMASynchronizer.create_schedules
@@ -1486,12 +1570,19 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
 
     def spy_exit(self, *a):
         before = len(raw_blocks)
+        # the acadia instructions this block compiles to, so its trigger can be found by address
+        # after compile even when the block sits out of line (emulator.trigger_blocks)
+        sequencer = getattr(getattr(runtime, "acadia", None), "_active_sequencer", None)
+        instructions = sequencer.Instruction.instances if sequencer is not None else None
+        first = len(instructions) if instructions is not None else None
         try:
             return orig_exit(self, *a)
         finally:
             if len(raw_blocks) > before:
                 raw_blocks[-1]["trigger"] = self._dma_trigger
                 raw_blocks[-1]["blocking"] = self._dma_block
+                if instructions is not None:
+                    raw_blocks[-1]["instructions"] = (instructions, first, len(instructions))
 
     pool = {}          # content hash -> array, so unchanged memories are shared
 
@@ -1529,7 +1620,7 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
         try:
             with hardware_stubbed(on_run, runtime=runtime,
                                   allow_instruments=allow_instruments), \
-                 branch_recorder(branch_stack):
+                 branch_recorder(branch_stack, construct_extents):
                 try:
                     runtime.main()
                 except StopDryRun:
@@ -1549,6 +1640,18 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
                 "channel_synchronizer, or it stopped earlier than expected")
 
         trace = _build_trace(runtime, raw_blocks, resolve_indeterminate)
+        try:
+            from .emulator import (bus_map, compile_program, construct_map, default_timing,
+                                   stream_sources, trigger_blocks)
+            trace.program = compile_program(runtime.acadia)
+            trace.constructs = construct_map(construct_extents, trace.blocks, trace.program)
+            trace.bus = bus_map(runtime.acadia)
+            trace.block_triggers = trigger_blocks(raw_blocks, trace.program, trace.bus)
+            trace.streams = stream_sources(runtime.acadia)
+            trace.timing = default_timing(**{k: trace.gap_terms[k] for k in ("detect", "propagate")
+                                             if k in trace.gap_terms})
+        except Exception as exc:                                   # noqa: BLE001
+            trace.program_error = f"{type(exc).__name__}: {exc}"
         # A memory the run writes directly -- np.copyto of precomputed raw samples, the fast
         # path runtimes use instead of load_pulse between points -- is invisible to the
         # load_pulse spy. If it holds nonzero samples at ANY captured point, the run wrote it,
@@ -1572,6 +1675,8 @@ def trace_runtime(runtime, point=0, resolve_indeterminate=0, envelopes=True,
             trace.point_offset = point
             selected = 0
 
+    # SEQVIZ_LAYOUT=emulator|machine picks the layout engine (see SequenceTrace.layout_engine)
+    trace.layout_engine = os.environ.get("SEQVIZ_LAYOUT", trace.layout_engine)
     trace.select_point(selected)
     return trace
 
@@ -1949,11 +2054,14 @@ def _build_trace(runtime, raw_blocks, resolve):
     try:
         stream = describe_cache_stream(acadia)
         if stream:
+            # the DAC number of every channel the stream drives (addr_names is keyed by it)
             for io in runtime._ios.values():
-                if str(io.channel) == stream["channel"]:
-                    stream["channel_num"] = io.channel.num()
-                    trace.stream = stream
-                    break
+                meta = stream["channels"].get(str(io.channel))
+                if meta is not None and "channel_num" not in meta:
+                    meta["channel_num"] = io.channel.num()
+            if all("channel_num" in meta for meta in stream["channels"].values()):
+                stream["channel_num"] = stream["channels"][stream["channel"]]["channel_num"]
+                trace.stream = stream
     except Exception:
         pass                    # the stream unroll is an enhancement; never fail the trace
 
@@ -2995,21 +3103,41 @@ def describe_cache_stream(acadia):
                 reg_directs.append((r.i, match.group(1)))
         if direct is not None:
             break
-    if direct is None and reg_directs and len({c for _i, c in reg_directs}) == 1:
-        # ...and only when those pushes sit inside ONE loop body, as dualrail_rb's repeats do.
-        # The one-rail streamed XEB (xeb_streamed_1DR) also latches on one channel, but from TWO
-        # loops on the same pointer -- the interleaved family's and the reference's -- so it is
-        # not this idiom: the stream path drew its reference string as no gates at all and its
-        # interleaved one as a jumble. The register-gate path lays it out exactly, as it does
-        # the multi-rail XEB runtimes.
-        loops = sequencer_control_flow(acadia)["back_branches"]
-        enclosing = {next(((t, b) for b, t in sorted(loops, key=lambda bt: bt[0] - bt[1])
-                           if t <= i <= b), None) for i, _c in reg_directs}
-        if len(enclosing) == 1 and None not in enclosing:
-            direct = reg_directs[0]
-    if direct is None:
+    loops = sequencer_control_flow(acadia)["back_branches"]
+
+    def innermost_loop(address):
+        """(target, branch) of the smallest loop body holding ``address``, or None."""
+        return next(((t, b) for b, t in sorted(loops, key=lambda bt: bt[0] - bt[1])
+                     if t <= address <= b), None)
+
+    # {channel: (address of its first push, its loop)} -- the channels the stream drives.
+    stream_pushes = {}
+    if direct is not None:
+        stream_pushes[direct[1]] = (direct[0], None)
+    elif reg_directs:
+        # ...and only when each channel's pushes sit inside ONE loop body, as dualrail_rb's
+        # repeats do. The one-rail streamed XEB (xeb_streamed_1DR) also latches on one channel,
+        # but from TWO loops on the same pointer -- the interleaved family's and the reference's
+        # -- so it is not this idiom: the stream path drew its reference string as no gates at
+        # all and its interleaved one as a jumble. The register-gate path lays it out exactly,
+        # as it does the multi-rail XEB runtimes.
+        by_channel = {}
+        for i, c in reg_directs:
+            by_channel.setdefault(c, []).append(i)
+        loop_of = {c: {innermost_loop(i) for i in idx} for c, idx in by_channel.items()}
+        if all(len(s) == 1 and None not in s for s in loop_of.values()):
+            own_loops = {c: next(iter(s)) for c, s in loop_of.items()}
+            # Several channels are one stream only when each has a loop of its OWN: the same walk
+            # written once per channel, each copy inside its own `test` arm, so one arm runs per
+            # shot (multi_dualrail_rb: one arm per qubit-cavity pair). The multi-rail XEB pushes
+            # its rails from ONE shared loop body through separate pointers, so the loops are not
+            # distinct and it stays with the register-gate path; the pointer check below also
+            # requires a single walking pointer.
+            if len(own_loops) == 1 or len(set(own_loops.values())) == len(own_loops):
+                stream_pushes = {c: (by_channel[c][0], own_loops[c]) for c in by_channel}
+    if not stream_pushes:
         return None
-    direct_idx, channel = direct
+    direct_idx, channel = min((i, c) for c, (i, _loop) in stream_pushes.items())
 
     decoder = acadia._firmware.sequencer_bus_decoder
     cache_base = decoder["cache"].address().value()
@@ -3028,7 +3156,7 @@ def describe_cache_stream(acadia):
     #
     # Pointing into the cache is what makes a counter a cache pointer, so select on that.
     pointers = {c for r in prog if (c := _dsp_pointer_config(r)) is not None}
-    cfg = start_offset = None
+    cache_pointers = []          # (DSP, start offset) in program order
     for r in prog:
         for dest, minor, src, imm in ((r.d1, r.d1_minor, r.s1, r.imm1),
                                       (r.d2, r.d2_minor, r.s2, r.imm2)):
@@ -3036,12 +3164,20 @@ def describe_cache_stream(acadia):
                 continue
             addr = _resolve_imm(imm)
             if addr is not None and cache_base <= addr < cache_base + cache_words:
-                cfg, start_offset = minor, addr - cache_base
-                break
-        if cfg is not None:
-            break
-    if cfg is None:
+                cache_pointers.append((minor, addr - cache_base))
+    if not cache_pointers:
         return None
+    cfg, start_offset = cache_pointers[0]
+    if len(stream_pushes) > 1:
+        # One walk shared by every channel: a single cache pointer, loaded once, and every
+        # channel's loop advances THAT pointer. Anything else (a pointer per rail) is not one
+        # stream, and modelling it as one would draw one rail's words on every channel.
+        if len({dsp for dsp, _off in cache_pointers}) != 1 or len(set(cache_pointers)) != 1:
+            return None
+        advances = [r.i for r in prog if r.cep is not None and r.cep == cfg]
+        for _c, (_i, (target, branch)) in stream_pushes.items():
+            if not any(target <= a <= branch for a in advances):
+                return None
 
     # count_word: the cache read feeding the AB+C 'count' term of the final-pointer DSP
     count_word = None
@@ -3067,20 +3203,35 @@ def describe_cache_stream(acadia):
     # a stream followed by a batch (which starts exactly at this trailing) lands right, where a
     # blanket count*floor put it ~one floor too late.
     triggers = [r.i for r in prog if _is_trigger(r)]
-    gate_trigger = next((t for t in triggers if t > direct_idx), None)
-    floor = post_span = None
-    for branch, target in sequencer_control_flow(acadia)["back_branches"]:
-        if target <= direct_idx <= branch:
-            floor = (branch - target + 1) + MEASURED_BRANCH_PENALTY
-            next_trigger = next((t for t in triggers if t > branch), None)
-            if gate_trigger is not None and next_trigger is not None:
-                post_span = next_trigger - gate_trigger
-            break
 
-    if start_offset is None or count_word is None or floor is None:
+    def floor_and_post_span(push_idx):
+        """(floor, post_span) of the loop around the push at ``push_idx``; (None, None) if none."""
+        gate_trigger = next((t for t in triggers if t > push_idx), None)
+        for branch, target in loops:
+            if target <= push_idx <= branch:
+                floor = (branch - target + 1) + MEASURED_BRANCH_PENALTY
+                next_trigger = next((t for t in triggers if t > branch), None)
+                post_span = floor
+                if gate_trigger is not None and next_trigger is not None:
+                    post_span = next_trigger - gate_trigger
+                return floor, post_span
+        return None, None
+
+    # Each channel's own loop gives its own floor and post-loop span (the per-channel copies of
+    # the walk need not compile to the same instruction count).
+    channels = {}
+    for c, (push_idx, _loop) in stream_pushes.items():
+        floor, post_span = floor_and_post_span(push_idx)
+        if floor is None:
+            return None
+        channels[c] = {"floor": floor, "post_span": post_span}
+    if start_offset is None or count_word is None:
         return None
+    # "channel"/"floor"/"post_span" describe the first channel, as before; "channels" holds every
+    # channel the stream drives (one entry for every single-channel stream).
     return {"channel": channel, "start_offset": start_offset, "count_word": count_word,
-            "floor": floor, "post_span": post_span if post_span is not None else floor}
+            "floor": channels[channel]["floor"], "post_span": channels[channel]["post_span"],
+            "channels": channels}
 
 
 INT16_FULL_SCALE = 2 ** 15 - 1
